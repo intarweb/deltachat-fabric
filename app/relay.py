@@ -74,6 +74,13 @@ class DeltaBackend(Protocol):
         """Send ``text`` from ``account_id`` into ``chat_id``; return the sent msg id."""
         ...
 
+    def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:
+        """Send ``text`` from ``account_id`` to the person at email ``addr``, resolving their
+        1:1 chat (address → contact → chat). Returns ``(chat_id, msg_id)``. Used to message a
+        HUMAN by their address after securejoin makes them a verified key-contact. (Optional on
+        fakes.)"""
+        ...
+
     def next_inbound(self) -> Optional[InboundMessage]:
         """Pop the next incoming message from the event stream, or None if idle.
 
@@ -224,6 +231,24 @@ class DeltaChat2Backend:
         from deltachat2 import MessageData  # type: ignore
 
         return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+
+    def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
+        """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
+
+        lookup_contact_id_by_addr → create_chat_by_contact_id (idempotent: returns the existing
+        verified 1:1 chat if it exists, else creates it) → send_msg. Requires the contact to be
+        a verified key-contact (post-securejoin) for the chat to be encryptable. Returns
+        ``(chat_id, msg_id)``. Verified vs installed deltachat2. Raises KeyError if no contact
+        resolves for ``addr``.
+        """
+        from deltachat2 import MessageData  # type: ignore
+
+        cid = self.rpc.lookup_contact_id_by_addr(account_id, addr)
+        if not cid:
+            raise KeyError(f"no contact for address {addr}")
+        chat_id = self.rpc.create_chat_by_contact_id(account_id, cid)
+        msg_id = self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+        return chat_id, msg_id
 
     # -- securejoin (accept a verified invite → inviter becomes a key-contact) ----
     def secure_join(self, account_id: int, invite: str) -> int:  # pragma: no cover
@@ -623,6 +648,17 @@ class Relay:
         msg_id = self.backend.send(accid, int(target), text)
         return {"status": "sent", "msg_id": msg_id, "account_id": accid}
 
+    def send_to_addr(self, bot: str, addr: str, text: str) -> dict:
+        """Send ``text`` from ``bot`` to the HUMAN at email ``addr`` (resolves their 1:1 chat).
+
+        Returns {"status","account_id","chat_id","msg_id"}. Raises KeyError if the bot has no
+        account or no contact resolves for ``addr`` (map to 404 at the endpoint)."""
+        accid = self.backend.account_id_for(bot)
+        if accid is None:
+            raise KeyError(f"no delta account for bot {bot!r}")
+        chat_id, msg_id = self.backend.send_to_addr(accid, addr, text)
+        return {"status": "sent", "account_id": accid, "chat_id": chat_id, "msg_id": msg_id}
+
     def _accid(self, bot: str) -> int:
         """Resolve a bot id/localpart to its Delta account id. KeyError if none."""
         accid = self.backend.account_id_for(bot)
@@ -834,6 +870,14 @@ class AddMemberRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SendToRequest(BaseModel):
+    """Send to a HUMAN by email ``addr`` (resolves their 1:1 chat) — the reach-a-person path."""
+    bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
+    addr: str
+    text: str
+    model_config = {"populate_by_name": True}
+
+
 class ReactRequest(BaseModel):
     bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
     chat_id: int
@@ -914,6 +958,11 @@ def create_app(relay: Relay):
     @app.post("/send_channel")
     async def send_channel(req: SendChannelRequest):
         return await _run(lambda: relay.send_channel(req.bot_id, req.channel_id, req.text))
+
+    @app.post("/send_to")
+    async def send_to(req: SendToRequest):
+        """Message a HUMAN by email address (resolves their 1:1 chat) — 404 on unknown bot/addr."""
+        return await _run(lambda: relay.send_to_addr(req.bot_id, req.addr, req.text))
 
     @app.post("/channel")
     async def create_channel(req: CreateChannelRequest):

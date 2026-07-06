@@ -48,11 +48,13 @@ from .mcp_tools import (
     DeltaSecureJoinTool,
     DeltaSendChannelTool,
     DeltaSendTool,
+    DeltaSendToTool,
 )
 
-# The 10 tool names exactly as they appear in an MCP client's tools/list.
+# The tool names exactly as they appear in an MCP client's tools/list.
 TOOL_NAMES = (
     "delta_send",
+    "delta_send_to",
     "delta_list_contacts",
     "delta_list_channels",
     "delta_send_channel",
@@ -108,6 +110,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
 
     # One relay client per operation, all pointed at the same injected relay_url.
     send_tool = DeltaSendTool(relay_url=relay_url)
+    send_to_tool = DeltaSendToTool(relay_url=relay_url)
     contacts_tool = DeltaListContactsTool(relay_url=relay_url)
     channels_tool = DeltaListChannelsTool(relay_url=relay_url)
     send_channel_tool = DeltaSendChannelTool(relay_url=relay_url)
@@ -131,6 +134,23 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         Returns the relay result, e.g. ``{"status":"sent","msg_id":int,"account_id":int}``.
         """
         return await send_tool.send(bot_id=bot_id, target=target, text=text)
+
+    @mcp.tool(name="delta_send_to")
+    async def delta_send_to(bot_id: str, addr: str, text: str) -> dict:
+        """Message a HUMAN by their email address (resolves their 1:1 chat automatically).
+
+        Use this to reach a person once they're a verified contact of the bot (they tapped the
+        bot's securejoin invite — see delta_create_invite). No chat id needed: the relay
+        resolves address → contact → 1:1 chat → send.
+
+        Args:
+            bot_id: The bot/account localpart to send AS.
+            addr: The person's email address (e.g. someone@example.com).
+            text: The message body.
+
+        Returns ``{"status":"sent","account_id":int,"chat_id":int,"msg_id":int}``.
+        """
+        return await send_to_tool.send_to(bot_id=bot_id, addr=addr, text=text)
 
     @mcp.tool(name="delta_list_contacts")
     async def delta_list_contacts(bot_id: str) -> dict:

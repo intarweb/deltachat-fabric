@@ -61,13 +61,13 @@ def relay_recorder(monkeypatch):
 # --------------------------------------------------------------------------- registration
 
 
-async def test_build_mcp_registers_exactly_eleven_tools_with_right_names():
+async def test_build_mcp_registers_exactly_twelve_tools_with_right_names():
     mcp = build_mcp(relay_url="http://relay.test:8080")
     tools = await mcp.list_tools()
     names = sorted(t.name for t in tools)
     assert names == sorted(TOOL_NAMES)
-    assert len(tools) == 11
-    assert {"delta_secure_join", "delta_messages", "delta_delete_chat"} <= set(names)
+    assert len(tools) == 12
+    assert {"delta_secure_join", "delta_messages", "delta_delete_chat", "delta_send_to"} <= set(names)
     assert {"delta_secure_join", "delta_messages", "delta_create_invite"} <= set(names)
 
 

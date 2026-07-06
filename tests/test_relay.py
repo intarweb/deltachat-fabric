@@ -67,6 +67,13 @@ class FakeBackend:
         self.sent.append((account_id, chat_id, text))
         return self._next_msg_id
 
+    def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:
+        self.sent_to = getattr(self, "sent_to", [])
+        self._next_chat_id += 1
+        self._next_msg_id += 1
+        self.sent_to.append((account_id, addr, text))
+        return self._next_chat_id, self._next_msg_id
+
     def next_inbound(self) -> Optional[InboundMessage]:
         return self._inbox.pop(0) if self._inbox else None
 
@@ -184,6 +191,39 @@ def test_send_http_endpoint_contract(tmp_path):
     assert isinstance(body["msg_id"], int)
 
     miss = client.post("/send", json={"bot_id": "bot-c", "target": 1, "text": "x"})
+    assert miss.status_code == 404
+
+
+def test_send_to_addr_resolves_and_returns_chat_and_msg(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path)
+
+    result = relay.send_to_addr("bot-a", "person@example.com", "hi there")
+
+    assert result["status"] == "sent"
+    assert result["account_id"] == 7
+    assert result["chat_id"] > 0 and result["msg_id"] > 0
+    assert backend.sent_to == [(7, "person@example.com", "hi there")]
+
+
+def test_send_to_addr_unknown_bot_raises(tmp_path):
+    relay = make_relay(FakeBackend(accounts={"bot-a": 7}), [], [], tmp_path)
+    with pytest.raises(KeyError):
+        relay.send_to_addr("nobody", "person@example.com", "x")
+
+
+def test_send_to_endpoint_contract(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7})
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+
+    resp = client.post("/send_to", json={"bot_id": "bot-a", "addr": "person@example.com", "text": "hi"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "sent" and body["account_id"] == 7
+    assert body["chat_id"] > 0 and body["msg_id"] > 0
+    assert backend.sent_to == [(7, "person@example.com", "hi")]
+
+    miss = client.post("/send_to", json={"bot_id": "nobody", "addr": "p@example.com", "text": "x"})
     assert miss.status_code == 404
 
 
