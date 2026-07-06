@@ -37,6 +37,9 @@ core / chatmail server**, so we know the deploy-time live-verify is load-bearing
   - `test_ensure_account_onboards_into_the_core_not_just_imap` + idempotency — onboarding
     calls `add_account` + `add_or_update_transport` (real deltachat2 `EnteredLoginParam`/
     `Socket` types via a fake rpc), not merely an IMAP login.
+  - **Host-header / DNS-rebinding** — the boot test POSTs a real `initialize` to `/mcp` with a
+    non-localhost `Host: mcp-deltachat:8000` and asserts it is **not 421-rejected** (the bug
+    that blocked an in-cluster gateway); `test_transport_security_*` guard the setting.
 
 deltachat2 API usage is verified against the **installed package** (not just docs):
 `EnteredLoginParam`/`Socket` fields, `Rpc.{add_account,add_or_update_transport,is_configured,

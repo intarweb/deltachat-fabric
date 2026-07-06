@@ -196,3 +196,27 @@ def test_relay_url_is_injected_no_fleet_identity():
     mcp = build_mcp(relay_url="http://injected.example:9999")
     # build succeeds with an arbitrary injected relay_url and registers the 7 tools.
     assert mcp.name == "deltachat"
+
+
+# --------------------------------------------------------------------------- transport security (Host-header / DNS-rebinding)
+
+
+def test_transport_security_defaults_protection_off(monkeypatch):
+    """🔴 Regression: the mcp SDK's default rebinding protection allows only localhost Hosts,
+    so an in-cluster client connecting by service name (Host: mcp-deltachat:8000) gets 421.
+    Our default disables protection (internal-net, gateway-fronted) so the deployed Host is
+    accepted."""
+    monkeypatch.delenv("DELTA_MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("DELTA_MCP_ALLOWED_ORIGINS", raising=False)
+    ts = mcp_server._transport_security()
+    assert ts.enable_dns_rebinding_protection is False
+
+
+def test_transport_security_env_reenables_and_scopes(monkeypatch):
+    """A browser-exposed deploy can re-enable + scope protection via env (generic — injected)."""
+    monkeypatch.setenv("DELTA_MCP_ALLOWED_HOSTS", "mcp-deltachat:8000, mcp-deltachat")
+    monkeypatch.delenv("DELTA_MCP_ALLOWED_ORIGINS", raising=False)
+    ts = mcp_server._transport_security()
+    assert ts.enable_dns_rebinding_protection is True
+    assert ts.allowed_hosts == ["mcp-deltachat:8000", "mcp-deltachat"]
+    assert ts.allowed_origins == ["mcp-deltachat:8000", "mcp-deltachat"]  # defaults to hosts

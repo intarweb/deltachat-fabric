@@ -58,15 +58,45 @@ TOOL_NAMES = (
 )
 
 
+def _transport_security():
+    """TransportSecuritySettings for the streamable-HTTP server.
+
+    🔴 The mcp SDK defaults DNS-rebinding protection ON with an allowlist of ONLY
+    ``127.0.0.1:*`` / ``localhost:*`` / ``[::1]:*`` — so an in-cluster client connecting by
+    the SERVICE NAME (``Host: mcp-deltachat:8000``) is rejected with 421 "Invalid Host header"
+    (verified against the installed SDK source; note a bare ``"*"`` does NOT work as a
+    catch-all — the matcher only does exact or ``host:*`` port-wildcard).
+
+    This engine is deployed on an internal network behind an MCP gateway (access-gated
+    upstream, never browser-exposed), where DNS-rebinding protection is redundant. So the
+    default is protection OFF (accept the deployed Host). A browser-exposed deployment can
+    RE-ENABLE + scope it by setting ``DELTA_MCP_ALLOWED_HOSTS`` (comma-separated Host values;
+    supports the SDK's ``host:*`` port-wildcard) and optionally ``DELTA_MCP_ALLOWED_ORIGINS``.
+    Generic: no host is baked — the allowlist is injected at deploy.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts = [h.strip() for h in os.environ.get("DELTA_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    origins = [o.strip() for o in os.environ.get("DELTA_MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    if hosts:
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts,
+            allowed_origins=origins or hosts,
+        )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
 def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
     """Build the ``FastMCP`` with the 7 delta tools registered.
 
     ``relay_url`` is injected into every underlying relay client (falls back to the
     ``RELAY_URL`` env / in-container loopback via ``_RelayTool``). The server is
     ``stateless_http`` so each request is self-contained (no sticky session), which is what
-    an MCP gateway's connect-and-list-tools flow wants.
+    an MCP gateway's connect-and-list-tools flow wants. ``transport_security`` accepts the
+    deployed Host (see ``_transport_security``) so an in-cluster gateway can reach it by name.
     """
-    mcp = FastMCP("deltachat", stateless_http=True)
+    mcp = FastMCP("deltachat", stateless_http=True, transport_security=_transport_security())
 
     # One relay client per operation, all pointed at the same injected relay_url.
     send_tool = DeltaSendTool(relay_url=relay_url)
