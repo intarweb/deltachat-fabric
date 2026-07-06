@@ -114,6 +114,9 @@ logic is pure + unit-tested; only the one imex RPC call touches the live core.
 | `DELTA_PASSWORD_MIN_LENGTH` | `9` | Server's minimum password length |
 | `DELTA_USERNAME_MIN_LENGTH` / `_MAX_LENGTH` | `1` / `64` | Localpart length bounds |
 | `RELAY_URL` | `http://localhost:8080` | Base URL the MCP tools call |
+| `DELTA_MCP_HOST` / `DELTA_MCP_PORT` | `0.0.0.0` / `8000` | MCP `/mcp` (streamable-HTTP) bind |
+| `DELTA_MCP_ALLOWED_HOSTS` | *(empty)* | Comma-separated Host allowlist for the `/mcp` server. **Empty (default) = DNS-rebinding protection OFF** — accepts any Host, correct for an internal-net deploy behind a gateway (the SDK default allows only `localhost`, which 421-rejects an in-cluster client connecting by service name). Set this (supports `host:*` port-wildcard) to re-enable + scope protection for a browser-exposed deploy. |
+| `DELTA_MCP_ALLOWED_ORIGINS` | *(=hosts)* | Comma-separated Origin allowlist (only when `DELTA_MCP_ALLOWED_HOSTS` is set). |
 
 ### Roster file
 
