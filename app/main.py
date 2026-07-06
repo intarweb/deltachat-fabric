@@ -318,6 +318,24 @@ async def drain_loop(relay: Relay, interval: float = 5.0,
         await asyncio.sleep(interval)
 
 
+async def poll_loop(relay: Relay, interval: float = 45.0,
+                    *, _should_stop: Optional[Callable[[], bool]] = None) -> None:
+    """Periodically force an IMAP fetch (deltachat ``maybe_network``) so queued mail is pulled
+    even when the server's IDLE push doesn't wake the core.
+
+    🔴 Stalwart v0.16.x (#339) pushes ``* STATUS INBOX (MESSAGES n)`` on new mail, NOT
+    ``* n EXISTS`` — deltachat-core's IDLE only wakes on EXISTS, so it never notices delivered
+    mail (e.g. a securejoin vc-request) until its ~15-min fallback poll. This loop nudges a
+    fetch on a short interval, sidestepping the broken IDLE entirely. Blocking rpc → to_thread.
+    """
+    while not (_should_stop and _should_stop()):
+        await asyncio.sleep(interval)  # sleep first: onboarding/reconcile already fetched
+        try:
+            await asyncio.to_thread(relay.force_poll)
+        except Exception:
+            log.exception("force-poll failed")
+
+
 # ---------------------------------------------------------------------------
 # Wiring — construct every collaborator. Importable + inspectable without I/O.
 # ---------------------------------------------------------------------------
@@ -409,6 +427,7 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
     backup_dir = os.environ.get("DELTA_BACKUP_DIR", "/backup")
     backup_retain = int(os.environ.get("DELTA_BACKUP_RETAIN", "7"))
     backup_interval = float(os.environ.get("DELTA_BACKUP_INTERVAL", "86400"))
+    poll_interval = float(os.environ.get("DELTA_POLL_INTERVAL", "45"))
 
     server = uvicorn.Server(uvicorn.Config(service.app, host=host, port=port, log_level="info"))
 
@@ -441,6 +460,7 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         server.serve(),
         mcp_server.serve(),
         drain_loop(service.relay),
+        poll_loop(service.relay, poll_interval),
         reconciler_loop(cfg, service.secrets, reconcile_interval, run_on_start, existing_fn,
                         onboard=_make_onboard(service),
                         after_reconcile=lambda: asyncio.to_thread(
