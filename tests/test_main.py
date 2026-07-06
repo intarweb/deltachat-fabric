@@ -68,59 +68,76 @@ def test_should_reconcile_interval_not_yet_elapsed():
     assert main.should_reconcile(100.0 + 10, 100.0, 3600) is False
 
 
-# -- reconcile_once (test-safe: injected IMAP login) ------------------------
+# -- reconcile_once (test-safe: injected onboard seam) ----------------------
 
 
 @pytest.mark.asyncio
 async def test_reconcile_once_provisions_desired_and_computes_prune(tmp_path):
     cfg = _cfg("bot-a", "bot-b")
     secrets = main.SecretsStore(str(tmp_path / "s.json"), cfg.password_min_length)
-    logins = []
+    onboarded = []
 
-    async def fake_login(host, port, user, password):
-        logins.append((host, port, user, password))
+    async def fake_onboard(localpart, password):
+        onboarded.append((localpart, password))
         return True
 
-    res = await main.reconcile_once(cfg, secrets, existing=["bot-b", "bot-c"], _login=fake_login)
+    res = await main.reconcile_once(cfg, secrets, existing=["bot-b", "bot-c"],
+                                    onboard=fake_onboard)
 
-    # every desired account (re)asserted via create-on-login
+    # every desired account (re)asserted via onboarding into the core
     assert res["provisioned"] == ["bot-a", "bot-b"]
     assert res["failed"] == []
     # diff vs existing: bot-a is new; bot-c is no longer desired → prune report
     assert res["to_provision"] == ["bot-a"]
     assert res["prune"] == ["bot-c"]
-    # login used the config domain + a minted password, per bot
-    users = {u for _, _, u, _ in logins}
-    assert users == {"bot-a@d.example", "bot-b@d.example"}
+    # onboarded exactly the desired bots
+    assert {lp for lp, _ in onboarded} == {"bot-a", "bot-b"}
     # passwords came from the secrets store (persisted)
-    assert secrets.get_or_create("bot-a") in {pw for *_, pw in logins}
+    assert secrets.get_or_create("bot-a") in {pw for _, pw in onboarded}
 
 
 @pytest.mark.asyncio
-async def test_reconcile_once_reports_login_failures(tmp_path):
+async def test_reconcile_once_reports_onboard_failures(tmp_path):
     cfg = _cfg("bot-a")
     secrets = main.SecretsStore(str(tmp_path / "s.json"))
 
-    async def failing_login(host, port, user, password):
+    async def failing_onboard(localpart, password):
         return False
 
-    res = await main.reconcile_once(cfg, secrets, existing=[], _login=failing_login)
+    res = await main.reconcile_once(cfg, secrets, existing=[], onboard=failing_onboard)
     assert res["failed"] == ["bot-a"]
     assert res["provisioned"] == []
 
 
 @pytest.mark.asyncio
-async def test_reconcile_once_no_real_imap_when_login_injected(tmp_path):
-    """Guard: with the login injected, reconcile_once never touches a live IMAP server."""
+async def test_reconcile_once_onboard_exception_marks_failed(tmp_path):
+    """A raising onboard (core/transport error) is caught → that bot is 'failed', and the
+    reconcile pass survives (a single bad account never crashes the loop)."""
+    cfg = _cfg("bot-a", "bot-b")
+    secrets = main.SecretsStore(str(tmp_path / "s.json"))
+
+    async def boom(localpart, password):
+        if localpart == "bot-a":
+            raise RuntimeError("core down")
+        return True
+
+    res = await main.reconcile_once(cfg, secrets, existing=[], onboard=boom)
+    assert res["failed"] == ["bot-a"]
+    assert res["provisioned"] == ["bot-b"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_no_real_io_when_onboard_injected(tmp_path):
+    """Guard: with the onboard injected, reconcile_once never touches a live core/IMAP."""
     cfg = _cfg("a", "b")
     secrets = main.SecretsStore(str(tmp_path / "s.json"))
     seen = []
 
-    async def fake_login(*a):
+    async def fake_onboard(*a):
         seen.append(a)
         return True
 
-    await main.reconcile_once(cfg, secrets, existing=[], _login=fake_login)
+    await main.reconcile_once(cfg, secrets, existing=[], onboard=fake_onboard)
     assert len(seen) == 2  # exactly the two desired bots, no network
 
 
@@ -174,3 +191,60 @@ def test_service_app_send_route_works_end_to_end(tmp_path):
     r = client.post("/send", json={"bot_id": "bot-a", "target": 7, "text": "hi"})
     assert r.status_code == 200
     assert r.json() == {"status": "sent", "msg_id": 4242, "account_id": 1}
+
+
+# -- event pump: the startup-freeze regression ------------------------------
+
+
+def test_event_pump_dispatches_incoming_and_never_blocks_the_loop():
+    """Regression for the startup-freeze bug (both uvicorns stuck at 'Waiting for application
+    startup', never bind): the BLOCKING deltachat event read must run in a thread and must
+    NOT freeze the asyncio loop; incoming messages bridge onto the loop via the pump."""
+    import asyncio
+    import threading
+
+    async def _run():
+        started = threading.Event()
+        release = threading.Event()
+        got: list = []
+
+        class BlockingBackend:
+            def __init__(self):
+                self.calls = 0
+
+            def next_inbound(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "MSG-1"                # one incoming to dispatch
+                started.set()
+                release.wait(2.0)                 # then block, like get_next_event long-poll
+                return None
+
+        class FakeRelay:
+            async def handle_inbound(self, msg):
+                got.append(msg)
+                return []
+
+        loop = asyncio.get_running_loop()
+        stop = {"v": False}
+        th = threading.Thread(
+            target=main._event_pump,
+            args=(BlockingBackend(), FakeRelay(), loop),
+            kwargs={"_should_stop": lambda: stop["v"]},
+            daemon=True,
+        )
+        th.start()
+        # the incoming msg is dispatched onto our loop while we stay responsive...
+        for _ in range(100):
+            if got:
+                break
+            await asyncio.sleep(0.01)
+        # ...and the loop is still alive even though the pump thread is now blocked in read.
+        assert started.wait(1.0)
+        assert await asyncio.wait_for(asyncio.sleep(0, result="alive"), timeout=1.0) == "alive"
+        assert got == ["MSG-1"]
+        stop["v"] = True
+        release.set()
+        th.join(2.0)
+
+    asyncio.run(_run())
