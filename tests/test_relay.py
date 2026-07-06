@@ -99,6 +99,10 @@ class FakeBackend:
         self.securejoined.append((account_id, invite))
         return 4321
 
+    def delete_chat(self, account_id: int, chat_id: int) -> None:
+        self.deleted = getattr(self, "deleted", [])
+        self.deleted.append((account_id, chat_id))
+
 
 def directory_transport(agents: list[dict], wake_sink: list[dict], *,
                         directory_status: int = 200):
@@ -643,6 +647,33 @@ def test_secure_join_endpoint(tmp_path):
     assert backend.securejoined == [(3, "https://i.delta.chat/#FAKE")]
 
     miss = client.post("/secure_join", json={"bot_id": "nobody", "invite": "https://i.delta.chat/#FAKE"})
+    assert miss.status_code == 404
+
+
+def test_relay_delete_chat_routes_to_account(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 3})
+    relay = make_relay(backend, [], [], tmp_path)
+    out = relay.delete_chat("bot-a", 12)
+    assert out == {"status": "deleted", "account_id": 3, "chat_id": 12}
+    assert backend.deleted == [(3, 12)]
+
+
+def test_relay_delete_chat_unknown_bot_raises(tmp_path):
+    relay = make_relay(FakeBackend(accounts={"bot-a": 3}), [], [], tmp_path)
+    with pytest.raises(KeyError):
+        relay.delete_chat("nobody", 12)
+
+
+def test_delete_chat_endpoint(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 3})
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+
+    resp = client.post("/delete_chat", json={"bot_id": "bot-a", "chat_id": 12})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "deleted", "account_id": 3, "chat_id": 12}
+    assert backend.deleted == [(3, 12)]
+
+    miss = client.post("/delete_chat", json={"bot_id": "nobody", "chat_id": 12})
     assert miss.status_code == 404
 
 

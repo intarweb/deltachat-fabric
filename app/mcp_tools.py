@@ -187,6 +187,21 @@ class DeltaCreateInviteTool(_RelayTool):
         return await self._get("/invite", {"bot_id": bot_id}, self.name)
 
 
+class DeltaDeleteChatTool(_RelayTool):
+    """``delta_delete_chat`` — delete a chat for a bot (e.g. clear a stale/tangled securejoin).
+
+    Deleting the chat drops any in-progress securejoin half-handshake it carries, so a single
+    clean securejoin can then complete. Returns ``{account_id, chat_id, status:"deleted"}``.
+    """
+
+    name = "delta_delete_chat"
+
+    async def delete_chat(self, bot_id: str, chat_id: int) -> dict:
+        return await self._post(
+            "/delete_chat", {"bot_id": bot_id, "chat_id": int(chat_id)}, self.name
+        )
+
+
 def _detail(resp: httpx.Response) -> str:
     try:
         body = resp.json()
