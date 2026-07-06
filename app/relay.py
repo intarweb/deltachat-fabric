@@ -111,6 +111,11 @@ class DeltaBackend(Protocol):
         confirm RECEIPT (the inbound side) — e.g. prove a bot-to-bot send round-trips."""
         ...
 
+    def create_invite(self, account_id: int) -> str:
+        """Generate the account's securejoin CONTACT-invite link (i.delta.chat/#...) — a human
+        taps it in their Delta app to establish a verified contact with this bot. (Optional on fakes.)"""
+        ...
+
     def ensure_account(self, localpart: str, password: str, *,
                        imap_host: str, imap_port: int,
                        smtp_host: str, smtp_port: int) -> bool:
@@ -365,6 +370,12 @@ class DeltaChat2Backend:
             except Exception:
                 continue
         return out
+
+    def create_invite(self, account_id: int) -> str:  # pragma: no cover - real rpc
+        # get_chat_securejoin_qr_code(accid, None) -> the account's securejoin CONTACT-invite
+        # link (i.delta.chat/#...); a human taps it to become a verified contact. Verified vs
+        # installed deltachat2.
+        return self.rpc.get_chat_securejoin_qr_code(account_id, None)
 
     # -- onboarding (create-on-login + configure into the deltachat CORE) ---
     def ensure_account(self, localpart: str, password: str, *,
@@ -629,6 +640,12 @@ class Relay:
         return {"account_id": accid, "chat_id": int(chat_id),
                 "messages": self.backend.list_messages(accid, int(chat_id), int(limit))}
 
+    def create_invite(self, bot: str) -> dict:
+        """Generate ``bot``'s securejoin contact-invite link (a human taps it to verify-contact
+        the bot). Returns {"account_id","invite"}."""
+        accid = self._accid(bot)
+        return {"account_id": accid, "invite": self.backend.create_invite(accid)}
+
     def secure_join(self, bot: str, invite: str) -> dict:
         """Accept a securejoin/verified invite as ``bot`` → the inviter becomes a verified
         key-contact (E2E key-exchange), so they can then be added to an encrypted channel.
@@ -825,6 +842,10 @@ def create_app(relay: Relay):
     @app.get("/contacts")
     async def contacts(bot_id: str):
         return await _run(lambda: relay.list_contacts(bot_id))
+
+    @app.get("/invite")
+    async def invite(bot_id: str):
+        return await _run(lambda: relay.create_invite(bot_id))
 
     @app.get("/channels")
     async def channels(bot_id: str):

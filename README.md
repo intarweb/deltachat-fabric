@@ -36,7 +36,7 @@ Everything that touches the outside world (deltachat rpc-server, IMAP, a2a HTTP)
 behind a thin **injectable** seam, so the whole engine is unit-tested with no live
 rpc-server and no network.
 
-## The 9 MCP tools
+## The 10 MCP tools
 
 Each is a thin client over the relay HTTP contract (base URL from `RELAY_URL`):
 
@@ -51,6 +51,7 @@ Each is a thin client over the relay HTTP contract (base URL from `RELAY_URL`):
 | `delta_react` | `POST /react` `{bot_id,chat_id,msg_id,emoji}` | Set an emoji reaction on a message |
 | `delta_secure_join` | `POST /secure_join` `{bot_id,invite}` | Accept a securejoin/verified invite (link or QR) → the inviter becomes a verified key-contact (E2E key-exchange), so they can be added to an encrypted channel / messaged E2E. The human-onboarding mechanism. |
 | `delta_messages` | `GET /messages` `{bot_id,chat_id,limit}` | Read a bot's recent messages in a chat (`{id,text,from_id}`, newest last) — the read-back/receipt side (confirm a message was received). |
+| `delta_create_invite` | `GET /invite` `{bot_id}` | Generate a bot's securejoin contact-invite link (`i.delta.chat/#...`) for a human to tap → verified contact → the bot can then message them. Human-onboarding (inverse of delta_secure_join). |
 
 `bot_id` also accepts the alias `localpart`. Non-2xx responses surface as errors carrying
 the relay's `detail` (404 = unknown bot).

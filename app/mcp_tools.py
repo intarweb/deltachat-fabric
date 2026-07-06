@@ -173,6 +173,20 @@ class DeltaMessagesTool(_RelayTool):
         )
 
 
+class DeltaCreateInviteTool(_RelayTool):
+    """``delta_create_invite`` — generate a bot's securejoin CONTACT-invite link.
+
+    Returns ``{account_id, invite}`` where ``invite`` is an ``i.delta.chat/#...`` link a HUMAN
+    taps in their Delta app to become a verified contact of the bot — then the bot can message
+    them. This is the human-onboarding mechanism (the inverse of delta_secure_join).
+    """
+
+    name = "delta_create_invite"
+
+    async def create_invite(self, bot_id: str) -> dict:
+        return await self._get("/invite", {"bot_id": bot_id}, self.name)
+
+
 def _detail(resp: httpx.Response) -> str:
     try:
         body = resp.json()

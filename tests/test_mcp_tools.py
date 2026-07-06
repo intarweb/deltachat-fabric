@@ -9,6 +9,7 @@ import pytest
 from app.mcp_tools import (
     DeltaAddMemberTool,
     DeltaCreateChannelTool,
+    DeltaCreateInviteTool,
     DeltaListChannelsTool,
     DeltaListContactsTool,
     DeltaMessagesTool,
@@ -261,3 +262,16 @@ async def test_delta_messages_gets_contract_and_returns_result():
     result = await tool.messages(bot_id="bot-a", chat_id=55, limit=20)
     assert "/messages" in captured["url"] and "bot_id=bot-a" in captured["url"] and "chat_id=55" in captured["url"]
     assert result["messages"] == [{"id": 9, "text": "hi", "from_id": 2}]
+
+
+async def test_delta_create_invite_gets_contract_and_returns_result():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json={"account_id": 1, "invite": "https://i.delta.chat/#X"})
+
+    tool = make_tool(handler, DeltaCreateInviteTool)
+    result = await tool.create_invite(bot_id="bot-a")
+    assert "/invite" in captured["url"] and "bot_id=bot-a" in captured["url"]
+    assert result["invite"] == "https://i.delta.chat/#X"
