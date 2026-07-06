@@ -66,6 +66,20 @@ class DeltaSendTool(_RelayTool):
         )
 
 
+class DeltaSendToTool(_RelayTool):
+    """``delta_send_to`` — message a HUMAN by email address (resolves their 1:1 chat)."""
+
+    name = "delta_send_to"
+
+    async def send_to(self, bot_id: str, addr: str, text: str) -> dict:
+        """Call the relay /send_to (address → contact → 1:1 chat → send). Requires the person
+        to be a verified key-contact of the bot (post-securejoin). Raises RuntimeError on a
+        non-2xx (404 = unknown bot or no contact for addr)."""
+        return await self._post(
+            "/send_to", {"bot_id": bot_id, "addr": addr, "text": text}, self.name
+        )
+
+
 class DeltaListContactsTool(_RelayTool):
     """``delta_list_contacts`` — list a bot account's known contacts."""
 

@@ -18,6 +18,7 @@ from app.mcp_tools import (
     DeltaSecureJoinTool,
     DeltaSendChannelTool,
     DeltaSendTool,
+    DeltaSendToTool,
 )
 
 
@@ -40,6 +41,22 @@ async def test_delta_send_posts_send_contract_and_returns_result():
     assert captured["url"] == "http://relay.test:8080/send"
     assert captured["body"] == {"bot_id": "bot-a", "target": 42, "text": "hi"}
     assert result == {"status": "sent", "msg_id": 1001, "account_id": 7}
+
+
+async def test_delta_send_to_posts_contract_and_returns_result():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"status": "sent", "account_id": 7, "chat_id": 88, "msg_id": 1002})
+
+    tool = make_tool(handler, DeltaSendToTool)
+    result = await tool.send_to(bot_id="bot-a", addr="person@example.com", text="hi")
+
+    assert captured["url"] == "http://relay.test:8080/send_to"
+    assert captured["body"] == {"bot_id": "bot-a", "addr": "person@example.com", "text": "hi"}
+    assert result == {"status": "sent", "account_id": 7, "chat_id": 88, "msg_id": 1002}
 
 
 async def test_delta_send_raises_on_unknown_bot():
