@@ -474,3 +474,108 @@ def test_react_endpoint(tmp_path):
     miss = client.post("/react", json={
         "bot_id": "bot-c", "chat_id": 1, "msg_id": 1, "emoji": "x"})
     assert miss.status_code == 404
+
+
+# --------------------------------------------------------------------------- (7) integration seams: real deltachat2 types + core onboarding
+
+
+def test_incoming_ids_selects_by_type_not_kind_string():
+    """🔴 Regression: deltachat2's ``EventTypeIncomingMsg`` has NO ``.kind`` attribute — it
+    is distinguished by TYPE. The old ``getattr(ev,"kind") == "IncomingMsg"`` check therefore
+    silently dropped EVERY incoming message (would bind + onboard but receive nothing).
+    Verified against the installed deltachat2 (Event.fields = context_id,event;
+    EventTypeIncomingMsg.fields = chat_id,msg_id, no kind)."""
+    from deltachat2 import EventTypeIncomingMsg
+
+    from app.relay import DeltaChat2Backend
+
+    # a real incoming-message event → (chat_id, msg_id)
+    assert DeltaChat2Backend.incoming_ids(EventTypeIncomingMsg(chat_id=7, msg_id=42)) == (7, 42)
+    # a non-incoming, typed event (no chat_id/msg_id) → ignored
+    assert DeltaChat2Backend.incoming_ids(object()) == (None, None)
+    # defensive dict-shaped fallback still works
+    assert DeltaChat2Backend.incoming_ids(
+        {"kind": "IncomingMsg", "chat_id": 1, "msg_id": 2}) == (1, 2)
+
+
+class _FakeRpc:
+    """Records core onboarding calls so ensure_account is unit-tested with no live rpc-server.
+    Mirrors the deltachat2 Rpc surface ensure_account uses (verified against the package)."""
+
+    def __init__(self):
+        self.accounts: dict[int, str | None] = {}   # accid -> configured addr
+        self.configured: set[int] = set()
+        self.transports: list = []                  # (accid, EnteredLoginParam)
+        self.started: list[int] = []
+        self._next = 0
+
+    def get_all_account_ids(self):
+        return list(self.accounts)
+
+    def get_config(self, accid, key):
+        return self.accounts.get(accid)             # addr / configured_addr
+
+    def add_account(self):
+        self._next += 1
+        self.accounts[self._next] = None
+        return self._next
+
+    def set_config(self, accid, key, val):
+        if key == "addr":
+            self.accounts[accid] = val
+
+    def add_or_update_transport(self, accid, param):
+        self.transports.append((accid, param))
+        self.accounts[accid] = param.addr           # core now knows the configured addr
+        self.configured.add(accid)
+
+    def is_configured(self, accid):
+        return accid in self.configured
+
+    def start_io(self, accid):
+        self.started.append(accid)
+
+    def start_io_for_all_accounts(self):
+        pass
+
+
+def test_ensure_account_onboards_into_the_core_not_just_imap(tmp_path):
+    """🔴 Bug 2 regression: onboarding must add+configure the account IN THE DELTACHAT CORE
+    (add_account + add_or_update_transport), not merely IMAP-login — that's why /data/accounts
+    had 0 .db files. Uses the REAL deltachat2 EnteredLoginParam/Socket via a fake rpc."""
+    from app.relay import DeltaChat2Backend
+
+    rpc = _FakeRpc()
+    cfg = make_config()  # mail_domain = deltachat.example.net
+    be = DeltaChat2Backend(cfg, str(tmp_path / "accounts"), _rpc=rpc)
+
+    ok = be.ensure_account("bot-a", "pw123456789",
+                           imap_host="mail.example.net", imap_port=993,
+                           smtp_host="mail.example.net", smtp_port=587)
+
+    assert ok is True
+    # onboarded INTO THE CORE: exactly one transport configured, with the right addr + ports.
+    assert len(rpc.transports) == 1
+    accid, param = rpc.transports[0]
+    assert param.addr == "bot-a@deltachat.example.net"
+    assert (param.imap_server, param.imap_port) == ("mail.example.net", 993)
+    assert (param.smtp_server, param.smtp_port) == ("mail.example.net", 587)
+    assert str(param.imap_security) == "ssl" and str(param.smtp_security) == "starttls"
+    assert rpc.is_configured(accid)
+    assert accid in rpc.started                      # start_io called → begins receiving
+    # the backend now indexes the account by localpart (so /send can resolve it)
+    assert be.account_id_for("bot-a") == accid
+
+
+def test_ensure_account_is_idempotent_skips_already_configured(tmp_path):
+    """A second reconcile pass for an already-configured account is a no-op (no re-add)."""
+    from app.relay import DeltaChat2Backend
+
+    rpc = _FakeRpc()
+    be = DeltaChat2Backend(make_config(), str(tmp_path / "accounts"), _rpc=rpc)
+    kw = dict(imap_host="mail.example.net", imap_port=993,
+              smtp_host="mail.example.net", smtp_port=587)
+
+    assert be.ensure_account("bot-a", "pw123456789", **kw) is True
+    assert be.ensure_account("bot-a", "pw123456789", **kw) is True   # idempotent
+    assert len(rpc.transports) == 1                                  # NOT re-onboarded

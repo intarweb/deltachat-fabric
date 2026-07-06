@@ -196,21 +196,41 @@ class DeltaChat2Backend:
         return self.rpc.send_msg(account_id, chat_id, MsgData(text=text))
 
     # -- inbound -----------------------------------------------------------
-    def next_inbound(self) -> Optional[InboundMessage]:  # pragma: no cover
+    @staticmethod
+    def incoming_ids(ev) -> tuple[Optional[int], Optional[int]]:
+        """(chat_id, msg_id) if ``ev`` is an incoming-message event, else (None, None).
+
+        🔴 deltachat2 deserializes each event to a TYPED dataclass — ``EventTypeIncomingMsg``
+        carries ``chat_id`` + ``msg_id`` and has **NO ``kind`` attribute** (the type IS the
+        discriminator). So we must select by ``isinstance``, NOT a ``kind`` string — a
+        ``getattr(ev,"kind")`` check silently drops EVERY incoming message. Kept as a pure
+        staticmethod so it's unit-tested against the real deltachat2 types (no rpc/network).
+        Verified against the installed deltachat2 (Event.fields = context_id,event;
+        EventTypeIncomingMsg.fields = chat_id,msg_id)."""
+        try:
+            from deltachat2 import EventTypeIncomingMsg  # type: ignore
+            if isinstance(ev, EventTypeIncomingMsg):
+                return ev.chat_id, ev.msg_id
+        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
+            pass
+        # defensive fallbacks: raw dict-shaped events, or a like-named type from another core
+        if isinstance(ev, dict) and ev.get("kind") == "IncomingMsg":
+            return ev.get("chat_id"), ev.get("msg_id")
+        if type(ev).__name__ == "EventTypeIncomingMsg":
+            return getattr(ev, "chat_id", None), getattr(ev, "msg_id", None)
+        return None, None
+
+    def next_inbound(self) -> Optional[InboundMessage]:  # pragma: no cover - real rpc entry
         raw = self.rpc.get_next_event()
         if raw is None:
             return None
-        # deltachat2 Event: the account id is ``context_id`` (aliased from wire ``contextId``);
-        # older bindings used ``account_id``/``accid``. Verified: adbenitez/deltachat2 types.py.
+        # deltachat2 Event: the account id is ``context_id`` (verified vs installed package);
+        # older bindings used ``account_id``/``accid``.
         accid = (getattr(raw, "context_id", None) or getattr(raw, "account_id", None)
                  or getattr(raw, "accid", None) or 0)
         ev = getattr(raw, "event", raw)
-        kind = getattr(ev, "kind", None) or (ev.get("kind") if isinstance(ev, dict) else None)
-        if kind != "IncomingMsg":
-            return None
-        msg_id = getattr(ev, "msg_id", None) or (ev.get("msg_id") if isinstance(ev, dict) else None)
-        chat_id = getattr(ev, "chat_id", None) or (ev.get("chat_id") if isinstance(ev, dict) else None)
-        if msg_id is None or chat_id is None:
+        chat_id, msg_id = self.incoming_ids(ev)
+        if chat_id is None or msg_id is None:
             return None
         return self._build_inbound(accid, chat_id, msg_id)
 
@@ -299,7 +319,7 @@ class DeltaChat2Backend:
     # -- onboarding (create-on-login + configure into the deltachat CORE) ---
     def ensure_account(self, localpart: str, password: str, *,
                        imap_host: str, imap_port: int,
-                       smtp_host: str, smtp_port: int) -> bool:  # pragma: no cover - real core
+                       smtp_host: str, smtp_port: int) -> bool:
         """Idempotently onboard a bot's mailbox INTO THE DELTACHAT CORE so it can send/receive.
 
         add_account() → add_or_update_transport(EnteredLoginParam(...)). The transport login
