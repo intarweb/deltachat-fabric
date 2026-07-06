@@ -27,6 +27,11 @@ Env contract (all optional-with-defaults except the domain):
   DELTA_RECONCILE_INTERVAL            reconciler loop seconds      default 3600
   RELAY_HOST / RELAY_PORT             uvicorn bind             default 0.0.0.0 / 8080
   DELTA_RECONCILE_ON_START            "1" to reconcile once at boot    default 1
+  DELTA_MCP_HOST / DELTA_MCP_PORT     bifrost-facing MCP /mcp bind   default 0.0.0.0 / 8000
+
+The MCP server (app.mcp_server) is served as a SECOND uvicorn in the same asyncio process,
+exposing the 7 delta tools over streamable-HTTP at ``/mcp`` for bifrost. It talks to the
+relay over loopback HTTP (RELAY_URL), so the relay's internal contract stays unchanged.
 """
 from __future__ import annotations
 
@@ -209,6 +214,18 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
 
     server = uvicorn.Server(uvicorn.Config(service.app, host=host, port=port, log_level="info"))
 
+    # Second uvicorn: the bifrost-facing MCP server at /mcp (streamable-HTTP). It reaches
+    # the relay over loopback HTTP; the relay's own /send contract is untouched.
+    from .mcp_server import build_mcp_app
+
+    mcp_host = os.environ.get("DELTA_MCP_HOST", "0.0.0.0")
+    mcp_port = int(os.environ.get("DELTA_MCP_PORT", "8000"))
+    relay_url = os.environ.get("RELAY_URL", f"http://127.0.0.1:{port}")
+    mcp_app = build_mcp_app(relay_url)
+    mcp_server = uvicorn.Server(
+        uvicorn.Config(mcp_app, host=mcp_host, port=mcp_port, log_level="info")
+    )
+
     def existing_fn() -> list[str]:
         # server-side localparts we know about = the relay backend's account index
         idx = getattr(service.relay.backend, "_localpart_to_accid", {})
@@ -216,6 +233,7 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
 
     await asyncio.gather(
         server.serve(),
+        mcp_server.serve(),
         service.relay.run_forever(interval=1.0),
         reconciler_loop(cfg, service.secrets, reconcile_interval, run_on_start, existing_fn),
         backup_mod.run_forever(cfg, service.backup_backend, backup_dir,
