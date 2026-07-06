@@ -108,11 +108,6 @@ class DeltaBackend(Protocol):
         """
         ...
 
-    def react_seen(self, account_id: int, msg_id: int) -> None:
-        """Acknowledge an inbound message by reacting 👀 to it (best-effort) — a clean
-        'seen it' signal instead of a text reply. (Optional on fakes.)"""
-        ...
-
     def localpart_for(self, account_id: int) -> Optional[str]:
         """The bot localpart owning ``account_id`` (reverse of ``account_id_for``), or None."""
         ...
@@ -382,13 +377,6 @@ class DeltaChat2Backend:
             account_id=accid, chat_id=chat_id or 0, msg_id=msg_id or 0,
             emoji=emoji, from_id=contact_id or 0, from_addr=from_addr,
         )
-
-    def react_seen(self, account_id: int, msg_id: int) -> None:  # pragma: no cover - real rpc
-        """React 👀 to an inbound message — a clean 'seen it' ack (no text reply)."""
-        try:
-            self.rpc.send_reaction(account_id, msg_id, ["\U0001f440"])
-        except Exception:
-            pass
 
     def localpart_for(self, account_id: int) -> Optional[str]:  # pragma: no cover - real rpc
         for lp, accid in self._localpart_to_accid.items():

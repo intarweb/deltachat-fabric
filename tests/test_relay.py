@@ -68,10 +68,6 @@ class FakeBackend:
                 return lp
         return None
 
-    def react_seen(self, account_id: int, msg_id: int) -> None:
-        self.seen_acks = getattr(self, "seen_acks", [])
-        self.seen_acks.append((account_id, msg_id))
-
     def send(self, account_id: int, chat_id: int, text: str) -> int:
         self._next_msg_id += 1
         self.sent.append((account_id, chat_id, text))

@@ -305,12 +305,9 @@ def _event_pump(backend, relay: Relay, loop: asyncio.AbstractEventLoop,
             if isinstance(msg, InboundReaction):
                 submit(relay.handle_reaction(msg))  # human reacted → wake bot w/ {who,emoji,msg_id}
             else:
-                # 👀-ack the inbound message (best-effort, blocking rpc — we're in the pump
-                # thread) so the human sees it was received, then wake the bot(s).
-                try:
-                    backend.react_seen(msg.account_id, msg.msg_id)
-                except Exception:
-                    log.exception("react_seen (👀 ack) failed")
+                # Relay is wake+deliver+surface ONLY — it must NOT react on the bot's behalf.
+                # The 👀 proof-of-life is AGENT-side: the woken bot calls delta_react as its
+                # first step. Auto-reacting here would fake liveness (👀 without a real wake).
                 submit(relay.handle_inbound(msg))
         except Exception:
             log.exception("inbound dispatch failed")
