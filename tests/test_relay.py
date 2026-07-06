@@ -137,10 +137,17 @@ def directory_transport(agents: list[dict], wake_sink: list[dict], *,
             if directory_status != 200:
                 return httpx.Response(directory_status, json={})
             return httpx.Response(200, json={"agents": agents})
-        # POST = wake delivery
+        # POST = wake delivery (A2A JSON-RPC message/send). Record url + the raw body + the
+        # extracted message text so tests can assert on the human-readable envelope.
         body = json.loads(request.content.decode() or "{}")
-        wake_sink.append({"url": str(request.url), "body": body})
-        return httpx.Response(200, json={"ok": True})
+        text = ""
+        try:
+            text = body["params"]["message"]["parts"][0]["text"]
+        except Exception:
+            pass
+        wake_sink.append({"url": str(request.url), "body": body,
+                          "method": body.get("method"), "text": text})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body.get("id"), "result": {}})
 
     return httpx.MockTransport(handler)
 
@@ -258,9 +265,10 @@ async def test_inbound_group_mention_wakes_right_bot_via_resolved_url(tmp_path):
 
     assert woken == ["bot-a"]                       # delegates to routing.wake_targets
     assert len(wakes) == 1
-    assert wakes[0]["url"] == "http://bot-a.live:8020/a2a"   # resolved from mocked directory
-    assert wakes[0]["body"]["bot_id"] == "bot-a"
-    assert wakes[0]["body"]["msg_id"] == 99
+    # A2A message/send to the bot's OWN agent url (NOT <url>/a2a), carrying the text envelope
+    assert wakes[0]["url"] == "http://bot-a.live:8020"   # resolved from mocked directory
+    assert wakes[0]["method"] == "message/send"
+    assert "Delta Chat" in wakes[0]["text"] and "@bot-a" in wakes[0]["text"]
     assert len(relay.hold) == 0                     # delivered → nothing held
 
 
@@ -278,7 +286,8 @@ async def test_inbound_no_mention_wakes_only_channel_main(tmp_path):
     woken = await relay.handle_inbound(msg)
 
     assert woken == ["bot-lead"]
-    assert [w["body"]["bot_id"] for w in wakes] == ["bot-lead"]
+    assert [w["url"] for w in wakes] == ["http://bot-lead.live:7780"]
+    assert all(w["method"] == "message/send" for w in wakes)
 
 
 async def test_inbound_direct_1to1_wakes_receiving_bot(tmp_path):
@@ -294,9 +303,11 @@ async def test_inbound_direct_1to1_wakes_receiving_bot(tmp_path):
     woken = await relay.handle_inbound(msg)
 
     assert woken == ["bot-a"]
-    assert wakes[0]["body"]["bot_id"] == "bot-a"
-    assert wakes[0]["body"]["msg_id"] == 16
-    assert wakes[0]["body"]["direct"] is True
+    w = wakes[0]
+    # A2A message/send to bot-a's own agent url; DM marker + message text in the envelope
+    assert w["url"] == "http://bot-a.live:8020"
+    assert w["method"] == "message/send"
+    assert "DM" in w["text"] and "Hrllo" in w["text"]
 
 
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
@@ -321,12 +332,13 @@ async def test_handle_reaction_wakes_owner_with_envelope(tmp_path):
     woken = await relay.handle_reaction(r)
 
     assert woken == ["bot-a"]
-    body = wakes[0]["body"]
-    assert body["bot_id"] == "bot-a"
-    assert body["reaction"] == "👍"
-    assert body["from"] == "person@example.com"
-    assert body["msg_id"] == 17
-    assert "reacted 👍" in body["text"]
+    w = wakes[0]
+    # A2A message/send to bot-a's own agent url; the text surfaces {who, emoji, msg_id}
+    assert w["url"] == "http://bot-a.live:8020"
+    assert w["method"] == "message/send"
+    assert "reacted 👍" in w["text"]
+    assert "person@example.com" in w["text"]
+    assert "msg 17" in w["text"]
 
 
 async def test_handle_reaction_unknown_account_noop(tmp_path):
@@ -335,6 +347,30 @@ async def test_handle_reaction_unknown_account_noop(tmp_path):
     relay = make_relay(FakeBackend(accounts={"bot-a": 7}),
                        [{"name": "bot-a", "url": "http://bot-a.live:8020"}], [], tmp_path)
     assert await relay.handle_reaction(r) == []
+
+
+async def test_wake_posts_a2a_jsonrpc_message_send_to_agent_url(tmp_path):
+    """🔴 Regression: a2abridge speaks A2A JSON-RPC. The wake MUST be a `message/send` request
+    POSTed to the agent's OWN url — NOT a plain JSON POST to `<url>/a2a` (that never lands in the
+    bot's a2a inbox; it's why live reaction/DM wakes silently failed while /messages still read
+    the store fine). This asserts the exact envelope shape against the resolved url."""
+    from app.relay import AgentDirectory
+
+    wakes: list[dict] = []
+    client = httpx.AsyncClient(
+        transport=directory_transport([{"name": "bot-a", "url": "http://bot-a.live:8020"}], wakes)
+    )
+    directory = AgentDirectory(make_config(), client)
+    ok = await directory.wake("http://bot-a.live:8020", "bot-a", {"text": "hello bot"})
+
+    assert ok is True
+    w = wakes[0]
+    assert w["url"] == "http://bot-a.live:8020"          # the agent url itself, NOT /a2a
+    body = w["body"]
+    assert body["jsonrpc"] == "2.0" and body["method"] == "message/send"
+    msg = body["params"]["message"]
+    assert msg["role"] == "user" and msg["kind"] == "message" and msg["messageId"]
+    assert msg["parts"][0] == {"kind": "text", "text": "hello bot"}
 
 
 # --------------------------------------------------------------------------- (3) unresolvable → held + drained
@@ -369,7 +405,8 @@ async def test_unresolvable_target_is_held_then_drained_idempotent(tmp_path):
     delivered = await relay.drain_holds()
     assert delivered == 1
     assert len(relay.hold) == 0
-    assert wakes[0]["url"] == "http://bot-a.live:8020/a2a"
+    assert wakes[0]["url"] == "http://bot-a.live:8020"
+    assert wakes[0]["method"] == "message/send"
 
     # draining again is a no-op (idempotent, nothing left)
     assert await relay.drain_holds() == 0
