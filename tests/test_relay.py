@@ -62,6 +62,16 @@ class FakeBackend:
     def account_id_for(self, localpart: str) -> Optional[int]:
         return self._accounts.get(localpart)
 
+    def localpart_for(self, account_id: int) -> Optional[str]:
+        for lp, accid in self._accounts.items():
+            if accid == account_id:
+                return lp
+        return None
+
+    def react_seen(self, account_id: int, msg_id: int) -> None:
+        self.seen_acks = getattr(self, "seen_acks", [])
+        self.seen_acks.append((account_id, msg_id))
+
     def send(self, account_id: int, chat_id: int, text: str) -> int:
         self._next_msg_id += 1
         self.sent.append((account_id, chat_id, text))
@@ -271,12 +281,60 @@ async def test_inbound_no_mention_wakes_only_channel_main(tmp_path):
     assert [w["body"]["bot_id"] for w in wakes] == ["bot-lead"]
 
 
-async def test_inbound_non_group_is_ignored(tmp_path):
-    msg = InboundMessage(account_id=7, chat_id=1, msg_id=1, text="hi", is_group=False,
+async def test_inbound_direct_1to1_wakes_receiving_bot(tmp_path):
+    # a 1:1 (non-group) message — e.g. a human DM — wakes the RECEIVING bot (account owner),
+    # marked direct, so bots see direct messages not just group traffic.
+    msg = InboundMessage(account_id=7, chat_id=11, msg_id=16, text="Hrllo", is_group=False,
                          members=[], mentioned=[])
     backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
-    relay = make_relay(backend, [], [], tmp_path)
+    wakes: list[dict] = []
+    agents = [{"name": "bot-a", "url": "http://bot-a.live:8020"}]
+    relay = make_relay(backend, agents, wakes, tmp_path)
+
+    woken = await relay.handle_inbound(msg)
+
+    assert woken == ["bot-a"]
+    assert wakes[0]["body"]["bot_id"] == "bot-a"
+    assert wakes[0]["body"]["msg_id"] == 16
+    assert wakes[0]["body"]["direct"] is True
+
+
+async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
+    # non-group message for an account with no known bot → nothing to wake
+    msg = InboundMessage(account_id=99, chat_id=1, msg_id=1, text="hi", is_group=False,
+                         members=[], mentioned=[])
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], [], tmp_path)
     assert await relay.handle_inbound(msg) == []
+
+
+async def test_handle_reaction_wakes_owner_with_envelope(tmp_path):
+    # a human reacted to bot-a's message → wake bot-a with {who, emoji, msg_id}
+    from app.relay import InboundReaction
+    r = InboundReaction(account_id=7, chat_id=11, msg_id=17, emoji="👍",
+                        from_id=12, from_addr="person@example.com")
+    backend = FakeBackend(accounts={"bot-a": 7})
+    wakes: list[dict] = []
+    agents = [{"name": "bot-a", "url": "http://bot-a.live:8020"}]
+    relay = make_relay(backend, agents, wakes, tmp_path)
+
+    woken = await relay.handle_reaction(r)
+
+    assert woken == ["bot-a"]
+    body = wakes[0]["body"]
+    assert body["bot_id"] == "bot-a"
+    assert body["reaction"] == "👍"
+    assert body["from"] == "person@example.com"
+    assert body["msg_id"] == 17
+    assert "reacted 👍" in body["text"]
+
+
+async def test_handle_reaction_unknown_account_noop(tmp_path):
+    from app.relay import InboundReaction
+    r = InboundReaction(account_id=99, chat_id=1, msg_id=1, emoji="👍", from_addr="p@example.com")
+    relay = make_relay(FakeBackend(accounts={"bot-a": 7}),
+                       [{"name": "bot-a", "url": "http://bot-a.live:8020"}], [], tmp_path)
+    assert await relay.handle_reaction(r) == []
 
 
 # --------------------------------------------------------------------------- (3) unresolvable → held + drained
@@ -555,6 +613,23 @@ def test_incoming_ids_selects_by_type_not_kind_string():
     # defensive dict-shaped fallback still works
     assert DeltaChat2Backend.incoming_ids(
         {"kind": "IncomingMsg", "chat_id": 1, "msg_id": 2}) == (1, 2)
+
+
+def test_reaction_ids_selects_incoming_reaction_and_skips_removals():
+    """Reactions arrive as EventTypeIncomingReaction on the core event stream (chat_id,
+    contact_id, msg_id, reaction). A non-empty reaction → the 4-tuple; an EMPTY reaction =
+    the reactor removed it → None (nothing to forward). Verified vs installed deltachat2."""
+    from deltachat2 import EventTypeIncomingReaction
+
+    from app.relay import DeltaChat2Backend
+
+    ev = EventTypeIncomingReaction(chat_id=11, contact_id=12, msg_id=17, reaction="👍")
+    assert DeltaChat2Backend.reaction_ids(ev) == (11, 12, 17, "👍")
+    # removal (empty reaction) → skipped
+    assert DeltaChat2Backend.reaction_ids(
+        EventTypeIncomingReaction(chat_id=11, contact_id=12, msg_id=17, reaction="")) is None
+    # a non-reaction typed event → None
+    assert DeltaChat2Backend.reaction_ids(object()) is None
 
 
 class _FakeRpc:

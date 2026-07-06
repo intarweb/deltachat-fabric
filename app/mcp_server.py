@@ -209,12 +209,19 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
 
     @mcp.tool(name="delta_add_member")
     async def delta_add_member(bot_id: str, channel_id: int, contact: str) -> dict:
-        """Add one contact to an existing group chat (channel).
+        """Add one EXISTING key-contact to a group chat (channel).
+
+        🔴 Only works for a contact that is ALREADY a verified key-contact of ``bot_id``. Adding
+        a not-yet-verified address to an ENCRYPTED group fails with "Only key-contacts can be
+        added to encrypted chats" — that's a deltachat constraint, NOT a bug. To onboard a NEW
+        person into an encrypted group, they must first become a key-contact via securejoin
+        (they tap the bot's invite — see delta_create_invite / delta_secure_join); only then can
+        they be added here.
 
         Args:
             bot_id: The bot/account localpart performing the add.
             channel_id: The Delta group-chat id to add the member to.
-            contact: The contact's email address to add (caller-supplied).
+            contact: The contact's email address to add (must already be a key-contact).
 
         Returns ``{"status":"added","channel_id":int,"account_id":int,"contact"}``.
         """
