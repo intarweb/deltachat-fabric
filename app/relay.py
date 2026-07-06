@@ -106,6 +106,11 @@ class DeltaBackend(Protocol):
         """Set the reaction ``emoji`` on message ``msg_id`` for this account."""
         ...
 
+    def list_messages(self, account_id: int, chat_id: int, limit: int = 20) -> list[dict]:
+        """Recent messages in a chat as ``[{id,text,from_id}, ...]`` (newest last). Used to
+        confirm RECEIPT (the inbound side) — e.g. prove a bot-to-bot send round-trips."""
+        ...
+
     def ensure_account(self, localpart: str, password: str, *,
                        imap_host: str, imap_port: int,
                        smtp_host: str, smtp_port: int) -> bool:
@@ -345,6 +350,21 @@ class DeltaChat2Backend:
 
     def react(self, account_id: int, msg_id: int, emoji: str) -> None:  # pragma: no cover
         self.rpc.send_reaction(account_id, msg_id, [emoji])
+
+    def list_messages(self, account_id: int, chat_id: int, limit: int = 20) -> list[dict]:  # pragma: no cover
+        # get_message_ids(accid, chatid, info_only, add_daymarker) -> list[int] (verified);
+        # read the newest `limit` via get_message. Defensive per-message so one bad id doesn't
+        # abort the read.
+        ids = self.rpc.get_message_ids(account_id, int(chat_id), False, False) or []
+        out: list[dict] = []
+        for mid in ids[-int(limit):]:
+            try:
+                m = self.rpc.get_message(account_id, mid)
+                out.append({"id": mid, "text": getattr(m, "text", "") or "",
+                            "from_id": getattr(m, "from_id", 0) or 0})
+            except Exception:
+                continue
+        return out
 
     # -- onboarding (create-on-login + configure into the deltachat CORE) ---
     def ensure_account(self, localpart: str, password: str, *,
@@ -602,6 +622,13 @@ class Relay:
         return {"status": "reacted", "account_id": accid, "chat_id": int(chat_id),
                 "msg_id": int(msg_id), "emoji": emoji}
 
+    def list_messages(self, bot: str, chat_id: int, limit: int = 20) -> dict:
+        """Recent messages in ``chat_id`` for ``bot``. Returns {"account_id","chat_id",
+        "messages":[{id,text,from_id}, ...]} — the read-back side (confirm receipt)."""
+        accid = self._accid(bot)
+        return {"account_id": accid, "chat_id": int(chat_id),
+                "messages": self.backend.list_messages(accid, int(chat_id), int(limit))}
+
     def secure_join(self, bot: str, invite: str) -> dict:
         """Accept a securejoin/verified invite as ``bot`` → the inviter becomes a verified
         key-contact (E2E key-exchange), so they can then be added to an encrypted channel.
@@ -802,6 +829,10 @@ def create_app(relay: Relay):
     @app.get("/channels")
     async def channels(bot_id: str):
         return await _run(lambda: relay.list_channels(bot_id))
+
+    @app.get("/messages")
+    async def messages(bot_id: str, chat_id: int, limit: int = 20):
+        return await _run(lambda: relay.list_messages(bot_id, chat_id, limit))
 
     @app.post("/send_channel")
     async def send_channel(req: SendChannelRequest):

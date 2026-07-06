@@ -11,6 +11,7 @@ from app.mcp_tools import (
     DeltaCreateChannelTool,
     DeltaListChannelsTool,
     DeltaListContactsTool,
+    DeltaMessagesTool,
     DeltaReactTool,
     DeltaSecureJoinTool,
     DeltaSendChannelTool,
@@ -246,3 +247,17 @@ async def test_delta_secure_join_posts_contract_and_returns_result():
     assert captured["url"] == "http://relay.test:8080/secure_join"
     assert captured["body"] == {"bot_id": "bot-a", "invite": "https://i.delta.chat/#FAKE"}
     assert result == {"status": "securejoin-initiated", "account_id": 3, "chat_id": 4321}
+
+
+async def test_delta_messages_gets_contract_and_returns_result():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json={"account_id": 7, "chat_id": 55,
+                                         "messages": [{"id": 9, "text": "hi", "from_id": 2}]})
+
+    tool = make_tool(handler, DeltaMessagesTool)
+    result = await tool.messages(bot_id="bot-a", chat_id=55, limit=20)
+    assert "/messages" in captured["url"] and "bot_id=bot-a" in captured["url"] and "chat_id=55" in captured["url"]
+    assert result["messages"] == [{"id": 9, "text": "hi", "from_id": 2}]

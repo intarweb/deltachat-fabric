@@ -157,6 +157,22 @@ class DeltaSecureJoinTool(_RelayTool):
         )
 
 
+class DeltaMessagesTool(_RelayTool):
+    """``delta_messages`` — read a bot's recent messages in a chat (the read-back / receipt side).
+
+    Returns ``{account_id, chat_id, messages:[{id,text,from_id}, ...]}`` (newest last). Lets a
+    caller confirm a message was RECEIVED (e.g. prove a bot-to-bot send round-trips).
+    """
+
+    name = "delta_messages"
+
+    async def messages(self, bot_id: str, chat_id: int, limit: int = 20) -> dict:
+        return await self._get(
+            "/messages", {"bot_id": bot_id, "chat_id": int(chat_id), "limit": int(limit)},
+            self.name,
+        )
+
+
 def _detail(resp: httpx.Response) -> str:
     try:
         body = resp.json()

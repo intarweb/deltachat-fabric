@@ -41,13 +41,14 @@ from .mcp_tools import (
     DeltaCreateChannelTool,
     DeltaListChannelsTool,
     DeltaListContactsTool,
+    DeltaMessagesTool,
     DeltaReactTool,
     DeltaSecureJoinTool,
     DeltaSendChannelTool,
     DeltaSendTool,
 )
 
-# The 8 tool names exactly as they appear in an MCP client's tools/list.
+# The 9 tool names exactly as they appear in an MCP client's tools/list.
 TOOL_NAMES = (
     "delta_send",
     "delta_list_contacts",
@@ -57,6 +58,7 @@ TOOL_NAMES = (
     "delta_add_member",
     "delta_react",
     "delta_secure_join",
+    "delta_messages",
 )
 
 
@@ -109,6 +111,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
     add_member_tool = DeltaAddMemberTool(relay_url=relay_url)
     react_tool = DeltaReactTool(relay_url=relay_url)
     secure_join_tool = DeltaSecureJoinTool(relay_url=relay_url)
+    messages_tool = DeltaMessagesTool(relay_url=relay_url)
 
     @mcp.tool(name="delta_send")
     async def delta_send(bot_id: str, target: int, text: str) -> dict:
@@ -224,6 +227,22 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         Returns ``{"status":"securejoin-initiated","account_id":int,"chat_id":int}``.
         """
         return await secure_join_tool.secure_join(bot_id=bot_id, invite=invite)
+
+    @mcp.tool(name="delta_messages")
+    async def delta_messages(bot_id: str, chat_id: int, limit: int = 20) -> dict:
+        """Read a bot's recent messages in a chat (the read-back / receipt side).
+
+        Use to confirm a message was RECEIVED — e.g. after sending into a channel, read it back
+        to prove a bot-to-bot round-trip.
+
+        Args:
+            bot_id: The bot/account localpart whose chat to read.
+            chat_id: The Delta chat (channel/contact) id to read messages from.
+            limit: Max recent messages to return (default 20).
+
+        Returns ``{"account_id":int,"chat_id":int,"messages":[{id,text,from_id}, ...]}`` (newest last).
+        """
+        return await messages_tool.messages(bot_id=bot_id, chat_id=chat_id, limit=limit)
 
     return mcp
 
