@@ -114,6 +114,11 @@ class DeltaBackend(Protocol):
         Returns True iff the account is configured after the call. (Optional on fakes.)"""
         ...
 
+    def secure_join(self, account_id: int, invite: str) -> int:
+        """Accept a securejoin/verified-invite (link or QR) → the inviter becomes a verified
+        key-contact; returns the resulting chat id. BLOCKING. (Optional on fakes.)"""
+        ...
+
 
 class DeltaChat2Backend:
     """Default backend over deltachat2 (account-manager + rpc-server on a LOCAL dir).
@@ -191,9 +196,22 @@ class DeltaChat2Backend:
 
     # -- send --------------------------------------------------------------
     def send(self, account_id: int, chat_id: int, text: str) -> int:  # pragma: no cover
-        from deltachat2 import MsgData  # type: ignore
+        # deltachat2's message-data type is MessageData (NOT MsgData — verified vs the
+        # installed package; send_msg(accid, chat_id, MessageData) -> int).
+        from deltachat2 import MessageData  # type: ignore
 
-        return self.rpc.send_msg(account_id, chat_id, MsgData(text=text))
+        return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+
+    # -- securejoin (accept a verified invite → inviter becomes a key-contact) ----
+    def secure_join(self, account_id: int, invite: str) -> int:  # pragma: no cover
+        """Accept a securejoin / verified-invite link (or QR content) for ``account_id``.
+
+        This IS the key-exchange: on success the inviter becomes a VERIFIED KEY-CONTACT of
+        this account (so they can then be added to an encrypted chat). Returns the resulting
+        chat id. Verified vs the installed deltachat2 (``secure_join(account_id, qr) -> int``).
+        Blocking (network handshake) — callers run it off the loop.
+        """
+        return self.rpc.secure_join(account_id, invite)
 
     # -- inbound -----------------------------------------------------------
     @staticmethod
@@ -584,6 +602,14 @@ class Relay:
         return {"status": "reacted", "account_id": accid, "chat_id": int(chat_id),
                 "msg_id": int(msg_id), "emoji": emoji}
 
+    def secure_join(self, bot: str, invite: str) -> dict:
+        """Accept a securejoin/verified invite as ``bot`` → the inviter becomes a verified
+        key-contact (E2E key-exchange), so they can then be added to an encrypted channel.
+        Returns {"status","account_id","chat_id"}."""
+        accid = self._accid(bot)
+        chat_id = self.backend.secure_join(accid, invite)
+        return {"status": "securejoin-initiated", "account_id": accid, "chat_id": chat_id}
+
     # -- wake routing ------------------------------------------------------
     def _channel_main(self, members: list[str]) -> Optional[str]:
         """Pick the channel 'main' (realm lead) for a set of members, generically.
@@ -723,6 +749,13 @@ class ReactRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SecureJoinRequest(BaseModel):
+    """Accept a securejoin/verified invite (link or QR content) as ``bot_id``."""
+    bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
+    invite: str
+    model_config = {"populate_by_name": True}
+
+
 def create_app(relay: Relay):
     """Build the internal FastAPI app around a ``Relay``. Imported lazily so tests that
     don't need HTTP don't pay for it."""
@@ -785,6 +818,10 @@ def create_app(relay: Relay):
     @app.post("/react")
     async def react(req: ReactRequest):
         return await _run(lambda: relay.react(req.bot_id, req.chat_id, req.msg_id, req.emoji))
+
+    @app.post("/secure_join")
+    async def secure_join(req: SecureJoinRequest):
+        return await _run(lambda: relay.secure_join(req.bot_id, req.invite))
 
     return app
 

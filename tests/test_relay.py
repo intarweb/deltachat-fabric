@@ -87,6 +87,11 @@ class FakeBackend:
     def react(self, account_id: int, msg_id: int, emoji: str) -> None:
         self.reacted.append((account_id, msg_id, emoji))
 
+    def secure_join(self, account_id: int, invite: str) -> int:
+        self.securejoined = getattr(self, "securejoined", [])
+        self.securejoined.append((account_id, invite))
+        return 4321
+
 
 def directory_transport(agents: list[dict], wake_sink: list[dict], *,
                         directory_status: int = 200):
@@ -602,3 +607,33 @@ def test_contact_to_dict_normalizes_deltachat2_contact_object():
 
     d = DeltaChat2Backend._contact_to_dict(Legacy())
     assert d["address"] == "x@y.net" and d["display_name"] == "x"
+
+
+# --------------------------------------------------------------------------- (8) securejoin
+
+
+def test_relay_secure_join_routes_to_account(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 3})
+    relay = make_relay(backend, [], [], tmp_path)
+    out = relay.secure_join("bot-a", "https://i.delta.chat/#FAKE&a=alpha%40example.net")
+    assert out == {"status": "securejoin-initiated", "account_id": 3, "chat_id": 4321}
+    assert backend.securejoined == [(3, "https://i.delta.chat/#FAKE&a=alpha%40example.net")]
+
+
+def test_relay_secure_join_unknown_bot_raises(tmp_path):
+    relay = make_relay(FakeBackend(accounts={"bot-a": 3}), [], [], tmp_path)
+    with pytest.raises(KeyError):
+        relay.secure_join("nobody", "https://i.delta.chat/#FAKE")
+
+
+def test_secure_join_endpoint(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 3})
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+
+    resp = client.post("/secure_join", json={"bot_id": "bot-a", "invite": "https://i.delta.chat/#FAKE"})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "securejoin-initiated", "account_id": 3, "chat_id": 4321}
+    assert backend.securejoined == [(3, "https://i.delta.chat/#FAKE")]
+
+    miss = client.post("/secure_join", json={"bot_id": "nobody", "invite": "https://i.delta.chat/#FAKE"})
+    assert miss.status_code == 404

@@ -42,11 +42,12 @@ from .mcp_tools import (
     DeltaListChannelsTool,
     DeltaListContactsTool,
     DeltaReactTool,
+    DeltaSecureJoinTool,
     DeltaSendChannelTool,
     DeltaSendTool,
 )
 
-# The 7 tool names exactly as they appear in an MCP client's tools/list.
+# The 8 tool names exactly as they appear in an MCP client's tools/list.
 TOOL_NAMES = (
     "delta_send",
     "delta_list_contacts",
@@ -55,6 +56,7 @@ TOOL_NAMES = (
     "delta_create_channel",
     "delta_add_member",
     "delta_react",
+    "delta_secure_join",
 )
 
 
@@ -88,7 +90,7 @@ def _transport_security():
 
 
 def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
-    """Build the ``FastMCP`` with the 7 delta tools registered.
+    """Build the ``FastMCP`` with the 8 delta tools registered.
 
     ``relay_url`` is injected into every underlying relay client (falls back to the
     ``RELAY_URL`` env / in-container loopback via ``_RelayTool``). The server is
@@ -106,6 +108,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
     create_channel_tool = DeltaCreateChannelTool(relay_url=relay_url)
     add_member_tool = DeltaAddMemberTool(relay_url=relay_url)
     react_tool = DeltaReactTool(relay_url=relay_url)
+    secure_join_tool = DeltaSecureJoinTool(relay_url=relay_url)
 
     @mcp.tool(name="delta_send")
     async def delta_send(bot_id: str, target: int, text: str) -> dict:
@@ -205,6 +208,22 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         return await react_tool.react(
             bot_id=bot_id, chat_id=chat_id, msg_id=msg_id, emoji=emoji
         )
+
+    @mcp.tool(name="delta_secure_join")
+    async def delta_secure_join(bot_id: str, invite: str) -> dict:
+        """Accept a Delta Chat securejoin / verified-invite as a bot (E2E key-exchange).
+
+        Use to onboard a human (or another account) who shares their Delta invite link: the
+        bot accepts it, the inviter becomes a VERIFIED KEY-CONTACT of the bot's account, and
+        they can then be added to an encrypted channel / messaged E2E.
+
+        Args:
+            bot_id: The bot/account localpart that accepts the invite.
+            invite: The securejoin invite link (``https://i.delta.chat/...``) or QR content.
+
+        Returns ``{"status":"securejoin-initiated","account_id":int,"chat_id":int}``.
+        """
+        return await secure_join_tool.secure_join(bot_id=bot_id, invite=invite)
 
     return mcp
 

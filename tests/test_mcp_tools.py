@@ -12,6 +12,7 @@ from app.mcp_tools import (
     DeltaListChannelsTool,
     DeltaListContactsTool,
     DeltaReactTool,
+    DeltaSecureJoinTool,
     DeltaSendChannelTool,
     DeltaSendTool,
 )
@@ -226,3 +227,22 @@ async def test_delta_react_raises_on_server_error():
     with pytest.raises(RuntimeError) as ei:
         await tool.react(bot_id="bot-a", chat_id=1, msg_id=1, emoji="x")
     assert "502" in str(ei.value)
+
+
+# --------------------------------------------------------------------------- secure_join
+
+
+async def test_delta_secure_join_posts_contract_and_returns_result():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"status": "securejoin-initiated", "account_id": 3, "chat_id": 4321})
+
+    tool = make_tool(handler, DeltaSecureJoinTool)
+    result = await tool.secure_join(bot_id="bot-a", invite="https://i.delta.chat/#FAKE")
+
+    assert captured["url"] == "http://relay.test:8080/secure_join"
+    assert captured["body"] == {"bot_id": "bot-a", "invite": "https://i.delta.chat/#FAKE"}
+    assert result == {"status": "securejoin-initiated", "account_id": 3, "chat_id": 4321}
