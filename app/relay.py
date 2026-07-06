@@ -128,11 +128,12 @@ class DeltaChat2Backend:
       * ``Rpc(IOTransport(accounts_dir=...))``      — account manager + rpc-server handle
       * ``rpc.get_all_account_ids() -> list[int]``
       * ``rpc.get_config(accid, "addr") -> str``    — configured address of an account
-      * ``rpc.send_msg(accid, chatid, MsgData(text=...)) -> int``   — returns sent msg id
+      * ``rpc.send_msg(accid, chatid, MessageData(text=...)) -> int``   — returns sent msg id
       * ``rpc.get_next_event() -> RawEvent``         — event stream
       * ``rpc.get_message(accid, msgid)`` / ``rpc.get_basic_chat_info`` /
         ``rpc.get_chat_contacts(accid, chatid) -> list[int]`` / ``rpc.get_contact(accid, cid)``
-      * ``rpc.create_group_chat(accid, name, protect=False) -> int``  — new group (verified)
+      * ``rpc.create_group_chat_unencrypted(accid, name) -> int``  — new group (unencrypted;
+        allows address-based member-add for fresh non-key-contacts. Verified vs installed pkg)
 
     ⚠ deltachat2 API used but NOT verifiable from the autodocs I could reach (context7
     /deltachat-bot/deltabot-cli-py returned no signature). These are the documented
@@ -191,9 +192,11 @@ class DeltaChat2Backend:
 
     # -- send --------------------------------------------------------------
     def send(self, account_id: int, chat_id: int, text: str) -> int:  # pragma: no cover
-        from deltachat2 import MsgData  # type: ignore
+        # deltachat2's message-data type is MessageData (NOT MsgData — verified vs the
+        # installed package; send_msg(accid, chat_id, MessageData) -> int).
+        from deltachat2 import MessageData  # type: ignore
 
-        return self.rpc.send_msg(account_id, chat_id, MsgData(text=text))
+        return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
 
     # -- inbound -----------------------------------------------------------
     @staticmethod
@@ -317,7 +320,13 @@ class DeltaChat2Backend:
         return self.rpc.create_contact(account_id, contact, None)
 
     def create_channel(self, account_id: int, name: str, members: list[str]) -> int:  # pragma: no cover
-        chat_id = self.rpc.create_group_chat(account_id, name, False)
+        # 🔴 UNENCRYPTED group: deltachat encrypted groups only accept key-contacts, but
+        # auto-provisioned fleet bots haven't key-exchanged → add_contact_to_chat fails
+        # ("Only key-contacts can be added to encrypted chats"). Unencrypted groups accept
+        # address-based member-add with no handshake — correct for internal bot-to-bot realm
+        # channels (transport is still TLS to chatmail). E2E for human-facing 1:1s is a
+        # separate securejoin/QR path. (Verified vs installed deltachat2.)
+        chat_id = self.rpc.create_group_chat_unencrypted(account_id, name)
         for m in members:
             self.rpc.add_contact_to_chat(account_id, chat_id, self._resolve_contact(account_id, m))
         return chat_id
