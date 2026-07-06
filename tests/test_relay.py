@@ -76,6 +76,10 @@ class FakeBackend:
     def list_channels(self, account_id: int) -> list[dict]:
         return list(self._channels.get(account_id, []))
 
+    def list_messages(self, account_id: int, chat_id: int, limit: int = 20) -> list[dict]:
+        msgs = getattr(self, "_messages", {}).get((account_id, chat_id), [])
+        return list(msgs)[-limit:]
+
     def create_channel(self, account_id: int, name: str, members: list[str]) -> int:
         self._next_chat_id += 1
         self.created.append((account_id, name, list(members)))
@@ -636,4 +640,37 @@ def test_secure_join_endpoint(tmp_path):
     assert backend.securejoined == [(3, "https://i.delta.chat/#FAKE")]
 
     miss = client.post("/secure_join", json={"bot_id": "nobody", "invite": "https://i.delta.chat/#FAKE"})
+    assert miss.status_code == 404
+
+
+# --------------------------------------------------------------------------- (9) messages (receipt read-back)
+
+
+def test_relay_list_messages_routes_and_returns(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7})
+    backend._messages = {(7, 55): [{"id": 1, "text": "hi", "from_id": 2},
+                                   {"id": 2, "text": "roundtrip", "from_id": 3}]}
+    relay = make_relay(backend, [], [], tmp_path)
+    out = relay.list_messages("bot-a", 55, limit=20)
+    assert out["account_id"] == 7 and out["chat_id"] == 55
+    assert out["messages"][-1] == {"id": 2, "text": "roundtrip", "from_id": 3}
+
+
+def test_relay_list_messages_unknown_bot_raises(tmp_path):
+    relay = make_relay(FakeBackend(accounts={"bot-a": 7}), [], [], tmp_path)
+    with pytest.raises(KeyError):
+        relay.list_messages("nobody", 55)
+
+
+def test_messages_endpoint(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7})
+    backend._messages = {(7, 55): [{"id": 9, "text": "delivered", "from_id": 2}]}
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+    resp = client.get("/messages", params={"bot_id": "bot-a", "chat_id": 55})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["account_id"] == 7 and body["chat_id"] == 55
+    assert body["messages"] == [{"id": 9, "text": "delivered", "from_id": 2}]
+
+    miss = client.get("/messages", params={"bot_id": "bot-c", "chat_id": 1})
     assert miss.status_code == 404
