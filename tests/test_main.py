@@ -248,3 +248,90 @@ def test_event_pump_dispatches_incoming_and_never_blocks_the_loop():
         th.join(2.0)
 
     asyncio.run(_run())
+
+
+# -- integration: the app actually BOOTS + both uvicorns BIND (the freeze, end-to-end) ----
+
+
+def test_serve_boots_and_both_uvicorns_bind_with_blocking_backend(tmp_path, monkeypatch):
+    """🔴 The integration test that would have CAUGHT the freeze: boot the REAL `_serve`
+    gather and assert BOTH uvicorns bind + respond within a timeout — EVEN with a backend
+    whose event read BLOCKS like the real deltachat get_next_event(). If the blocking read
+    regresses back onto the event loop, uvicorn never binds → these HTTP calls time out →
+    this test FAILS. (Units passing while the app won't boot is the exact gap this closes.)"""
+    import asyncio
+    import contextlib
+    import socket
+    import threading
+
+    import httpx
+
+    def _free_port() -> int:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    relay_port, mcp_port = _free_port(), _free_port()
+    monkeypatch.setenv("RELAY_HOST", "127.0.0.1")
+    monkeypatch.setenv("RELAY_PORT", str(relay_port))
+    monkeypatch.setenv("DELTA_MCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("DELTA_MCP_PORT", str(mcp_port))
+    monkeypatch.setenv("DELTA_RECONCILE_ON_START", "0")   # this test is about binding, not onboarding
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DELTA_BACKUP_DIR", str(tmp_path / "backup"))
+    monkeypatch.setenv("DELTA_BACKUP_INTERVAL", "99999")   # backup loop sleeps; never fires in-test
+
+    release = threading.Event()
+
+    class BlockingBackend:
+        """Its event read BLOCKS (like get_next_event long-poll). If run on the loop, freeze."""
+        _localpart_to_accid: dict = {}
+
+        def next_inbound(self):
+            release.wait(15)     # block the pump thread; must NOT freeze the asyncio loop
+            return None
+
+        def ensure_account(self, *a, **k):
+            return True
+
+    from app.relay import AgentDirectory, HoldQueue, Relay
+
+    cfg = _cfg("bot-a", leads={"default": "bot-a"})
+    relay = Relay(cfg, BlockingBackend(), AgentDirectory(cfg, httpx.AsyncClient()),
+                  HoldQueue(str(tmp_path)))
+    svc = main.Service(cfg, relay, main.SecretsStore(str(tmp_path / "s.json")), backup_backend=None)
+
+    async def _await_ok(client, url, timeout=12.0):
+        import time
+        end = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < end:
+            try:
+                r = await client.get(url, timeout=2.0)
+                if r.status_code == 200:
+                    return r
+                last = r.status_code
+            except Exception as e:  # not bound yet
+                last = repr(e)
+            await asyncio.sleep(0.1)
+        raise AssertionError(f"{url} never became ready (last={last}) — loop likely frozen")
+
+    async def _run():
+        task = asyncio.create_task(main._serve(svc))
+        try:
+            async with httpx.AsyncClient() as c:
+                # relay uvicorn must bind + /healthz respond — impossible if the loop is frozen
+                r = await _await_ok(c, f"http://127.0.0.1:{relay_port}/healthz")
+                assert r.json()["status"] == "ok"
+                # MCP uvicorn must also be serving on its port (any <500 proves it bound + runs)
+                mr = await c.get(f"http://127.0.0.1:{mcp_port}/mcp", timeout=3.0)
+                assert mr.status_code < 500
+        finally:
+            release.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(_run())
