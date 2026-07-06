@@ -384,9 +384,9 @@ class _ChanBackend:
     def list_channels(self, accid):
         return self._channels.get(accid, [])
 
-    def create_channel(self, accid, name, members):
+    def create_channel(self, accid, name, members, *, encrypted=True):
         self._next += 1
-        self.created.append((accid, name, list(members)))
+        self.created.append((accid, name, list(members), encrypted))
         return self._next
 
     def add_member(self, accid, chat_id, contact):
@@ -399,8 +399,9 @@ def test_provision_channels_creates_missing_channel_with_members_minus_lead():
                  realm_leads={"r1": "lead"})
     be = _ChanBackend(accounts={"lead": 3, "a": 4})
     res = main.provision_channels(cfg, be)
-    # created by the lead's account, members = realm minus the lead, as addresses
-    assert be.created == [(3, "r1", ["a@d.example"])]
+    # created by the lead's account, members = realm minus the lead, as addresses,
+    # UNENCRYPTED (internal bot-to-bot realm channel — Justin's ruling)
+    assert be.created == [(3, "r1", ["a@d.example"], False)]
     assert res[0]["created"]
 
 

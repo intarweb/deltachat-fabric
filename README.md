@@ -93,6 +93,14 @@ channel by name and only adds missing members; a realm whose lead isn't onboarde
 retried next pass. The lead is the channel's "main" (routing wakes it on an unaddressed
 message). A realm with no lead is skipped (nothing to route unaddressed messages to).
 
+These internal bot-to-bot realm channels are created **unencrypted** (members add by address
+with no key-contact handshake) — appropriate when you operate the mail server yourself
+(end-to-end encryption on your own internal channels guards against no one; transport TLS is
+the real requirement). **Human-facing** chats are the other mode: keep them **encrypted** —
+onboard the person via `delta_secure_join` (they share a Delta invite link → become a verified
+key-contact), then create an encrypted channel / 1:1. `create_channel` defaults to encrypted;
+only the reconciler opts realm channels into unencrypted.
+
 ## Backup
 
 A nightly loop calls the deltachat **imex** backup export

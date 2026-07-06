@@ -90,11 +90,14 @@ class DeltaBackend(Protocol):
         """List a bot account's group chats as ``[{id,name,members:[localpart,...]}, ...]``."""
         ...
 
-    def create_channel(self, account_id: int, name: str, members: list[str]) -> int:
+    def create_channel(self, account_id: int, name: str, members: list[str],
+                       *, encrypted: bool = True) -> int:
         """Create a group chat named ``name`` and add each address in ``members``.
 
         ``members`` are full addresses (or ids the backend can resolve). Returns the chat id.
-        Generic: members come from the caller — nothing is baked.
+        Generic: members come from the caller — nothing is baked. ``encrypted`` (default True)
+        = key-contact group (human/ad-hoc); False = unencrypted (internal bot-to-bot channels
+        where members add without a key handshake).
         """
         ...
 
@@ -334,8 +337,16 @@ class DeltaChat2Backend:
         """Resolve a member address to a contact id (create_contact is create-or-get)."""
         return self.rpc.create_contact(account_id, contact, None)
 
-    def create_channel(self, account_id: int, name: str, members: list[str]) -> int:  # pragma: no cover
-        chat_id = self.rpc.create_group_chat(account_id, name, False)
+    def create_channel(self, account_id: int, name: str, members: list[str],
+                       *, encrypted: bool = True) -> int:  # pragma: no cover
+        # Two modes: encrypted (default — human-facing / ad-hoc; members must be key-contacts,
+        # e.g. via securejoin) vs unencrypted (internal bot-to-bot realm channels — members
+        # add by address with NO key handshake). Verified vs installed deltachat2:
+        # create_group_chat(accid,name,protect) / create_group_chat_unencrypted(accid,name).
+        if encrypted:
+            chat_id = self.rpc.create_group_chat(account_id, name, False)
+        else:
+            chat_id = self.rpc.create_group_chat_unencrypted(account_id, name)
         for m in members:
             self.rpc.add_contact_to_chat(account_id, chat_id, self._resolve_contact(account_id, m))
         return chat_id

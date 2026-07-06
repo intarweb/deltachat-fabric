@@ -217,7 +217,11 @@ def provision_channels(config: Config, backend) -> list[dict]:
             existing = backend.list_channels(lead_accid) or []
             match = next((c for c in existing if c.get("name") == name), None)
             if match is None:
-                chat_id = backend.create_channel(lead_accid, name, member_addrs)
+                # internal bot-to-bot realm channels are UNENCRYPTED (Justin's ruling: he's the
+                # server operator, E2E internal = no value; TLS-in-transit is the real guard).
+                # Members add by address with no key-contact handshake. Human 1:1s stay E2E
+                # (encrypted default + securejoin) — a separate path.
+                chat_id = backend.create_channel(lead_accid, name, member_addrs, encrypted=False)
                 results.append({"realm": ch["realm"], "created": chat_id,
                                 "members": len(member_addrs)})
             else:

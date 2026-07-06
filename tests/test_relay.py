@@ -76,9 +76,11 @@ class FakeBackend:
     def list_channels(self, account_id: int) -> list[dict]:
         return list(self._channels.get(account_id, []))
 
-    def create_channel(self, account_id: int, name: str, members: list[str]) -> int:
+    def create_channel(self, account_id: int, name: str, members: list[str],
+                       *, encrypted: bool = True) -> int:
         self._next_chat_id += 1
         self.created.append((account_id, name, list(members)))
+        self.created_encrypted = encrypted
         return self._next_chat_id
 
     def add_member(self, account_id: int, chat_id: int, contact: str) -> None:
@@ -362,6 +364,9 @@ def test_relay_create_channel_passes_members_from_args_not_baked(tmp_path):
     assert out["members"] == ["bot-a@x.net", "bot-b@x.net"]
     # backend saw exactly the caller-supplied members (generic — not derived from config)
     assert backend.created == [(3, "realm-a-ops", ["bot-a@x.net", "bot-b@x.net"])]
+    # the relay/tool (human/ad-hoc) path defaults to ENCRYPTED (E2E); only the reconciler's
+    # internal realm channels opt into unencrypted.
+    assert backend.created_encrypted is True
 
 
 def test_relay_add_member_passes_contact_from_args(tmp_path):
