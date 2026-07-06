@@ -250,7 +250,29 @@ def test_event_pump_dispatches_incoming_and_never_blocks_the_loop():
     asyncio.run(_run())
 
 
-# -- integration: the app actually BOOTS + both uvicorns BIND (the freeze, end-to-end) ----
+def test_poll_loop_forces_periodic_fetch():
+    """poll_loop nudges relay.force_poll on its interval — the Stalwart #339 IDLE workaround
+    (server pushes STATUS not EXISTS, so the core never wakes on new mail; we poll instead)."""
+    import asyncio
+
+    async def _run():
+        calls = {"n": 0}
+        stop = {"v": False}
+
+        class FakeRelay:
+            def force_poll(self):
+                calls["n"] += 1
+                if calls["n"] >= 2:
+                    stop["v"] = True
+                return {"status": "polled"}
+
+        await asyncio.wait_for(
+            main.poll_loop(FakeRelay(), 0.01, _should_stop=lambda: stop["v"]),
+            timeout=2.0,
+        )
+        assert calls["n"] >= 2
+
+    asyncio.run(_run())
 
 
 def test_serve_boots_and_both_uvicorns_bind_with_blocking_backend(tmp_path, monkeypatch):
