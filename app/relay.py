@@ -59,6 +59,23 @@ class InboundMessage:
     from_id: int = 0
 
 
+@dataclass
+class InboundReaction:
+    """Normalized inbound REACTION — a human reacted to one of the bot's messages.
+
+    ``account_id`` is the bot whose message was reacted to; ``msg_id`` the reacted message;
+    ``from_addr`` the reactor's email (resolved by the backend, so routing never sees
+    deltachat2); ``emoji`` the reaction (never empty — an empty reaction = removal, dropped
+    upstream in the backend).
+    """
+    account_id: int
+    chat_id: int
+    msg_id: int
+    emoji: str
+    from_id: int = 0
+    from_addr: str = ""
+
+
 class DeltaBackend(Protocol):
     """Thin injectable seam over the deltachat account-manager + rpc-server.
 
@@ -81,12 +98,22 @@ class DeltaBackend(Protocol):
         fakes.)"""
         ...
 
-    def next_inbound(self) -> Optional[InboundMessage]:
-        """Pop the next incoming message from the event stream, or None if idle.
+    def next_inbound(self):
+        """Pop the next inbound event from the stream: an ``InboundMessage``, an
+        ``InboundReaction``, or ``None`` if idle / not a routable event.
 
         Non-blocking: the inbound loop calls this repeatedly per tick. Returning None
-        means "nothing waiting right now".
+        means "nothing routable waiting right now".
         """
+        ...
+
+    def react_seen(self, account_id: int, msg_id: int) -> None:
+        """Acknowledge an inbound message by reacting 👀 to it (best-effort) — a clean
+        'seen it' signal instead of a text reply. (Optional on fakes.)"""
+        ...
+
+    def localpart_for(self, account_id: int) -> Optional[str]:
+        """The bot localpart owning ``account_id`` (reverse of ``account_id_for``), or None."""
         ...
 
     def list_contacts(self, account_id: int) -> list[dict]:
@@ -302,7 +329,30 @@ class DeltaChat2Backend:
             return getattr(ev, "chat_id", None), getattr(ev, "msg_id", None)
         return None, None
 
-    def next_inbound(self) -> Optional[InboundMessage]:  # pragma: no cover - real rpc entry
+    @staticmethod
+    def reaction_ids(ev):
+        """(chat_id, contact_id, msg_id, emoji) if ``ev`` is an incoming-REACTION event with a
+        non-empty reaction, else None.
+
+        🔴 Reactions arrive on the deltachat CORE event stream as ``EventTypeIncomingReaction``
+        (fields chat_id/contact_id/msg_id/reaction) — NOT in message bodies, so the IMAP/text
+        path never sees them. An EMPTY ``reaction`` string = the reactor REMOVED their reaction
+        → return None (nothing to forward). Select by isinstance (the type is the discriminator),
+        mirroring incoming_ids. Verified vs installed deltachat2."""
+        try:
+            from deltachat2 import EventTypeIncomingReaction  # type: ignore
+            if isinstance(ev, EventTypeIncomingReaction):
+                return (ev.chat_id, ev.contact_id, ev.msg_id, ev.reaction) if ev.reaction else None
+        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
+            pass
+        if type(ev).__name__ == "EventTypeIncomingReaction":
+            emoji = getattr(ev, "reaction", "") or ""
+            if not emoji:
+                return None
+            return getattr(ev, "chat_id", None), getattr(ev, "contact_id", None), getattr(ev, "msg_id", None), emoji
+        return None
+
+    def next_inbound(self):  # pragma: no cover - real rpc entry
         raw = self.rpc.get_next_event()
         if raw is None:
             return None
@@ -312,9 +362,38 @@ class DeltaChat2Backend:
                  or getattr(raw, "accid", None) or 0)
         ev = getattr(raw, "event", raw)
         chat_id, msg_id = self.incoming_ids(ev)
-        if chat_id is None or msg_id is None:
-            return None
-        return self._build_inbound(accid, chat_id, msg_id)
+        if chat_id is not None and msg_id is not None:
+            return self._build_inbound(accid, chat_id, msg_id)
+        react = self.reaction_ids(ev)
+        if react is not None:
+            r_chat, r_contact, r_msg, emoji = react
+            return self._build_reaction(accid, r_chat, r_contact, r_msg, emoji)
+        return None
+
+    def _build_reaction(self, accid: int, chat_id, contact_id, msg_id, emoji: str) -> InboundReaction:  # pragma: no cover
+        from_addr = ""
+        try:
+            contact = self.rpc.get_contact(accid, contact_id)
+            from_addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
+        except Exception:
+            pass
+        return InboundReaction(
+            account_id=accid, chat_id=chat_id or 0, msg_id=msg_id or 0,
+            emoji=emoji, from_id=contact_id or 0, from_addr=from_addr,
+        )
+
+    def react_seen(self, account_id: int, msg_id: int) -> None:  # pragma: no cover - real rpc
+        """React 👀 to an inbound message — a clean 'seen it' ack (no text reply)."""
+        try:
+            self.rpc.send_reaction(account_id, msg_id, ["\U0001f440"])
+        except Exception:
+            pass
+
+    def localpart_for(self, account_id: int) -> Optional[str]:  # pragma: no cover - real rpc
+        for lp, accid in self._localpart_to_accid.items():
+            if accid == account_id:
+                return lp
+        return None
 
     def _build_inbound(self, accid: int, chat_id: int, msg_id: int) -> InboundMessage:  # pragma: no cover
         msg = self.rpc.get_message(accid, msg_id)
@@ -420,10 +499,24 @@ class DeltaChat2Backend:
             try:
                 m = self.rpc.get_message(account_id, mid)
                 out.append({"id": mid, "text": getattr(m, "text", "") or "",
-                            "from_id": getattr(m, "from_id", 0) or 0})
+                            "from_id": getattr(m, "from_id", 0) or 0,
+                            "reactions": self._reactions_for(account_id, mid)})
             except Exception:
                 continue
         return out
+
+    def _reactions_for(self, account_id: int, msg_id: int) -> list[dict]:  # pragma: no cover - real rpc
+        """Reactions on a message as ``[{emoji,count,is_from_self}, ...]`` (read side, so a
+        caller can see inbound reactions in /messages). Best-effort: [] on any error."""
+        try:
+            reactions = self.rpc.get_message_reactions(account_id, msg_id)
+            if not reactions:
+                return []
+            return [{"emoji": getattr(r, "emoji", ""), "count": getattr(r, "count", 0),
+                     "is_from_self": bool(getattr(r, "is_from_self", False))}
+                    for r in (getattr(reactions, "reactions", None) or [])]
+        except Exception:
+            return []
 
     def create_invite(self, account_id: int) -> str:  # pragma: no cover - real rpc
         # get_chat_securejoin_qr_code(accid, None) -> the account's securejoin CONTACT-invite
@@ -776,22 +869,39 @@ class Relay:
         return None
 
     async def handle_inbound(self, msg: InboundMessage) -> list[str]:
-        """Route one inbound group message → wake the right bot(s). Returns woken bot ids.
+        """Route one inbound message → wake the right bot(s). Returns woken bot ids.
 
-        Non-group messages are ignored (returns []). Delegates target selection to
-        ``routing.wake_targets`` (the anti-thundering-herd rule). Undeliverable targets are
-        parked in the hold-queue.
+        GROUP message → the anti-thundering-herd ``routing.wake_targets`` (mentioned + main).
+        1:1 (non-group, e.g. a human DM) → wake the RECEIVING bot (the account owner) so it
+        sees direct messages, not just group traffic. Undeliverable targets are held.
         """
+        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id, "text": msg.text}
         if not msg.is_group:
-            return []
+            bot = self.backend.localpart_for(msg.account_id)
+            if not bot:
+                return []
+            payload["direct"] = True
+            return [bot] if await self._deliver(bot, payload) else []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)
-        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id, "text": msg.text}
         woken: list[str] = []
         for bot in targets:
             if await self._deliver(bot, payload):
                 woken.append(bot)
         return woken
+
+    async def handle_reaction(self, r: InboundReaction) -> list[str]:
+        """Route one inbound REACTION → wake the bot whose message was reacted to, with an
+        envelope carrying {who, emoji, msg_id}. Returns woken bot ids (the single owner, or [])."""
+        bot = self.backend.localpart_for(r.account_id)
+        if not bot:
+            return []
+        who = r.from_addr or "someone"
+        payload = {
+            "chat_id": r.chat_id, "msg_id": r.msg_id, "reaction": r.emoji, "from": who,
+            "text": f"[{who} reacted {r.emoji} via Delta Chat]",
+        }
+        return [bot] if await self._deliver(bot, payload) else []
 
     async def _deliver(self, bot: str, payload: dict) -> bool:
         """Resolve ``bot``'s live url + POST the wake; hold it on any failure."""
@@ -827,11 +937,14 @@ class Relay:
         """
         processed, woken = 0, 0
         while True:
-            msg = self.backend.next_inbound()
-            if msg is None:
+            item = self.backend.next_inbound()
+            if item is None:
                 break
             processed += 1
-            woken += len(await self.handle_inbound(msg))
+            if isinstance(item, InboundReaction):
+                woken += len(await self.handle_reaction(item))
+            else:
+                woken += len(await self.handle_inbound(item))
         drained = await self.drain_holds()
         return {"processed": processed, "woken": woken, "drained": drained}
 

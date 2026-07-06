@@ -52,7 +52,7 @@ from typing import Awaitable, Callable, Optional
 from . import backup as backup_mod
 from . import reconciler
 from .config import Config
-from .relay import Relay, build_default, create_app
+from .relay import InboundReaction, Relay, build_default, create_app
 
 log = logging.getLogger("dcf")
 
@@ -302,7 +302,16 @@ def _event_pump(backend, relay: Relay, loop: asyncio.AbstractEventLoop,
         if msg is None:
             continue
         try:
-            submit(relay.handle_inbound(msg))
+            if isinstance(msg, InboundReaction):
+                submit(relay.handle_reaction(msg))  # human reacted → wake bot w/ {who,emoji,msg_id}
+            else:
+                # 👀-ack the inbound message (best-effort, blocking rpc — we're in the pump
+                # thread) so the human sees it was received, then wake the bot(s).
+                try:
+                    backend.react_seen(msg.account_id, msg.msg_id)
+                except Exception:
+                    log.exception("react_seen (👀 ack) failed")
+                submit(relay.handle_inbound(msg))
         except Exception:
             log.exception("inbound dispatch failed")
 
