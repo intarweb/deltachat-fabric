@@ -325,8 +325,21 @@ def test_serve_boots_and_both_uvicorns_bind_with_blocking_backend(tmp_path, monk
                 # relay uvicorn must bind + /healthz respond — impossible if the loop is frozen
                 r = await _await_ok(c, f"http://127.0.0.1:{relay_port}/healthz")
                 assert r.json()["status"] == "ok"
-                # MCP uvicorn must also be serving on its port (any <500 proves it bound + runs)
-                mr = await c.get(f"http://127.0.0.1:{mcp_port}/mcp", timeout=3.0)
+                # 🔴 MCP uvicorn must ACCEPT a by-name Host (Host: mcp-deltachat:8000), not just
+                # localhost — the DNS-rebinding-protection default returns 421 to an in-cluster
+                # client connecting by service name (the bug that blocked bifrost). POST a real
+                # initialize with a non-localhost Host and assert it is NOT rejected.
+                init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                   "clientInfo": {"name": "t", "version": "1"}}}
+                mr = await c.post(
+                    f"http://127.0.0.1:{mcp_port}/mcp",
+                    headers={"Host": "mcp-deltachat:8000", "Content-Type": "application/json",
+                             "Accept": "application/json, text/event-stream"},
+                    json=init, timeout=5.0,
+                )
+                assert mr.status_code != 421, f"by-name Host rejected (421): {mr.text}"
+                assert "Invalid Host header" not in mr.text
                 assert mr.status_code < 500
         finally:
             release.set()
