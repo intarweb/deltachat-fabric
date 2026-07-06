@@ -125,9 +125,11 @@ class DeltaBackend(Protocol):
 
     def ensure_account(self, localpart: str, password: str, *,
                        imap_host: str, imap_port: int,
-                       smtp_host: str, smtp_port: int) -> bool:
+                       smtp_host: str, smtp_port: int,
+                       display_name: Optional[str] = None) -> bool:
         """Idempotently onboard a bot's mailbox into the deltachat core (create-on-login +
-        configure) so it can send/receive. BLOCKING — callers run it off the event loop.
+        configure) so it can send/receive. ``display_name`` sets the Delta name humans see
+        (e.g. 'Robot' vs the raw email). BLOCKING — callers run it off the event loop.
         Returns True iff the account is configured after the call. (Optional on fakes.)"""
         ...
 
@@ -432,13 +434,16 @@ class DeltaChat2Backend:
     # -- onboarding (create-on-login + configure into the deltachat CORE) ---
     def ensure_account(self, localpart: str, password: str, *,
                        imap_host: str, imap_port: int,
-                       smtp_host: str, smtp_port: int) -> bool:
+                       smtp_host: str, smtp_port: int,
+                       display_name: Optional[str] = None) -> bool:
         """Idempotently onboard a bot's mailbox INTO THE DELTACHAT CORE so it can send/receive.
 
         add_account() → add_or_update_transport(EnteredLoginParam(...)). The transport login
         create-on-logins the mailbox on a chatmail/Dovecot server AND configures the core
-        account (writes the SQLCipher dc.db). BLOCKING — callers must run it off the event
-        loop (main._make_onboard uses asyncio.to_thread).
+        account (writes the SQLCipher dc.db). ``display_name`` sets the deltachat ``displayname``
+        config (the name humans see, e.g. 'Robot' vs the raw address) — applied idempotently
+        on every pass, including already-onboarded accounts. BLOCKING — callers must run it off
+        the event loop (main._make_onboard uses asyncio.to_thread).
 
         Verified against adbenitez/deltachat2: ``add_or_update_transport`` supersedes the
         deprecated (2025-02) ``configure``; ``EnteredLoginParam``/``Socket`` field names +
@@ -455,6 +460,7 @@ class DeltaChat2Backend:
                     current = (self.rpc.get_config(existing, "configured_addr")
                                or self.rpc.get_config(existing, "addr"))
                     if current == desired_addr:
+                        self._set_displayname(existing, display_name)  # apply to already-onboarded
                         return True  # already onboarded on the right address — idempotent no-op
                     # address/domain changed (e.g. deltachat.* → stalwart.* migration):
                     # fall through to re-run add_or_update_transport onto the new address.
@@ -467,6 +473,7 @@ class DeltaChat2Backend:
             self.rpc.set_config(accid, "bot", "1")  # mark as a bot account (best-effort)
         except Exception:
             pass
+        self._set_displayname(accid, display_name)  # name humans see (best-effort)
         param = EnteredLoginParam(
             addr=desired_addr,
             password=password,
@@ -485,6 +492,16 @@ class DeltaChat2Backend:
                 pass
             self._reindex_accounts()
         return ok
+
+    def _set_displayname(self, account_id: int, display_name: Optional[str]) -> None:  # pragma: no cover - real rpc
+        """Set the deltachat ``displayname`` config (the name humans see) — best-effort,
+        idempotent. No-op when ``display_name`` is falsy."""
+        if not display_name:
+            return
+        try:
+            self.rpc.set_config(account_id, "displayname", display_name)
+        except Exception:
+            pass
 
 
 def extract_mentions(text: str, members: list[str]) -> list[str]:
