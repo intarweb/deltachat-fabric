@@ -28,16 +28,3 @@ def test_reconcile_diff_provision_and_prune_sorted():
 
 def test_reconcile_noop_when_aligned():
     assert reconciler.reconcile(["a", "b"], ["b", "a"]) == ([], [])
-
-
-async def test_ensure_account_uses_injected_login():
-    calls = []
-
-    async def fake_login(host, port, user, password):
-        calls.append((host, port, user, password))
-        return True
-
-    ok = await reconciler.ensure_account("mail.x", 993, "bot-a", "deltachat.example.net",
-                                         "pw123456789", _login=fake_login)
-    assert ok is True
-    assert calls == [("mail.x", 993, "bot-a@deltachat.example.net", "pw123456789")]

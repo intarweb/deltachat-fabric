@@ -28,7 +28,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional, Protocol
+from typing import Any, Optional, Protocol
 
 import httpx
 from pydantic import AliasChoices, BaseModel, Field
@@ -104,6 +104,14 @@ class DeltaBackend(Protocol):
 
     def react(self, account_id: int, msg_id: int, emoji: str) -> None:
         """Set the reaction ``emoji`` on message ``msg_id`` for this account."""
+        ...
+
+    def ensure_account(self, localpart: str, password: str, *,
+                       imap_host: str, imap_port: int,
+                       smtp_host: str, smtp_port: int) -> bool:
+        """Idempotently onboard a bot's mailbox into the deltachat core (create-on-login +
+        configure) so it can send/receive. BLOCKING — callers run it off the event loop.
+        Returns True iff the account is configured after the call. (Optional on fakes.)"""
         ...
 
 
@@ -192,7 +200,10 @@ class DeltaChat2Backend:
         raw = self.rpc.get_next_event()
         if raw is None:
             return None
-        accid = getattr(raw, "account_id", None) or getattr(raw, "accid", None) or 0
+        # deltachat2 Event: the account id is ``context_id`` (aliased from wire ``contextId``);
+        # older bindings used ``account_id``/``accid``. Verified: adbenitez/deltachat2 types.py.
+        accid = (getattr(raw, "context_id", None) or getattr(raw, "account_id", None)
+                 or getattr(raw, "accid", None) or 0)
         ev = getattr(raw, "event", raw)
         kind = getattr(ev, "kind", None) or (ev.get("kind") if isinstance(ev, dict) else None)
         if kind != "IncomingMsg":
@@ -284,6 +295,55 @@ class DeltaChat2Backend:
 
     def react(self, account_id: int, msg_id: int, emoji: str) -> None:  # pragma: no cover
         self.rpc.send_reaction(account_id, msg_id, [emoji])
+
+    # -- onboarding (create-on-login + configure into the deltachat CORE) ---
+    def ensure_account(self, localpart: str, password: str, *,
+                       imap_host: str, imap_port: int,
+                       smtp_host: str, smtp_port: int) -> bool:  # pragma: no cover - real core
+        """Idempotently onboard a bot's mailbox INTO THE DELTACHAT CORE so it can send/receive.
+
+        add_account() → add_or_update_transport(EnteredLoginParam(...)). The transport login
+        create-on-logins the mailbox on a chatmail/Dovecot server AND configures the core
+        account (writes the SQLCipher dc.db). BLOCKING — callers must run it off the event
+        loop (main._make_onboard uses asyncio.to_thread).
+
+        Verified against adbenitez/deltachat2: ``add_or_update_transport`` supersedes the
+        deprecated (2025-02) ``configure``; ``EnteredLoginParam``/``Socket`` field names +
+        ``is_configured``/``start_io`` signatures. Isolated here behind DeltaBackend so an API
+        drift is a one-place fix. Returns True iff the account is configured after the call.
+        """
+        from deltachat2 import EnteredLoginParam, Socket  # type: ignore
+
+        existing = self._localpart_to_accid.get(localpart)
+        if existing is not None:
+            try:
+                if self.rpc.is_configured(existing):
+                    return True  # already onboarded — idempotent no-op
+            except Exception:
+                pass
+        accid = existing if existing is not None else self.rpc.add_account()
+        try:
+            self.rpc.set_config(accid, "bot", "1")  # mark as a bot account (best-effort)
+        except Exception:
+            pass
+        param = EnteredLoginParam(
+            addr=f"{localpart}@{self.config.mail_domain}",
+            password=password,
+            imap_server=imap_host, imap_port=int(imap_port), imap_security=Socket.SSL,
+            smtp_server=smtp_host, smtp_port=int(smtp_port), smtp_security=Socket.STARTTLS,
+        )
+        self.rpc.add_or_update_transport(accid, param)  # blocks until configuration finishes
+        try:
+            ok = bool(self.rpc.is_configured(accid))
+        except Exception:
+            ok = True  # older cores lack is_configured; no exception above ⇒ assume configured
+        if ok:
+            try:
+                self.rpc.start_io(accid)  # begin receiving for the freshly-configured account
+            except Exception:
+                pass
+            self._reindex_accounts()
+        return ok
 
 
 def extract_mentions(text: str, members: list[str]) -> list[str]:
@@ -551,7 +611,13 @@ class Relay:
 
     # -- inbound tick ------------------------------------------------------
     async def tick(self) -> dict:
-        """One inbound-loop pass: drain the event stream, then retry held wakes.
+        """One inbound pass: drain any pending events, then retry held wakes.
+
+        ⚠ ``backend.next_inbound()`` (deltachat ``get_next_event``) BLOCKS the caller until an
+        event exists — so this is NOT run on the asyncio loop in production. The service runs
+        the blocking event stream in a dedicated thread (``main._event_pump``) and the
+        hold-queue retry in ``main.drain_loop``. ``tick`` is kept as a composable unit for
+        tests/manual drains (tests inject a non-blocking fake backend).
 
         Returns a small summary {"processed","woken","drained"} for observability/tests.
         """
@@ -564,16 +630,6 @@ class Relay:
             woken += len(await self.handle_inbound(msg))
         drained = await self.drain_holds()
         return {"processed": processed, "woken": woken, "drained": drained}
-
-    async def run_forever(self, interval: float = 1.0,
-                          _should_stop: Optional[Callable[[], bool]] = None) -> None:  # pragma: no cover
-        """Inbound loop: tick every ``interval`` seconds until ``_should_stop`` (tests inject)."""
-        while not (_should_stop and _should_stop()):
-            try:
-                await self.tick()
-            except Exception:
-                pass
-            await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -648,8 +704,10 @@ def create_app(relay: Relay):
 
     @app.post("/send", response_model=SendResponse)
     async def send(req: SendRequest) -> SendResponse:
+        # relay.send → sync (blocking) deltachat rpc; run it OFF the event loop.
         try:
-            return SendResponse(**relay.send(req.bot_id, req.target, req.text))
+            result = await asyncio.to_thread(relay.send, req.bot_id, req.target, req.text)
+            return SendResponse(**result)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except Exception as e:  # pragma: no cover - backend send failure
@@ -660,37 +718,41 @@ def create_app(relay: Relay):
         return {"drained": await relay.drain_holds(), "held": len(relay.hold)}
 
     # -- contacts / channels (mirror /send: 404 on unknown bot, 502 on backend error) --
-    def _guard(fn):
+    async def _run(fn):
+        """Run a blocking relay/backend call OFF the event loop (deltachat rpc is
+        synchronous), mapping errors to the same 404/502 contract."""
         try:
-            return fn()
+            return await asyncio.to_thread(fn)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except HTTPException:
+            raise
         except Exception as e:  # pragma: no cover - backend failure
             raise HTTPException(status_code=502, detail=str(e))
 
     @app.get("/contacts")
     async def contacts(bot_id: str):
-        return _guard(lambda: relay.list_contacts(bot_id))
+        return await _run(lambda: relay.list_contacts(bot_id))
 
     @app.get("/channels")
     async def channels(bot_id: str):
-        return _guard(lambda: relay.list_channels(bot_id))
+        return await _run(lambda: relay.list_channels(bot_id))
 
     @app.post("/send_channel")
     async def send_channel(req: SendChannelRequest):
-        return _guard(lambda: relay.send_channel(req.bot_id, req.channel_id, req.text))
+        return await _run(lambda: relay.send_channel(req.bot_id, req.channel_id, req.text))
 
     @app.post("/channel")
     async def create_channel(req: CreateChannelRequest):
-        return _guard(lambda: relay.create_channel(req.bot_id, req.name, req.members))
+        return await _run(lambda: relay.create_channel(req.bot_id, req.name, req.members))
 
     @app.post("/channel/member")
     async def add_member(req: AddMemberRequest):
-        return _guard(lambda: relay.add_member(req.bot_id, req.channel_id, req.contact))
+        return await _run(lambda: relay.add_member(req.bot_id, req.channel_id, req.contact))
 
     @app.post("/react")
     async def react(req: ReactRequest):
-        return _guard(lambda: relay.react(req.bot_id, req.chat_id, req.msg_id, req.emoji))
+        return await _run(lambda: relay.react(req.bot_id, req.chat_id, req.msg_id, req.emoji))
 
     return app
 
