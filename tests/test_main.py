@@ -425,3 +425,27 @@ def test_provision_channels_skips_lead_not_onboarded_yet():
     res = main.provision_channels(cfg, be)
     assert res[0]["skipped"] == "lead-not-onboarded"
     assert be.created == []
+
+
+# -- env-selectable secret backend (the atomic chatmaild→Stalwart cutover) -------------------
+
+
+def test_select_secret_backend_env_selectable():
+    assert main.select_secret_backend({}) == "local"                          # default (chatmaild)
+    assert main.select_secret_backend({"DELTA_SECRET_BACKEND": "opconnect"}) == "opconnect"
+    # explicit wins over auto-detect
+    assert main.select_secret_backend(
+        {"DELTA_SECRET_BACKEND": "local", "OP_CONNECT_URL": "x", "DELTA_BOT_CREDS_ITEM": "y"}) == "local"
+    # auto → opconnect only when BOTH op-connect signals present
+    assert main.select_secret_backend(
+        {"OP_CONNECT_URL": "http://op", "DELTA_BOT_CREDS_ITEM": "creds"}) == "opconnect"
+    assert main.select_secret_backend({"OP_CONNECT_URL": "http://op"}) == "local"
+
+
+def test_both_secret_stores_share_get_or_create_interface():
+    # the reconciler/onboard path only calls secrets.get_or_create(bot); both backends satisfy
+    # it, so the Stalwart cutover is a store swap with NO reconciler change.
+    from app.main import SecretsStore
+    from app.opconnect import OpConnectStore
+    assert callable(getattr(SecretsStore, "get_or_create", None))
+    assert callable(getattr(OpConnectStore, "get_or_create", None))
