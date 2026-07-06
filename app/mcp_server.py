@@ -39,6 +39,7 @@ from mcp.server.fastmcp import FastMCP
 from .mcp_tools import (
     DeltaAddMemberTool,
     DeltaCreateChannelTool,
+    DeltaCreateInviteTool,
     DeltaListChannelsTool,
     DeltaListContactsTool,
     DeltaMessagesTool,
@@ -48,7 +49,7 @@ from .mcp_tools import (
     DeltaSendTool,
 )
 
-# The 9 tool names exactly as they appear in an MCP client's tools/list.
+# The 10 tool names exactly as they appear in an MCP client's tools/list.
 TOOL_NAMES = (
     "delta_send",
     "delta_list_contacts",
@@ -59,6 +60,7 @@ TOOL_NAMES = (
     "delta_react",
     "delta_secure_join",
     "delta_messages",
+    "delta_create_invite",
 )
 
 
@@ -112,6 +114,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
     react_tool = DeltaReactTool(relay_url=relay_url)
     secure_join_tool = DeltaSecureJoinTool(relay_url=relay_url)
     messages_tool = DeltaMessagesTool(relay_url=relay_url)
+    invite_tool = DeltaCreateInviteTool(relay_url=relay_url)
 
     @mcp.tool(name="delta_send")
     async def delta_send(bot_id: str, target: int, text: str) -> dict:
@@ -243,6 +246,22 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         Returns ``{"account_id":int,"chat_id":int,"messages":[{id,text,from_id}, ...]}`` (newest last).
         """
         return await messages_tool.messages(bot_id=bot_id, chat_id=chat_id, limit=limit)
+
+    @mcp.tool(name="delta_create_invite")
+    async def delta_create_invite(bot_id: str) -> dict:
+        """Generate a bot's securejoin CONTACT-invite link for a human to tap.
+
+        Returns an ``i.delta.chat/#...`` link the person opens in their Delta Chat app to
+        establish a VERIFIED CONTACT with the bot — after which the bot can message them
+        (delta_send). This is how you onboard a human to the fabric (the inverse of
+        delta_secure_join, which accepts someone else's invite).
+
+        Args:
+            bot_id: The bot/account localpart to generate the invite FOR.
+
+        Returns ``{"account_id":int,"invite":"https://i.delta.chat/#..."}``.
+        """
+        return await invite_tool.create_invite(bot_id=bot_id)
 
     return mcp
 

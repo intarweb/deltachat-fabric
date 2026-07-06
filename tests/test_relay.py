@@ -80,6 +80,9 @@ class FakeBackend:
         msgs = getattr(self, "_messages", {}).get((account_id, chat_id), [])
         return list(msgs)[-limit:]
 
+    def create_invite(self, account_id: int) -> str:
+        return f"https://i.delta.chat/#FAKEINVITE-acc{account_id}"
+
     def create_channel(self, account_id: int, name: str, members: list[str]) -> int:
         self._next_chat_id += 1
         self.created.append((account_id, name, list(members)))
@@ -673,4 +676,21 @@ def test_messages_endpoint(tmp_path):
     assert body["messages"] == [{"id": 9, "text": "delivered", "from_id": 2}]
 
     miss = client.get("/messages", params={"bot_id": "bot-c", "chat_id": 1})
+    assert miss.status_code == 404
+
+
+def test_relay_create_invite_routes_and_returns(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path)
+    out = relay.create_invite("bot-a")
+    assert out == {"account_id": 7, "invite": "https://i.delta.chat/#FAKEINVITE-acc7"}
+
+
+def test_invite_endpoint(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7})
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+    resp = client.get("/invite", params={"bot_id": "bot-a"})
+    assert resp.status_code == 200
+    assert resp.json() == {"account_id": 7, "invite": "https://i.delta.chat/#FAKEINVITE-acc7"}
+    miss = client.get("/invite", params={"bot_id": "bot-c"})
     assert miss.status_code == 404
