@@ -1,7 +1,7 @@
-"""Bifrost-facing MCP server for the Delta Chat Fabric.
+"""MCP server for the Delta Chat Fabric.
 
 Exposes the fabric's 7 delta operations as a **streamable-HTTP MCP server at ``/mcp``** so
-bifrost can connect and auto-discover the tools via ``tools/list``. Each tool is a thin
+an MCP gateway (or any MCP client) can connect and auto-discover the tools via ``tools/list``. Each tool is a thin
 wrapper that delegates to the relay's HTTP contract by REUSING the client classes in
 ``app.mcp_tools`` (constructed with the injected ``relay_url``) — so the relay stays the
 single source of truth and this module adds no new relay logic.
@@ -9,12 +9,12 @@ single source of truth and this module adds no new relay logic.
 Generic-engine rule (hard): ZERO fleet identity. Nothing about a bot roster, domain, or
 mesh is baked here — ``relay_url`` is injected and ``bot_id`` / targets are caller args
 that flow straight through to the relay contract. The tool docstrings + type hints ARE the
-schema bifrost's ``tools/list`` discovers.
+schema an MCP client's ``tools/list`` discovers.
 
-Transport / endpoint (what bifrost connects to):
+Transport / endpoint (what an MCP client connects to):
   - path      ``/mcp``   (FastMCP's default ``streamable_http_path``)
   - transport ``streamable-http`` (stateless_http=True — no per-session server state)
-  - auth      NONE at this endpoint — access is Virtual-Key-gated upstream at bifrost.
+  - auth      NONE at this endpoint — access is Virtual-Key-gated upstream at the MCP gateway.
 
 Usage:
   ``build_mcp(relay_url)`` -> a configured ``FastMCP`` with the 7 tools registered.
@@ -46,7 +46,7 @@ from .mcp_tools import (
     DeltaSendTool,
 )
 
-# The 7 tool names exactly as they appear in bifrost's tools/list.
+# The 7 tool names exactly as they appear in an MCP client's tools/list.
 TOOL_NAMES = (
     "delta_send",
     "delta_list_contacts",
@@ -59,12 +59,12 @@ TOOL_NAMES = (
 
 
 def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
-    """Build the bifrost-facing ``FastMCP`` with the 7 delta tools registered.
+    """Build the ``FastMCP`` with the 7 delta tools registered.
 
     ``relay_url`` is injected into every underlying relay client (falls back to the
     ``RELAY_URL`` env / in-container loopback via ``_RelayTool``). The server is
     ``stateless_http`` so each request is self-contained (no sticky session), which is what
-    bifrost's connect-and-list-tools flow wants.
+    an MCP gateway's connect-and-list-tools flow wants.
     """
     mcp = FastMCP("deltachat", stateless_http=True)
 
