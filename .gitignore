@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime data / injected config — NEVER commit (generic engine: no fleet identity in-repo)
+data/
+*.db
+*.sqlite
+config/
+roster.yaml
+.env

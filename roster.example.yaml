@@ -1,0 +1,17 @@
+# Example roster — copy to the path DELTA_ROSTER_PATH points at (default /config/roster.yaml)
+# and inject at DEPLOY. The image/repo carries NO real roster (generic engine).
+#
+# Each bot maps to a Delta Chat account localpart@DELTA_MAIL_DOMAIN, provisioned by the
+# reconciler via IMAP create-on-login. `realm` groups bots into channels; `realm_leads`
+# names the "main" bot woken for an UNADDRESSED channel message (anti-thundering-herd).
+
+bots:
+  - id: alpha
+    realm: example
+  - id: beta
+    realm: example
+    localpart: beta-bot        # optional: override the account localpart (defaults to id)
+  - gamma                       # bare string → id=gamma, realm=default
+
+realm_leads:
+  example: alpha                # unaddressed messages in the "example" realm wake only alpha

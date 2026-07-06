@@ -1,0 +1,176 @@
+import json
+
+import pytest
+
+from app import main
+from app.config import BotSpec, Config
+
+
+def _cfg(*localparts, leads=None):
+    return Config(
+        mail_domain="d.example", imap_host="mail.d.example",
+        roster=[BotSpec(id=lp) for lp in localparts],
+        realm_leads=leads or {},
+    )
+
+
+# -- SecretsStore -----------------------------------------------------------
+
+
+def test_secrets_store_mints_and_persists(tmp_path):
+    path = tmp_path / "secrets.json"
+    s = main.SecretsStore(str(path), password_min_length=9)
+    pw = s.get_or_create("bot-a")
+    assert len(pw) >= 9
+    # stable across calls
+    assert s.get_or_create("bot-a") == pw
+    # persisted to disk, reloaded by a fresh store
+    s2 = main.SecretsStore(str(path))
+    assert s2.get_or_create("bot-a") == pw
+
+
+def test_secrets_store_file_is_mode_600(tmp_path):
+    path = tmp_path / "secrets.json"
+    s = main.SecretsStore(str(path))
+    s.get_or_create("bot-b")
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_secrets_store_distinct_per_bot(tmp_path):
+    s = main.SecretsStore(str(tmp_path / "s.json"))
+    assert s.get_or_create("a") != s.get_or_create("b")
+
+
+# -- desired_localparts -----------------------------------------------------
+
+
+def test_desired_localparts_dedup_order():
+    cfg = Config(mail_domain="d", imap_host="m",
+                 roster=[BotSpec(id="bot-a"), BotSpec(id="bot-b"),
+                         BotSpec(id="bot-a", localpart="bot-a")])
+    assert main.desired_localparts(cfg) == ["bot-a", "bot-b"]
+
+
+# -- should_reconcile scheduling --------------------------------------------
+
+
+def test_should_reconcile_first_run_honors_run_on_start():
+    assert main.should_reconcile(100.0, None, 3600, run_on_start=True) is True
+    assert main.should_reconcile(100.0, None, 3600, run_on_start=False) is False
+
+
+def test_should_reconcile_interval_elapsed():
+    assert main.should_reconcile(100.0 + 3600, 100.0, 3600) is True
+    assert main.should_reconcile(100.0 + 3600, 100.0, 3600, run_on_start=False) is True
+
+
+def test_should_reconcile_interval_not_yet_elapsed():
+    assert main.should_reconcile(100.0 + 10, 100.0, 3600) is False
+
+
+# -- reconcile_once (test-safe: injected IMAP login) ------------------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_provisions_desired_and_computes_prune(tmp_path):
+    cfg = _cfg("bot-a", "bot-b")
+    secrets = main.SecretsStore(str(tmp_path / "s.json"), cfg.password_min_length)
+    logins = []
+
+    async def fake_login(host, port, user, password):
+        logins.append((host, port, user, password))
+        return True
+
+    res = await main.reconcile_once(cfg, secrets, existing=["bot-b", "bot-c"], _login=fake_login)
+
+    # every desired account (re)asserted via create-on-login
+    assert res["provisioned"] == ["bot-a", "bot-b"]
+    assert res["failed"] == []
+    # diff vs existing: bot-a is new; bot-c is no longer desired → prune report
+    assert res["to_provision"] == ["bot-a"]
+    assert res["prune"] == ["bot-c"]
+    # login used the config domain + a minted password, per bot
+    users = {u for _, _, u, _ in logins}
+    assert users == {"bot-a@d.example", "bot-b@d.example"}
+    # passwords came from the secrets store (persisted)
+    assert secrets.get_or_create("bot-a") in {pw for *_, pw in logins}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_reports_login_failures(tmp_path):
+    cfg = _cfg("bot-a")
+    secrets = main.SecretsStore(str(tmp_path / "s.json"))
+
+    async def failing_login(host, port, user, password):
+        return False
+
+    res = await main.reconcile_once(cfg, secrets, existing=[], _login=failing_login)
+    assert res["failed"] == ["bot-a"]
+    assert res["provisioned"] == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_no_real_imap_when_login_injected(tmp_path):
+    """Guard: with the login injected, reconcile_once never touches a live IMAP server."""
+    cfg = _cfg("a", "b")
+    secrets = main.SecretsStore(str(tmp_path / "s.json"))
+    seen = []
+
+    async def fake_login(*a):
+        seen.append(a)
+        return True
+
+    await main.reconcile_once(cfg, secrets, existing=[], _login=fake_login)
+    assert len(seen) == 2  # exactly the two desired bots, no network
+
+
+# -- Service wiring is importable/constructible without I/O -----------------
+
+
+class _FakeBackend:
+    """Minimal DeltaBackend fake for the wiring test (no rpc-server)."""
+    def __init__(self):
+        self._localpart_to_accid = {"bot-a": 1}
+
+    def account_id_for(self, lp):
+        return self._localpart_to_accid.get(lp)
+
+
+def test_service_wiring_builds_app_without_io(tmp_path):
+    import httpx
+
+    from app.relay import AgentDirectory, HoldQueue, Relay
+
+    cfg = _cfg("bot-a", leads={"default": "bot-a"})
+    backend = _FakeBackend()
+    directory = AgentDirectory(cfg, httpx.AsyncClient())
+    hold = HoldQueue(str(tmp_path))
+    relay = Relay(cfg, backend, directory, hold)
+    secrets = main.SecretsStore(str(tmp_path / "s.json"))
+
+    svc = main.Service(cfg, relay, secrets)
+    # the FastAPI app is wired and carries the /send route
+    routes = {r.path for r in svc.app.routes}
+    assert "/send" in routes and "/healthz" in routes
+    assert svc.relay is relay
+
+
+def test_service_app_send_route_works_end_to_end(tmp_path):
+    """The wired app actually serves /send through the injected fake backend."""
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from app.relay import AgentDirectory, HoldQueue, Relay
+
+    class SendBackend(_FakeBackend):
+        def send(self, accid, chat_id, text):
+            return 4242
+
+    cfg = _cfg("bot-a")
+    relay = Relay(cfg, SendBackend(), AgentDirectory(cfg, httpx.AsyncClient()),
+                  HoldQueue(str(tmp_path)))
+    svc = main.Service(cfg, relay, main.SecretsStore(str(tmp_path / "s.json")))
+    client = TestClient(svc.app)
+    r = client.post("/send", json={"bot_id": "bot-a", "target": 7, "text": "hi"})
+    assert r.status_code == 200
+    assert r.json() == {"status": "sent", "msg_id": 4242, "account_id": 1}

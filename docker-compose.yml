@@ -1,0 +1,49 @@
+# Delta Chat Fabric — standalone example deployment.
+# This file carries EXAMPLE values only; the image itself has ZERO fleet identity.
+# Real identity (domain, roster, a2a-directory) injects here at deploy time.
+services:
+  dcf:
+    build: .
+    # image: ghcr.io/<owner>/delta-chat-fabric:latest   # or a published image
+    restart: unless-stopped
+    ports:
+      - "8080:8080"          # relay HTTP contract (/send, /channels, ...)
+    environment:
+      # --- REQUIRED: where accounts live (injected, never baked) ---
+      DELTA_MAIL_DOMAIN: "deltachat.example.net"
+      DELTA_IMAP_HOST: "deltachat.example.net"
+      DELTA_IMAP_PORT: "993"
+      DELTA_SUBMISSION_HOST: "deltachat.example.net"
+      DELTA_SUBMISSION_PORT: "587"
+      # --- roster + directory (mounted / injected) ---
+      DELTA_ROSTER_PATH: "/config/roster.yaml"
+      A2A_DIRECTORY_URL: "http://a2a-directory.example:7777/agents"
+      # --- dirs (LOCAL volumes) ---
+      DATA_DIR: "/data"
+      ACCOUNTS_DIR: "/data/accounts"
+      DELTA_SECRETS_PATH: "/data/secrets.json"
+      DELTA_BACKUP_DIR: "/backup"
+      # --- schedules / tuning ---
+      DELTA_RECONCILE_INTERVAL: "3600"
+      DELTA_RECONCILE_ON_START: "1"
+      DELTA_BACKUP_INTERVAL: "86400"
+      DELTA_BACKUP_RETAIN: "7"
+      RELAY_HOST: "0.0.0.0"
+      RELAY_PORT: "8080"
+    volumes:
+      # 🔴 /data MUST be a LOCAL volume (SQLCipher over NFS corrupts). Use a named
+      # docker volume or a local bind — NEVER an NFS mount.
+      - dcf-data:/data
+      - dcf-backup:/backup
+      # roster injected read-only at deploy; the repo/image never contains it.
+      - ./config:/config:ro
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,os;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('RELAY_PORT','8080')+'/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  dcf-data:
+  dcf-backup:
