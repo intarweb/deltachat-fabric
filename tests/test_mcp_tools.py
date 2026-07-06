@@ -10,6 +10,7 @@ from app.mcp_tools import (
     DeltaAddMemberTool,
     DeltaCreateChannelTool,
     DeltaCreateInviteTool,
+    DeltaDeleteChatTool,
     DeltaListChannelsTool,
     DeltaListContactsTool,
     DeltaMessagesTool,
@@ -275,3 +276,19 @@ async def test_delta_create_invite_gets_contract_and_returns_result():
     result = await tool.create_invite(bot_id="bot-a")
     assert "/invite" in captured["url"] and "bot_id=bot-a" in captured["url"]
     assert result["invite"] == "https://i.delta.chat/#X"
+
+
+async def test_delta_delete_chat_posts_contract_and_returns_result():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"status": "deleted", "account_id": 3, "chat_id": 12})
+
+    tool = make_tool(handler, DeltaDeleteChatTool)
+    result = await tool.delete_chat(bot_id="bot-a", chat_id=12)
+
+    assert captured["url"] == "http://relay.test:8080/delete_chat"
+    assert captured["body"] == {"bot_id": "bot-a", "chat_id": 12}
+    assert result == {"status": "deleted", "account_id": 3, "chat_id": 12}

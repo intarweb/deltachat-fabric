@@ -129,6 +129,12 @@ class DeltaBackend(Protocol):
         key-contact; returns the resulting chat id. BLOCKING. (Optional on fakes.)"""
         ...
 
+    def delete_chat(self, account_id: int, chat_id: int) -> None:
+        """Delete ``chat_id`` from ``account_id`` (drops the chat + any in-progress securejoin
+        half-handshake it holds). Used to clear a stale/tangled securejoin so a single clean
+        one can complete. BLOCKING. (Optional on fakes.)"""
+        ...
+
 
 class DeltaChat2Backend:
     """Default backend over deltachat2 (account-manager + rpc-server on a LOCAL dir).
@@ -222,6 +228,13 @@ class DeltaChat2Backend:
         Blocking (network handshake) — callers run it off the loop.
         """
         return self.rpc.secure_join(account_id, invite)
+
+    def delete_chat(self, account_id: int, chat_id: int) -> None:  # pragma: no cover - real rpc
+        """Delete ``chat_id`` from ``account_id``. Clears the chat and any in-progress
+        securejoin half-handshake it carries, so a single clean securejoin can complete.
+        Verified vs installed deltachat2 (``delete_chat(account_id, chat_id) -> None``).
+        """
+        self.rpc.delete_chat(account_id, int(chat_id))
 
     # -- inbound -----------------------------------------------------------
     @staticmethod
@@ -654,6 +667,13 @@ class Relay:
         chat_id = self.backend.secure_join(accid, invite)
         return {"status": "securejoin-initiated", "account_id": accid, "chat_id": chat_id}
 
+    def delete_chat(self, bot: str, chat_id: int) -> dict:
+        """Delete ``chat_id`` for ``bot`` — clears a stale/tangled securejoin so a single clean
+        one can complete. Returns {"status","account_id","chat_id"}."""
+        accid = self._accid(bot)
+        self.backend.delete_chat(accid, int(chat_id))
+        return {"status": "deleted", "account_id": accid, "chat_id": int(chat_id)}
+
     # -- wake routing ------------------------------------------------------
     def _channel_main(self, members: list[str]) -> Optional[str]:
         """Pick the channel 'main' (realm lead) for a set of members, generically.
@@ -800,6 +820,13 @@ class SecureJoinRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class DeleteChatRequest(BaseModel):
+    """Delete a chat (e.g. clear a stale/tangled securejoin) for ``bot_id``."""
+    bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
+    chat_id: int
+    model_config = {"populate_by_name": True}
+
+
 def create_app(relay: Relay):
     """Build the internal FastAPI app around a ``Relay``. Imported lazily so tests that
     don't need HTTP don't pay for it."""
@@ -874,6 +901,10 @@ def create_app(relay: Relay):
     @app.post("/secure_join")
     async def secure_join(req: SecureJoinRequest):
         return await _run(lambda: relay.secure_join(req.bot_id, req.invite))
+
+    @app.post("/delete_chat")
+    async def delete_chat(req: DeleteChatRequest):
+        return await _run(lambda: relay.delete_chat(req.bot_id, req.chat_id))
 
     return app
 

@@ -45,6 +45,7 @@ def relay_recorder(monkeypatch):
             ("POST", "/channel"): {"status": "created", "channel_id": 5, "account_id": 7, "name": "n", "members": []},
             ("POST", "/channel/member"): {"status": "added", "channel_id": 5, "account_id": 7, "contact": "c@x"},
             ("POST", "/react"): {"status": "reacted", "account_id": 7, "chat_id": 1, "msg_id": 1, "emoji": "x"},
+            ("POST", "/delete_chat"): {"status": "deleted", "account_id": 7, "chat_id": 12},
         }
     )
     real_init = httpx.AsyncClient.__init__
@@ -60,12 +61,13 @@ def relay_recorder(monkeypatch):
 # --------------------------------------------------------------------------- registration
 
 
-async def test_build_mcp_registers_exactly_ten_tools_with_right_names():
+async def test_build_mcp_registers_exactly_eleven_tools_with_right_names():
     mcp = build_mcp(relay_url="http://relay.test:8080")
     tools = await mcp.list_tools()
     names = sorted(t.name for t in tools)
     assert names == sorted(TOOL_NAMES)
-    assert len(tools) == 10
+    assert len(tools) == 11
+    assert {"delta_secure_join", "delta_messages", "delta_delete_chat"} <= set(names)
     assert {"delta_secure_join", "delta_messages", "delta_create_invite"} <= set(names)
 
 

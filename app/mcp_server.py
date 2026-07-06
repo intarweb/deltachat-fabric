@@ -40,6 +40,7 @@ from .mcp_tools import (
     DeltaAddMemberTool,
     DeltaCreateChannelTool,
     DeltaCreateInviteTool,
+    DeltaDeleteChatTool,
     DeltaListChannelsTool,
     DeltaListContactsTool,
     DeltaMessagesTool,
@@ -61,6 +62,7 @@ TOOL_NAMES = (
     "delta_secure_join",
     "delta_messages",
     "delta_create_invite",
+    "delta_delete_chat",
 )
 
 
@@ -115,6 +117,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
     secure_join_tool = DeltaSecureJoinTool(relay_url=relay_url)
     messages_tool = DeltaMessagesTool(relay_url=relay_url)
     invite_tool = DeltaCreateInviteTool(relay_url=relay_url)
+    delete_chat_tool = DeltaDeleteChatTool(relay_url=relay_url)
 
     @mcp.tool(name="delta_send")
     async def delta_send(bot_id: str, target: int, text: str) -> dict:
@@ -262,6 +265,23 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         Returns ``{"account_id":int,"invite":"https://i.delta.chat/#..."}``.
         """
         return await invite_tool.create_invite(bot_id=bot_id)
+
+    @mcp.tool(name="delta_delete_chat")
+    async def delta_delete_chat(bot_id: str, chat_id: int) -> dict:
+        """Delete a chat for a bot — clears a stale/tangled securejoin half-handshake.
+
+        Delta's verified-contact (securejoin) handshake can WEDGE when two joins with the same
+        peer race (e.g. a bot both accepted a person's invite AND the person tapped the bot's
+        invite). Deleting the stale chat drops its half-handshake so a single clean securejoin
+        can complete.
+
+        Args:
+            bot_id: The bot/account localpart that owns the chat.
+            chat_id: The chat id to delete.
+
+        Returns ``{"status":"deleted","account_id":int,"chat_id":int}``.
+        """
+        return await delete_chat_tool.delete_chat(bot_id=bot_id, chat_id=chat_id)
 
     return mcp
 
