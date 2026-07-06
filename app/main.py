@@ -337,17 +337,45 @@ class Service:
         self.app = create_app(relay)
 
 
+def select_secret_backend(env: Optional[dict] = None) -> str:
+    """Which per-bot credential store the reconciler uses — env-selectable so the chatmaild→
+    Stalwart cutover is an ATOMIC env flip, not a code change:
+      'opconnect'  → read/mint each bot's pw on the shared op-connect item (Stalwart era;
+                     Stalwart validates it via LDAP→Authentik; the sync set_passwords the same)
+      'local'      → mint-to-disk secrets.json (chatmaild era, create-on-login) — the DEFAULT
+    Chosen by DELTA_SECRET_BACKEND=opconnect|local, or auto-'opconnect' when OP_CONNECT_URL +
+    DELTA_BOT_CREDS_ITEM are both set. Pure → unit-tested; build_service builds the store.
+    """
+    e = env if env is not None else os.environ
+    explicit = e.get("DELTA_SECRET_BACKEND", "").strip().lower()
+    if explicit in ("opconnect", "local"):
+        return explicit
+    if e.get("OP_CONNECT_URL") and e.get("DELTA_BOT_CREDS_ITEM"):
+        return "opconnect"
+    return "local"
+
+
 def build_service(config: Optional[Config] = None,
                   *, relay: Optional[Relay] = None) -> Service:  # pragma: no cover - real wiring
     """Production wiring: Config.load() → backend + directory + hold-queue → Relay →
     secrets store → Service. ``relay`` can be injected (tests). Not unit-run because the
     default relay needs a live rpc-server; every part is injectable so tests build their own.
+
+    The secret store is env-selectable (``select_secret_backend``): local mint-to-disk today
+    (chatmaild), op-connect read on the Stalwart cutover — both expose ``get_or_create(bot)``
+    so the reconciler/onboard path is identical either way.
     """
     config = config or Config.load()
     data_dir = os.environ.get("DATA_DIR", "/data")
     secrets_path = os.environ.get("DELTA_SECRETS_PATH", str(Path(data_dir) / "secrets.json"))
     relay = relay or build_default(config)
-    secrets = SecretsStore(secrets_path, config.password_min_length)
+    if select_secret_backend() == "opconnect":
+        from .opconnect import OpConnectStore
+        secrets = OpConnectStore(password_min_length=config.password_min_length)
+        log.info("secret store: op-connect (Stalwart-era; reads/mints deltachat-bot-creds)")
+    else:
+        secrets = SecretsStore(secrets_path, config.password_min_length)
+        log.info("secret store: local mint-to-disk (chatmaild-era)")
     backup_backend = backup_mod.DeltaChat2BackupBackend(relay.backend)
     return Service(config, relay, secrets, backup_backend=backup_backend)
 
