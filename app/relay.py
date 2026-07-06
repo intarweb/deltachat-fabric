@@ -135,6 +135,13 @@ class DeltaBackend(Protocol):
         one can complete. BLOCKING. (Optional on fakes.)"""
         ...
 
+    def force_poll(self) -> None:
+        """Nudge the core to do an IMAP fetch cycle NOW (deltachat ``maybe_network``), instead
+        of waiting on IDLE. Needed where the server's IDLE push doesn't wake the core — e.g.
+        Stalwart #339 pushes a STATUS notification, not EXISTS, so the IDLE client never wakes
+        and queued mail (a securejoin vc-request) sits unfetched. BLOCKING. (Optional on fakes.)"""
+        ...
+
 
 class DeltaChat2Backend:
     """Default backend over deltachat2 (account-manager + rpc-server on a LOCAL dir).
@@ -235,6 +242,13 @@ class DeltaChat2Backend:
         Verified vs installed deltachat2 (``delete_chat(account_id, chat_id) -> None``).
         """
         self.rpc.delete_chat(account_id, int(chat_id))
+
+    def force_poll(self) -> None:  # pragma: no cover - real rpc
+        """Force an IMAP fetch cycle now via ``maybe_network`` — the core reconnects/fetches on
+        all accounts rather than waiting on IDLE. Sidesteps servers whose IDLE push the core
+        doesn't wake on (Stalwart #339: STATUS not EXISTS). Verified vs installed deltachat2
+        (``maybe_network() -> None``)."""
+        self.rpc.maybe_network()
 
     # -- inbound -----------------------------------------------------------
     @staticmethod
@@ -408,11 +422,19 @@ class DeltaChat2Backend:
         """
         from deltachat2 import EnteredLoginParam, Socket  # type: ignore
 
+        desired_addr = f"{localpart}@{self.config.mail_domain}"
         existing = self._localpart_to_accid.get(localpart)
         if existing is not None:
             try:
                 if self.rpc.is_configured(existing):
-                    return True  # already onboarded — idempotent no-op
+                    current = (self.rpc.get_config(existing, "configured_addr")
+                               or self.rpc.get_config(existing, "addr"))
+                    if current == desired_addr:
+                        return True  # already onboarded on the right address — idempotent no-op
+                    # address/domain changed (e.g. deltachat.* → stalwart.* migration):
+                    # fall through to re-run add_or_update_transport onto the new address.
+                    log.info("re-onboarding %s: address changed %s -> %s",
+                             localpart, current, desired_addr)
             except Exception:
                 pass
         accid = existing if existing is not None else self.rpc.add_account()
@@ -421,7 +443,7 @@ class DeltaChat2Backend:
         except Exception:
             pass
         param = EnteredLoginParam(
-            addr=f"{localpart}@{self.config.mail_domain}",
+            addr=desired_addr,
             password=password,
             imap_server=imap_host, imap_port=int(imap_port), imap_security=Socket.SSL,
             smtp_server=smtp_host, smtp_port=int(smtp_port), smtp_security=Socket.STARTTLS,
@@ -674,6 +696,13 @@ class Relay:
         self.backend.delete_chat(accid, int(chat_id))
         return {"status": "deleted", "account_id": accid, "chat_id": int(chat_id)}
 
+    def force_poll(self) -> dict:
+        """Force an IMAP fetch cycle now (all accounts) so queued mail is pulled without waiting
+        on IDLE — see backend.force_poll. Global (not per-bot): deltachat maybe_network nudges
+        every account. Returns {"status":"polled"}."""
+        self.backend.force_poll()
+        return {"status": "polled"}
+
     # -- wake routing ------------------------------------------------------
     def _channel_main(self, members: list[str]) -> Optional[str]:
         """Pick the channel 'main' (realm lead) for a set of members, generically.
@@ -905,6 +934,12 @@ def create_app(relay: Relay):
     @app.post("/delete_chat")
     async def delete_chat(req: DeleteChatRequest):
         return await _run(lambda: relay.delete_chat(req.bot_id, req.chat_id))
+
+    @app.post("/poll")
+    async def poll():
+        """Force an IMAP fetch now (maybe_network) — on-demand trigger for the IDLE-push
+        workaround; the poll_loop also fires this periodically."""
+        return await _run(relay.force_poll)
 
     return app
 

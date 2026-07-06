@@ -103,6 +103,9 @@ class FakeBackend:
         self.deleted = getattr(self, "deleted", [])
         self.deleted.append((account_id, chat_id))
 
+    def force_poll(self) -> None:
+        self.polls = getattr(self, "polls", 0) + 1
+
 
 def directory_transport(agents: list[dict], wake_sink: list[dict], *,
                         directory_status: int = 200):
@@ -675,6 +678,22 @@ def test_delete_chat_endpoint(tmp_path):
 
     miss = client.post("/delete_chat", json={"bot_id": "nobody", "chat_id": 12})
     assert miss.status_code == 404
+
+
+def test_relay_force_poll_calls_backend(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 3})
+    relay = make_relay(backend, [], [], tmp_path)
+    assert relay.force_poll() == {"status": "polled"}
+    assert backend.polls == 1
+
+
+def test_poll_endpoint(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 3})
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+    resp = client.post("/poll")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "polled"}
+    assert backend.polls == 1
 
 
 # --------------------------------------------------------------------------- (9) messages (receipt read-back)
