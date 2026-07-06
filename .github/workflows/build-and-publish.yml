@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt pytest pytest-asyncio execnet
-      - run: pytest -q
+      - run: python -m pytest -q
   build:
     needs: test
     runs-on: ubuntu-latest
