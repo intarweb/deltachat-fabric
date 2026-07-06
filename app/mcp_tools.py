@@ -141,6 +141,22 @@ class DeltaReactTool(_RelayTool):
         )
 
 
+class DeltaSecureJoinTool(_RelayTool):
+    """``delta_secure_join`` — accept a securejoin/verified invite (link or QR) as a bot.
+
+    On success the inviter becomes a verified key-contact of the bot's account (the E2E
+    key-exchange), so they can then be added to an encrypted channel. Returns the resulting
+    chat id. This is the human-onboarding mechanism (a person shares their Delta invite link).
+    """
+
+    name = "delta_secure_join"
+
+    async def secure_join(self, bot_id: str, invite: str) -> dict:
+        return await self._post(
+            "/secure_join", {"bot_id": bot_id, "invite": invite}, self.name
+        )
+
+
 def _detail(resp: httpx.Response) -> str:
     try:
         body = resp.json()
