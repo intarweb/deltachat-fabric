@@ -27,10 +27,10 @@ Env contract (all optional-with-defaults except the domain):
   DELTA_RECONCILE_INTERVAL            reconciler loop seconds      default 3600
   RELAY_HOST / RELAY_PORT             uvicorn bind             default 0.0.0.0 / 8080
   DELTA_RECONCILE_ON_START            "1" to reconcile once at boot    default 1
-  DELTA_MCP_HOST / DELTA_MCP_PORT     bifrost-facing MCP /mcp bind   default 0.0.0.0 / 8000
+  DELTA_MCP_HOST / DELTA_MCP_PORT     MCP /mcp bind   default 0.0.0.0 / 8000
 
 The MCP server (app.mcp_server) is served as a SECOND uvicorn in the same asyncio process,
-exposing the 7 delta tools over streamable-HTTP at ``/mcp`` for bifrost. It talks to the
+exposing the 7 delta tools over streamable-HTTP at ``/mcp`` for an MCP gateway. It talks to the
 relay over loopback HTTP (RELAY_URL), so the relay's internal contract stays unchanged.
 """
 from __future__ import annotations
@@ -214,7 +214,7 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
 
     server = uvicorn.Server(uvicorn.Config(service.app, host=host, port=port, log_level="info"))
 
-    # Second uvicorn: the bifrost-facing MCP server at /mcp (streamable-HTTP). It reaches
+    # Second uvicorn: the MCP server at /mcp (streamable-HTTP). It reaches
     # the relay over loopback HTTP; the relay's own /send contract is untouched.
     from .mcp_server import build_mcp_app
 

@@ -1,0 +1,6 @@
+# Delta Chat Fabric — development / test dependencies.
+# Install alongside requirements.txt to run the offline test suite:
+#   pip install -r requirements.txt -r dev-requirements.txt && python -m pytest -q
+pytest>=8.0
+pytest-asyncio>=0.23      # async test support (reconciler / relay coroutines)
+execnet>=2.0              # pulled in by the deltachat-rpc-client test seam
