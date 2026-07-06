@@ -257,34 +257,46 @@ class DeltaChat2Backend:
         )
 
     # -- contacts / channels ----------------------------------------------
-    # NOTE: every deltachat2 call below is version-fragile and NOT verifiable from the
-    # autodocs I could reach — see the class docstring's ⚠ list. Isolated here behind the
-    # DeltaBackend seam with defensive getattr so relay logic never sees the raw binding.
+    # deltachat2 signatures below verified against the installed package: get_contacts ->
+    # list[Contact] (OBJECTS with .id/.address/.display_name, NOT ids); get_chatlist_entries
+    # -> list[int]; get_chat_contacts -> list[int]; ChatType is a str-enum ("Group"/"Single").
+    @staticmethod
+    def _contact_to_dict(contact) -> dict:
+        """Normalize a deltachat2 Contact object → {id,address,display_name}. Pure (no rpc),
+        so it's unit-testable; the field fallbacks tolerate minor cross-version drift."""
+        return {
+            "id": getattr(contact, "id", None),
+            "address": getattr(contact, "address", None) or getattr(contact, "addr", None) or "",
+            "display_name": (getattr(contact, "display_name", None)
+                             or getattr(contact, "name", None) or ""),
+        }
+
     def _contact_dict(self, accid: int, cid: int) -> dict:  # pragma: no cover
-        contact = self.rpc.get_contact(accid, cid)
-        addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
-        name = getattr(contact, "display_name", None) or getattr(contact, "name", None) or ""
-        return {"id": cid, "address": addr, "display_name": name}
+        return self._contact_to_dict(self.rpc.get_contact(accid, cid))
 
     def list_contacts(self, account_id: int) -> list[dict]:  # pragma: no cover
-        # get_contacts(accid, listflags, query) is the documented JSON-RPC name; fall back
-        # to a no-arg / positional shape defensively.
-        try:
-            ids = self.rpc.get_contacts(account_id, 0, None)
-        except TypeError:
-            ids = self.rpc.get_contacts(account_id)
-        return [self._contact_dict(account_id, cid) for cid in (ids or [])]
+        # 🔴 get_contacts returns list[Contact] OBJECTS (verified vs installed deltachat2), not
+        # ids — build the dicts directly. Fall back to id-fetch for a legacy binding that
+        # returns ints.
+        items = self.rpc.get_contacts(account_id, 0, None)
+        out: list[dict] = []
+        for item in (items or []):
+            if hasattr(item, "address") or hasattr(item, "id"):
+                out.append(self._contact_to_dict(item))       # Contact object (deltachat2)
+            else:
+                out.append(self._contact_dict(account_id, item))  # int id (legacy)
+        return out
 
     def list_channels(self, account_id: int) -> list[dict]:  # pragma: no cover
-        # Enumerate chatlist entries → keep the group chats. get_chatlist_entries shape
-        # varies (list[int] of chat ids, or list[(chatid,msgid)]); normalize defensively.
+        # Enumerate chatlist entries → keep the group chats. get_chatlist_entries -> list[int]
+        # (verified); tolerate a (chatid,msgid) tuple shape defensively. ChatType.GROUP == "Group".
         entries = self.rpc.get_chatlist_entries(account_id, 0, None, None)
         out: list[dict] = []
         for e in (entries or []):
             chat_id = e[0] if isinstance(e, (list, tuple)) else e
             info = self.rpc.get_basic_chat_info(account_id, chat_id)
             chat_type = getattr(info, "chat_type", None) or getattr(info, "type", None)
-            is_group = chat_type in ("Group", "group", 120, 130) or bool(getattr(info, "is_group", False))
+            is_group = str(chat_type) in ("Group", "ChatType.GROUP") or bool(getattr(info, "is_group", False))
             if not is_group:
                 continue
             members: list[str] = []

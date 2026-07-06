@@ -348,3 +348,80 @@ def test_serve_boots_and_both_uvicorns_bind_with_blocking_backend(tmp_path, monk
                 await task
 
     asyncio.run(_run())
+
+
+# -- per-realm channel provisioning (Vikunja proj-23 step 5b) ----------------
+
+
+def test_desired_channels_one_per_realm_with_a_lead():
+    cfg = Config(
+        mail_domain="d.example", imap_host="m",
+        roster=[BotSpec(id="lead", realm="r1"), BotSpec(id="a", realm="r1"),
+                BotSpec(id="b", realm="r2"), BotSpec(id="c", realm="r3")],
+        realm_leads={"r1": "lead", "r2": "b"},  # r3 has NO lead → skipped
+    )
+    chans = {c["realm"]: c for c in main.desired_channels(cfg)}
+    assert set(chans) == {"r1", "r2"}          # r3 skipped (no main → can't route)
+    assert chans["r1"]["lead"] == "lead"
+    assert chans["r1"]["name"] == "r1"
+    assert chans["r1"]["members"] == ["a", "lead"]   # sorted, de-duped
+    assert chans["r2"]["members"] == ["b"]
+
+
+class _ChanBackend:
+    """Fake DeltaBackend surface for provision_channels (no live core)."""
+
+    def __init__(self, accounts, channels=None):
+        self._acc = accounts                       # localpart -> accid
+        self._channels = channels or {}            # accid -> [{id,name,members}]
+        self.created: list = []
+        self.added: list = []
+        self._next = 900
+
+    def account_id_for(self, lp):
+        return self._acc.get(lp)
+
+    def list_channels(self, accid):
+        return self._channels.get(accid, [])
+
+    def create_channel(self, accid, name, members):
+        self._next += 1
+        self.created.append((accid, name, list(members)))
+        return self._next
+
+    def add_member(self, accid, chat_id, contact):
+        self.added.append((accid, chat_id, contact))
+
+
+def test_provision_channels_creates_missing_channel_with_members_minus_lead():
+    cfg = Config(mail_domain="d.example", imap_host="m",
+                 roster=[BotSpec(id="lead", realm="r1"), BotSpec(id="a", realm="r1")],
+                 realm_leads={"r1": "lead"})
+    be = _ChanBackend(accounts={"lead": 3, "a": 4})
+    res = main.provision_channels(cfg, be)
+    # created by the lead's account, members = realm minus the lead, as addresses
+    assert be.created == [(3, "r1", ["a@d.example"])]
+    assert res[0]["created"]
+
+
+def test_provision_channels_idempotent_adds_only_missing_members():
+    cfg = Config(mail_domain="d.example", imap_host="m",
+                 roster=[BotSpec(id="lead", realm="r1"), BotSpec(id="a", realm="r1"),
+                         BotSpec(id="x", realm="r1")],
+                 realm_leads={"r1": "lead"})
+    # channel already exists with lead+a present → only x is added, nothing recreated
+    be = _ChanBackend(accounts={"lead": 3, "a": 4, "x": 5},
+                      channels={3: [{"id": 77, "name": "r1", "members": ["lead", "a"]}]})
+    res = main.provision_channels(cfg, be)
+    assert be.created == []
+    assert be.added == [(3, 77, "x@d.example")]
+    assert res[0]["added"] == 1
+
+
+def test_provision_channels_skips_lead_not_onboarded_yet():
+    cfg = Config(mail_domain="d.example", imap_host="m",
+                 roster=[BotSpec(id="lead", realm="r1")], realm_leads={"r1": "lead"})
+    be = _ChanBackend(accounts={})               # lead has no account yet
+    res = main.provision_channels(cfg, be)
+    assert res[0]["skipped"] == "lead-not-onboarded"
+    assert be.created == []
