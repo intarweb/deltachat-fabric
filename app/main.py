@@ -117,6 +117,33 @@ def desired_localparts(config: Config) -> list[str]:
     return out
 
 
+def desired_channels(config: Config) -> list[dict]:
+    """One group chat PER REALM that has a lead, from the roster. Pure (Vikunja proj-23 5b).
+
+    Returns ``[{realm, name, lead, members:[localpart,...]}]`` — the lead is the channel's
+    "main" (owns/creates it + routing wakes it on an unaddressed message; see routing.py).
+    A realm with no ``realm_leads`` entry is skipped (no main → can't route unaddressed msgs).
+    Order-preserving by first appearance; members sorted + de-duped.
+    """
+    order: list[str] = []
+    by_realm: dict[str, list[str]] = {}
+    for spec in config.roster:
+        if spec.realm not in by_realm:
+            by_realm[spec.realm] = []
+            order.append(spec.realm)
+        if spec.localpart not in by_realm[spec.realm]:
+            by_realm[spec.realm].append(spec.localpart)
+    out: list[dict] = []
+    for realm in order:
+        lead = config.realm_leads.get(realm)
+        if not lead:
+            continue
+        out.append({"realm": realm, "name": realm, "lead": lead,
+                    "members": sorted(by_realm[realm])})
+    return out
+
+
+
 def should_reconcile(now: float, last_run: Optional[float], interval: float,
                      run_on_start: bool = True) -> bool:
     """Pure loop-scheduling decision: should the reconciler fire this pass?
@@ -167,19 +194,68 @@ async def reconcile_once(config: Config, secrets: SecretsStore,
             "to_provision": to_provision}
 
 
+def provision_channels(config: Config, backend) -> list[dict]:
+    """Ensure ONE group chat per realm exists, created by the realm lead, with all realm
+    members synced in (Vikunja proj-23 step 5b). Idempotent: matches an existing channel by
+    name among the lead's channels and only adds MISSING members.
+
+    Synchronous (deltachat rpc is blocking) — the loop runs it via ``asyncio.to_thread``.
+    Uses only the injectable ``DeltaBackend`` surface (account_id_for/list_channels/
+    create_channel/add_member), so it's unit-tested with a fake backend, no live core.
+    A realm whose lead isn't onboarded yet is skipped this pass (retried next pass).
+    """
+    domain = config.mail_domain
+    results: list[dict] = []
+    for ch in desired_channels(config):
+        lead, name = ch["lead"], ch["name"]
+        lead_accid = backend.account_id_for(lead)
+        if lead_accid is None:
+            results.append({"realm": ch["realm"], "skipped": "lead-not-onboarded"})
+            continue
+        member_addrs = [f"{m}@{domain}" for m in ch["members"] if m != lead]
+        try:
+            existing = backend.list_channels(lead_accid) or []
+            match = next((c for c in existing if c.get("name") == name), None)
+            if match is None:
+                chat_id = backend.create_channel(lead_accid, name, member_addrs)
+                results.append({"realm": ch["realm"], "created": chat_id,
+                                "members": len(member_addrs)})
+            else:
+                have = set(match.get("members", []))
+                added = 0
+                for m in ch["members"]:
+                    if m != lead and m not in have:
+                        backend.add_member(lead_accid, match["id"], f"{m}@{domain}")
+                        added += 1
+                results.append({"realm": ch["realm"], "channel_id": match["id"],
+                                "added": added})
+        except Exception:
+            log.exception("channel provision failed for realm %s", ch["realm"])
+            results.append({"realm": ch["realm"], "error": True})
+    created = sum(1 for r in results if "created" in r)
+    if created:
+        log.info("reconcile: created %d per-realm channel(s)", created)
+    return results
+
+
 async def reconciler_loop(config: Config, secrets: SecretsStore,
                           interval: float, run_on_start: bool,
                           existing_fn: Callable[[], list[str]],
                           *, onboard: Onboard,
+                          after_reconcile: Optional[Callable[[], Awaitable]] = None,
                           _should_stop: Optional[Callable[[], bool]] = None) -> None:  # pragma: no cover - loop
     """Periodic reconciler. ``existing_fn`` supplies current onboarded localparts each pass
-    (default in build wiring = the relay backend's account index)."""
+    (default in build wiring = the relay backend's account index). ``after_reconcile`` (opt)
+    runs once per pass AFTER account onboarding — production wires it to per-realm channel
+    provisioning (accounts must exist before their channels can be created)."""
     last_run: Optional[float] = None
     while not (_should_stop and _should_stop()):
         now = asyncio.get_event_loop().time()
         if should_reconcile(now, last_run, interval, run_on_start):
             try:
                 await reconcile_once(config, secrets, existing_fn(), onboard=onboard)
+                if after_reconcile is not None:
+                    await after_reconcile()
             except Exception:
                 log.exception("reconcile pass failed")
             last_run = asyncio.get_event_loop().time()
@@ -338,7 +414,9 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         mcp_server.serve(),
         drain_loop(service.relay),
         reconciler_loop(cfg, service.secrets, reconcile_interval, run_on_start, existing_fn,
-                        onboard=_make_onboard(service)),
+                        onboard=_make_onboard(service),
+                        after_reconcile=lambda: asyncio.to_thread(
+                            provision_channels, cfg, service.relay.backend)),
         backup_mod.run_forever(cfg, service.backup_backend, backup_dir,
                                retain=backup_retain, interval=backup_interval),
     )

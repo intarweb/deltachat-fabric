@@ -83,6 +83,15 @@ Passwords are minted with a CSPRNG (never below the server's minimum length) and
 to a local mode-`600` secrets file (`DELTA_SECRETS_PATH`) so login is stable across
 restarts. Point that path at a locket/secret mount in a real deploy.
 
+### Per-realm channels
+
+After onboarding accounts, each reconcile pass also ensures **one group chat per realm**
+(that has a `realm_leads` entry): the realm's lead account creates a group named after the
+realm and syncs in every roster member of that realm. Idempotent — matches an existing
+channel by name and only adds missing members; a realm whose lead isn't onboarded yet is
+retried next pass. The lead is the channel's "main" (routing wakes it on an unaddressed
+message). A realm with no lead is skipped (nothing to route unaddressed messages to).
+
 ## Backup
 
 A nightly loop calls the deltachat **imex** backup export

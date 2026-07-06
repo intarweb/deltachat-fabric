@@ -579,3 +579,26 @@ def test_ensure_account_is_idempotent_skips_already_configured(tmp_path):
     assert be.ensure_account("bot-a", "pw123456789", **kw) is True
     assert be.ensure_account("bot-a", "pw123456789", **kw) is True   # idempotent
     assert len(rpc.transports) == 1                                  # NOT re-onboarded
+
+
+def test_contact_to_dict_normalizes_deltachat2_contact_object():
+    """🔴 Regression: deltachat2 get_contacts() returns Contact OBJECTS (.id/.address/
+    .display_name), NOT ids — list_contacts must build from the object, not re-fetch by id.
+    Verified vs the installed package."""
+    from app.relay import DeltaChat2Backend
+
+    class Contact:            # mimics deltachat2.types.Contact
+        id = 12
+        address = "bot-a@deltachat.example.net"
+        display_name = "bot-a"
+
+    assert DeltaChat2Backend._contact_to_dict(Contact()) == {
+        "id": 12, "address": "bot-a@deltachat.example.net", "display_name": "bot-a"}
+
+    class Legacy:             # tolerate addr/name fallbacks
+        id = 5
+        addr = "x@y.net"
+        name = "x"
+
+    d = DeltaChat2Backend._contact_to_dict(Legacy())
+    assert d["address"] == "x@y.net" and d["display_name"] == "x"
