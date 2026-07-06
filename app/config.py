@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -18,6 +19,7 @@ class BotSpec:
     id: str                       # fleet bot id (e.g. "bot-a") — injected, not baked
     realm: str = "default"        # realm/channel grouping (e.g. "realm-a", "realm-b")
     localpart: str = ""           # delta account localpart; defaults to id if unset
+    display_name: str = ""        # Delta display name shown to humans; defaults to Capitalized id
 
     def __post_init__(self):
         if not self.localpart:
@@ -64,3 +66,18 @@ class Config:
             roster=roster,
             realm_leads=leads,
         )
+
+    @staticmethod
+    def _capitalize(s: str) -> str:
+        """Capitalize the first character only (preserve the rest): 'robot' -> 'Robot',
+        'mcBot' -> 'McBot'. Generic — no fleet names baked in."""
+        return s[:1].upper() + s[1:] if s else s
+
+    def display_name_for(self, localpart: str) -> str:
+        """Delta display name a human should see for a bot account (e.g. 'Robot', not the
+        raw email). Uses the roster's explicit ``display_name`` if set, else the Capitalized bot
+        id. Generic: falls back to the Capitalized localpart for an unknown account."""
+        for b in self.roster:
+            if localpart in (b.localpart, b.id):
+                return b.display_name or self._capitalize(b.id)
+        return self._capitalize(localpart)

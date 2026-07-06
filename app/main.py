@@ -409,6 +409,7 @@ def _make_onboard(service: Service) -> Onboard:  # pragma: no cover - real core 
             backend.ensure_account, localpart, password,
             imap_host=cfg.imap_host, imap_port=cfg.imap_port,
             smtp_host=cfg.submission_host or cfg.imap_host, smtp_port=cfg.submission_port,
+            display_name=cfg.display_name_for(localpart),
         )
 
     return onboard
