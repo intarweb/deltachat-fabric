@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +37,8 @@ import httpx
 from pydantic import AliasChoices, BaseModel, Field
 
 from .config import Config
+
+log = logging.getLogger("dcf")
 from .routing import wake_targets
 
 # ---------------------------------------------------------------------------
@@ -617,33 +621,70 @@ class AgentDirectory:
     def __init__(self, config: Config, client: httpx.AsyncClient):
         self.config = config
         self.client = client
+        self._name_to_url: dict[str, str] = {}   # cached bot-name(lower) → live a2a url
+        self._refreshed_at: float = 0.0
+        self._ttl = float(os.environ.get("A2A_DIRECTORY_TTL", "30"))
 
-    async def resolve(self, bot_id: str) -> Optional[str]:
-        """Return the live a2a URL for ``bot_id`` from the directory, or None.
+    async def _agent_name(self, entry: dict, agent_url: str) -> str:
+        """Identity for a directory entry. 🔴 The a2abridge /agents endpoint lists
+        ``{url,lastSeen}`` WITHOUT a name — the name lives in each agent's
+        ``/.well-known/agent-card.json``. Tolerate an inline ``name`` (tests / a future
+        directory), else fetch the card. Returns '' on any failure."""
+        inline = entry.get("name") or (entry.get("card") or {}).get("name")
+        if inline:
+            return str(inline)
+        try:
+            resp = await self.client.get(agent_url.rstrip("/") + "/.well-known/agent-card.json")
+            resp.raise_for_status()
+            return str((resp.json() or {}).get("name") or "")
+        except Exception:
+            return ""
 
-        Expects the directory to return either ``[{name,url}, ...]`` or
-        ``{"agents": [{name,url}, ...]}``. Matches on ``name`` (case-insensitive).
-        Any error / miss → None (caller then holds the wake).
-        """
+    async def _refresh(self) -> None:
+        """Rebuild the name→url map from the directory (fetching cards for names)."""
         url = self.config.a2a_directory_url
         if not url:
-            return None
+            return
         try:
             resp = await self.client.get(url)
             resp.raise_for_status()
             data = resp.json()
-        except Exception:
-            return None
-        agents = data.get("agents", data) if isinstance(data, dict) else data
-        if not isinstance(agents, list):
-            return None
-        for a in agents:
-            if not isinstance(a, dict):
+        except Exception as e:
+            log.warning("a2a directory GET %s failed: %s", url, e)
+            return
+        entries = data.get("agents", data) if isinstance(data, dict) else data
+        if not isinstance(entries, list):
+            log.warning("a2a directory returned non-list (%s)", type(data).__name__)
+            return
+        mapping: dict[str, str] = {}
+        for e in entries:
+            if not isinstance(e, dict) or not e.get("url"):
                 continue
-            name = str(a.get("name", "")).lower()
-            if name == bot_id.lower() and a.get("url"):
-                return a["url"]
-        return None
+            name = await self._agent_name(e, e["url"])
+            if name:
+                mapping[name.lower()] = e["url"]
+        if mapping:
+            self._name_to_url = mapping
+            self._refreshed_at = time.monotonic()
+
+    async def resolve(self, bot_id: str) -> Optional[str]:
+        """Return the live a2a URL for ``bot_id`` from the a2abridge directory, or None.
+
+        The directory lists urls only (no names); identity comes from each agent's card, so we
+        build+cache a name→url map (TTL ``A2A_DIRECTORY_TTL``, default 30s) and refresh on a
+        cache MISS so a newly-appeared bot resolves promptly. Logs the result — resolve()
+        silently returning None (the old name-inline assumption) is exactly what pinned every
+        wake in the hold-queue."""
+        key = bot_id.lower()
+        if key not in self._name_to_url or (time.monotonic() - self._refreshed_at) > self._ttl:
+            await self._refresh()
+        target = self._name_to_url.get(key)
+        if target is None:
+            log.warning("resolve(%s) → None (not in a2a directory: %d agents known)",
+                        bot_id, len(self._name_to_url))
+        else:
+            log.info("resolve(%s) → %s", bot_id, target)
+        return target
 
     async def wake(self, agent_url: str, bot_id: str, payload: dict) -> bool:
         """Wake a bot by POSTing an A2A ``message/send`` to its agent endpoint.
@@ -666,8 +707,10 @@ class AgentDirectory:
         try:
             resp = await self.client.post(agent_url.rstrip("/"), json=envelope)
             resp.raise_for_status()
+            log.info("wake %s → %s (%s)", bot_id, agent_url, resp.status_code)
             return True
-        except Exception:
+        except Exception as e:
+            log.warning("wake %s → %s FAILED: %s", bot_id, agent_url, e)
             return False
 
 
@@ -925,6 +968,9 @@ class Relay:
             if agent_url and await self.directory.wake(agent_url, bot, payload):
                 self.hold.remove(item)
                 delivered += 1
+            else:
+                log.info("drain: held wake for %s NOT delivered (resolve=%s) — stays queued",
+                         bot, agent_url)
         return delivered
 
     # -- inbound tick ------------------------------------------------------
