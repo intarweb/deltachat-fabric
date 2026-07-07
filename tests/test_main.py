@@ -505,6 +505,137 @@ def test_provision_channels_skips_lead_not_onboarded_yet():
     assert be.created == []
 
 
+def test_desired_channels_lead_id_normalized_to_localpart():
+    # 🔴 Break (b): realm_leads maps realm -> bot ID, but members[] + account lookup key by
+    # LOCALPART. desired_channels must normalize the lead to its localpart, else account_id_for
+    # (localpart-keyed) returns None and the realm is silently skipped whenever id != localpart.
+    cfg = Config(
+        mail_domain="d.example", imap_host="m",
+        roster=[BotSpec(id="lead", realm="r1", localpart="pantest01"),
+                BotSpec(id="m1", realm="r1", localpart="pantest02")],
+        realm_leads={"r1": "lead"},               # keyed by bot ID, not localpart
+    )
+    ch = main.desired_channels(cfg)[0]
+    assert ch["lead"] == "pantest01"              # bot-id -> localpart
+    assert ch["members"] == ["pantest01", "pantest02"]
+
+
+def test_provision_channels_resolves_lead_when_id_ne_localpart():
+    # End-to-end of break (b): with id != localpart the lead account now resolves and the lead
+    # is correctly excluded from the member address list.
+    cfg = Config(
+        mail_domain="d.example", imap_host="m",
+        roster=[BotSpec(id="lead", realm="r1", localpart="pantest01"),
+                BotSpec(id="m1", realm="r1", localpart="pantest02")],
+        realm_leads={"r1": "lead"},
+    )
+    be = _ChanBackend(accounts={"pantest01": 10, "pantest02": 11})
+    res = main.provision_channels(cfg, be)
+    assert be.created == [(10, "r1", ["pantest02@d.example"])]   # lead excluded, lead acct = 10
+    assert res[0]["created"]
+
+
+# -- securejoin STAR (break (a): make members verified key-contacts of the realm lead) --------
+
+
+class _StarBackend:
+    """Fake DeltaBackend surface for securejoin_star (no live core, no IMAP)."""
+
+    def __init__(self, accounts, *, verify_after_nudges=1, verified=None):
+        self._acc = accounts                       # localpart -> accid
+        self._verify_after = verify_after_nudges    # how many force_polls until a pair verifies
+        self._verified = set(verified or [])        # (lead_accid, addr) already verified
+        self.invites = 0
+        self.joins: list = []                       # (member_accid, invite)
+        self.polls = 0
+        self._pending_nudges: dict = {}             # (lead_accid, addr) -> nudges seen so far
+
+    def account_id_for(self, lp):
+        return self._acc.get(lp)
+
+    def is_verified_key_contact(self, accid, addr):
+        return (accid, addr.strip().lower()) in self._verified
+
+    def create_invite(self, accid):
+        self.invites += 1
+        return f"invite-for-{accid}"
+
+    def secure_join(self, member_accid, invite):
+        self.joins.append((member_accid, invite))
+        return 1
+
+    def force_poll(self):
+        self.polls += 1
+        # advance every in-flight pair; verify once it has seen `_verify_after` nudges
+        for key in list(self._pending_nudges):
+            self._pending_nudges[key] += 1
+            if self._pending_nudges[key] >= self._verify_after:
+                self._verified.add(key)
+
+
+def _star_be(accounts, **kw):
+    be = _StarBackend(accounts, **kw)
+    _orig = be.secure_join
+
+    def _sj(member_accid, invite):
+        # arm the pending pair keyed by lead accid + this member's addr (single-realm helper)
+        lead_accid = accounts["lead"] if "lead" in accounts else 10
+        for lp, a in accounts.items():
+            if a == member_accid:
+                be._pending_nudges[(lead_accid, f"{lp}@d.example")] = 0
+        return _orig(member_accid, invite)
+
+    be.secure_join = _sj
+    return be
+
+
+def test_securejoin_star_joins_each_member_to_lead():
+    cfg = Config(mail_domain="d.example", imap_host="m",
+                 roster=[BotSpec(id="lead", realm="r1", localpart="lead"),
+                         BotSpec(id="m1", realm="r1", localpart="m1"),
+                         BotSpec(id="m2", realm="r1", localpart="m2")],
+                 realm_leads={"r1": "lead"})
+    be = _star_be({"lead": 10, "m1": 11, "m2": 12}, verify_after_nudges=1)
+    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
+    # each non-lead member secure_joins the lead's invite and ends up verified
+    assert sorted(res[0]["joined"]) == ["m1", "m2"]
+    assert res[0]["pending"] == []
+    assert be.invites == 2 and len(be.joins) == 2
+
+
+def test_securejoin_star_idempotent_skips_already_verified():
+    cfg = Config(mail_domain="d.example", imap_host="m",
+                 roster=[BotSpec(id="lead", realm="r1", localpart="lead"),
+                         BotSpec(id="m1", realm="r1", localpart="m1")],
+                 realm_leads={"r1": "lead"})
+    # m1 is ALREADY a verified key-contact of the lead → no invite, no securejoin
+    be = _star_be({"lead": 10, "m1": 11}, verified={(10, "m1@d.example")})
+    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
+    assert res[0]["skipped_verified"] == ["m1"]
+    assert res[0]["joined"] == [] and be.invites == 0 and be.joins == []
+
+
+def test_securejoin_star_skips_lead_not_onboarded():
+    cfg = Config(mail_domain="d.example", imap_host="m",
+                 roster=[BotSpec(id="lead", realm="r1", localpart="lead")],
+                 realm_leads={"r1": "lead"})
+    be = _star_be({})                              # lead has no account yet
+    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
+    assert res[0]["skipped"] == "lead-not-onboarded"
+    assert be.invites == 0
+
+
+def test_securejoin_star_pending_when_member_not_onboarded():
+    cfg = Config(mail_domain="d.example", imap_host="m",
+                 roster=[BotSpec(id="lead", realm="r1", localpart="lead"),
+                         BotSpec(id="m1", realm="r1", localpart="m1")],
+                 realm_leads={"r1": "lead"})
+    be = _star_be({"lead": 10})                    # m1 not onboarded yet → retried next pass
+    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
+    assert res[0]["pending"] == ["m1"]
+    assert be.invites == 0
+
+
 # -- env-selectable secret backend (the atomic chatmaild→Stalwart cutover) -------------------
 
 

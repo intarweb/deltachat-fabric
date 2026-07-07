@@ -165,6 +165,13 @@ class DeltaBackend(Protocol):
         key-contact; returns the resulting chat id. BLOCKING. (Optional on fakes.)"""
         ...
 
+    def is_verified_key_contact(self, account_id: int, addr: str) -> bool:
+        """True iff ``addr`` is already a VERIFIED KEY-CONTACT of ``account_id`` (the state a
+        completed securejoin establishes). Lets the securejoin-star skip an already-verified
+        (lead, member) pair so reconcile is idempotent and doesn't re-handshake every run.
+        (Optional on fakes.)"""
+        ...
+
     def delete_chat(self, account_id: int, chat_id: int) -> None:
         """Delete ``chat_id`` from ``account_id`` (drops the chat + any in-progress securejoin
         half-handshake it holds). Used to clear a stale/tangled securejoin so a single clean
@@ -289,6 +296,26 @@ class DeltaChat2Backend:
         Blocking (network handshake) — callers run it off the loop.
         """
         return self.rpc.secure_join(account_id, invite)
+
+    def is_verified_key_contact(self, account_id: int, addr: str) -> bool:  # pragma: no cover
+        """True iff ``addr`` is already a VERIFIED KEY-CONTACT of ``account_id``.
+
+        Mirrors ``_resolve_contact``'s enumeration (get_contacts matching the address, keep the
+        key-contacts) but only asks whether a VERIFIED one exists — the state a completed
+        securejoin leaves behind. Used by the securejoin-star to skip an already-verified pair
+        (idempotent reconcile). Defensive: False on any error (→ we attempt the securejoin,
+        which is itself idempotent)."""
+        try:
+            matches = self.rpc.get_contacts(account_id, 0, addr) or []
+        except Exception:
+            return False
+        want = addr.strip().lower()
+        for c in matches:
+            if (getattr(c, "is_key_contact", False)
+                    and getattr(c, "is_verified", False)
+                    and (getattr(c, "address", "") or "").strip().lower() == want):
+                return True
+        return False
 
     def delete_chat(self, account_id: int, chat_id: int) -> None:  # pragma: no cover - real rpc
         """Delete ``chat_id`` from ``account_id``. Clears the chat and any in-progress

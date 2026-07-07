@@ -124,10 +124,19 @@ def desired_channels(config: Config) -> list[dict]:
     "main" (owns/creates it + routing wakes it on an unaddressed message; see routing.py).
     A realm with no ``realm_leads`` entry is skipped (no main → can't route unaddressed msgs).
     Order-preserving by first appearance; members sorted + de-duped.
+
+    🔴 ``lead`` is normalized to the lead's LOCALPART, not its roster bot-id. ``realm_leads``
+    maps realm → bot **id** (e.g. ``ka``), but ``members`` (and the whole account/securejoin/
+    channel path) key by **localpart** (e.g. ``keytesta1``). Without this normalization the
+    downstream ``account_id_for(lead)`` (localpart-keyed) returns None and the realm is
+    silently skipped whenever id ≠ localpart. When id == localpart it's a no-op, so existing
+    same-id rosters are unaffected.
     """
     order: list[str] = []
     by_realm: dict[str, list[str]] = {}
+    id_to_localpart: dict[str, str] = {}
     for spec in config.roster:
+        id_to_localpart[spec.id] = spec.localpart
         if spec.realm not in by_realm:
             by_realm[spec.realm] = []
             order.append(spec.realm)
@@ -135,9 +144,10 @@ def desired_channels(config: Config) -> list[dict]:
             by_realm[spec.realm].append(spec.localpart)
     out: list[dict] = []
     for realm in order:
-        lead = config.realm_leads.get(realm)
-        if not lead:
+        lead_id = config.realm_leads.get(realm)
+        if not lead_id:
             continue
+        lead = id_to_localpart.get(lead_id, lead_id)  # bot-id → localpart (no-op if id==lp)
         out.append({"realm": realm, "name": realm, "lead": lead,
                     "members": sorted(by_realm[realm])})
     return out
@@ -235,6 +245,85 @@ def provision_channels(config: Config, backend) -> list[dict]:
     created = sum(1 for r in results if "created" in r)
     if created:
         log.info("reconcile: created %d per-realm channel(s)", created)
+    return results
+
+
+def securejoin_star(config: Config, backend, *,
+                    poll_nudges: int = 6, poll_wait: float = 5.0,
+                    _sleep: Optional[Callable[[float], None]] = None) -> list[dict]:
+    """Establish a securejoin STAR to each realm's lead, so the lead can populate the realm's
+    encrypted group (Vikunja proj-23 step 5a — the prerequisite for 5b/``provision_channels``).
+
+    🔴 Why this must run BEFORE ``provision_channels``: with break #1's key-contact fix, the
+    lead can only ``create_channel``/``add_member`` a member who is a VERIFIED KEY-CONTACT of
+    the lead (deltachat refuses "Only key-contacts can be added to encrypted chats"). Onboarding
+    only create-on-logins each account — it never securejoins bots to each other. So for each
+    realm we drive a star: the LEAD creates a securejoin invite and each non-lead member
+    ``secure_join``s it. Both accounts live on THIS relay process, so we drive both sides
+    locally and nudge the IMAP key-exchange with ``force_poll`` (reused from the IDLE-push
+    workaround) until the member is a verified key-contact of the lead.
+
+    A star (every member ↔ lead) is sufficient: once all members are in the lead-created group,
+    members learn each OTHER's keys via Autocrypt gossip in the group — no full mesh needed.
+
+    Idempotent: a (lead, member) pair whose member is already a verified key-contact of the
+    lead is skipped, so reconcile doesn't re-handshake every run. Blocking (rpc + IMAP) — the
+    loop runs it via ``asyncio.to_thread``. Uses only the injectable ``DeltaBackend`` surface
+    (account_id_for/create_invite/secure_join/is_verified_key_contact/force_poll) so it's
+    unit-testable with a fake backend, no live core.
+
+    Returns ``[{realm, joined:[member,...], skipped_verified:[member,...], pending:[member,...]}]``.
+    """
+    sleep = _sleep or time.sleep
+    domain = config.mail_domain
+    results: list[dict] = []
+    for ch in desired_channels(config):
+        lead = ch["lead"]
+        lead_accid = backend.account_id_for(lead)
+        if lead_accid is None:
+            results.append({"realm": ch["realm"], "skipped": "lead-not-onboarded"})
+            continue
+        members = [m for m in ch["members"] if m != lead]
+        joined: list[str] = []
+        skipped_verified: list[str] = []
+        pending: list[str] = []
+        for m in members:
+            m_accid = backend.account_id_for(m)
+            if m_accid is None:
+                pending.append(m)  # member not onboarded yet → retry next pass
+                continue
+            m_addr = f"{m}@{domain}"
+            if backend.is_verified_key_contact(lead_accid, m_addr):
+                skipped_verified.append(m)  # already verified → idempotent no-op
+                continue
+            try:
+                invite = backend.create_invite(lead_accid)
+                backend.secure_join(m_accid, invite)  # member accepts the lead's invite
+            except Exception:
+                log.exception("securejoin-star %s → %s failed", m, lead)
+                pending.append(m)
+                continue
+            # Drive the IMAP key-exchange: the vc-request/vc-auth round-trips ride on mail the
+            # broken IDLE won't wake the core for, so nudge force_poll until verified (bounded).
+            verified = False
+            for _ in range(max(1, poll_nudges)):
+                try:
+                    backend.force_poll()
+                except Exception:
+                    log.exception("securejoin-star force_poll failed")
+                sleep(poll_wait)
+                if backend.is_verified_key_contact(lead_accid, m_addr):
+                    verified = True
+                    break
+            (joined if verified else pending).append(m)
+        results.append({"realm": ch["realm"], "joined": joined,
+                        "skipped_verified": skipped_verified, "pending": pending})
+        if joined:
+            log.info("reconcile: securejoin-star realm %s — %d member(s) verified to lead %s",
+                     ch["realm"], len(joined), lead)
+        if pending:
+            log.warning("reconcile: securejoin-star realm %s — %d member(s) NOT yet verified: %s",
+                        ch["realm"], len(pending), pending)
     return results
 
 
@@ -455,6 +544,14 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         idx = getattr(service.relay.backend, "_localpart_to_accid", {})
         return list(idx.keys())
 
+    async def after_reconcile() -> None:
+        # 🔴 Order matters: establish the per-realm securejoin STAR to the lead FIRST (so every
+        # member is a verified key-contact of the lead), THEN provision the encrypted realm
+        # channel — the lead can only add verified key-contacts to an encrypted group. Both run
+        # off the loop (blocking rpc + IMAP).
+        await asyncio.to_thread(securejoin_star, cfg, service.relay.backend)
+        await asyncio.to_thread(provision_channels, cfg, service.relay.backend)
+
     loop = asyncio.get_running_loop()
     # 🔴 blocking deltachat event stream → dedicated daemon thread (NEVER on the loop).
     threading.Thread(
@@ -470,8 +567,7 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         poll_loop(service.relay, poll_interval),
         reconciler_loop(cfg, service.secrets, reconcile_interval, run_on_start, existing_fn,
                         onboard=_make_onboard(service),
-                        after_reconcile=lambda: asyncio.to_thread(
-                            provision_channels, cfg, service.relay.backend)),
+                        after_reconcile=after_reconcile),
         backup_mod.run_forever(cfg, service.backup_backend, backup_dir,
                                retain=backup_retain, interval=backup_interval),
     )
