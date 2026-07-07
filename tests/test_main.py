@@ -250,6 +250,62 @@ def test_event_pump_dispatches_incoming_and_never_blocks_the_loop():
     asyncio.run(_run())
 
 
+def test_event_pump_does_NOT_auto_react_on_inbound():
+    """🔴 Spec (authoritative interaction protocol): the relay is wake+deliver+surface ONLY — it must
+    NEVER emit a reaction on a bot's behalf. The 👀 proof-of-life is AGENT-side (the woken bot
+    calls delta_react as its first step), NOT relay code. Regression on the false-liveness bug:
+    the pump used to auto-fire backend.react_seen (👀) on every inbound → Justin saw a 👀 even
+    when the bot never actually woke (a lie). This asserts the inbound pump auto-reacts on
+    NOTHING while still dispatching the wake. FAILS on the old auto-👀 pump code (proves
+    fail-on-broken)."""
+    import asyncio
+
+    from app.relay import InboundMessage
+
+    async def _run():
+        reacted: list = []
+        submitted: list = []
+
+        class SpyBackend:
+            def __init__(self):
+                self.calls = 0
+
+            def next_inbound(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return InboundMessage(account_id=7, chat_id=1, msg_id=5, text="hi",
+                                          is_group=False, members=[], mentioned=[])
+                raise StopIteration  # break the pump loop after one message
+
+            # 🔴 the relay must call NONE of these on an inbound message (no auto-react):
+            def react_seen(self, accid, msg_id):
+                reacted.append(("react_seen", accid, msg_id))
+
+            def react(self, accid, msg_id, emoji):
+                reacted.append(("react", accid, msg_id, emoji))
+
+        class FakeRelay:
+            async def handle_inbound(self, msg):
+                return []
+
+            async def handle_reaction(self, r):
+                return []
+
+        loop = asyncio.get_running_loop()
+
+        def _submit(coro):
+            submitted.append(coro)
+            coro.close()  # we assert on auto-reactions + dispatch, not delivery result
+
+        main._event_pump(SpyBackend(), FakeRelay(), loop,
+                         _should_stop=lambda: False, _submit=_submit)
+
+        assert reacted == []          # relay did NOT auto-react on the bot's behalf
+        assert len(submitted) == 1    # the inbound was still dispatched to the wake path
+
+    asyncio.run(_run())
+
+
 def test_poll_loop_forces_periodic_fetch():
     """poll_loop nudges relay.force_poll on its interval — the Stalwart #339 IDLE workaround
     (server pushes STATUS not EXISTS, so the core never wakes on new mail; we poll instead)."""

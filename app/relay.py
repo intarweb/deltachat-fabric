@@ -26,6 +26,7 @@ import asyncio
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -105,11 +106,6 @@ class DeltaBackend(Protocol):
         Non-blocking: the inbound loop calls this repeatedly per tick. Returning None
         means "nothing routable waiting right now".
         """
-        ...
-
-    def react_seen(self, account_id: int, msg_id: int) -> None:
-        """Acknowledge an inbound message by reacting 👀 to it (best-effort) — a clean
-        'seen it' signal instead of a text reply. (Optional on fakes.)"""
         ...
 
     def localpart_for(self, account_id: int) -> Optional[str]:
@@ -382,13 +378,6 @@ class DeltaChat2Backend:
             emoji=emoji, from_id=contact_id or 0, from_addr=from_addr,
         )
 
-    def react_seen(self, account_id: int, msg_id: int) -> None:  # pragma: no cover - real rpc
-        """React 👀 to an inbound message — a clean 'seen it' ack (no text reply)."""
-        try:
-            self.rpc.send_reaction(account_id, msg_id, ["\U0001f440"])
-        except Exception:
-            pass
-
     def localpart_for(self, account_id: int) -> Optional[str]:  # pragma: no cover - real rpc
         for lp, accid in self._localpart_to_accid.items():
             if accid == account_id:
@@ -657,12 +646,25 @@ class AgentDirectory:
         return None
 
     async def wake(self, agent_url: str, bot_id: str, payload: dict) -> bool:
-        """POST a wake/message to a resolved agent URL. True iff it was accepted (2xx)."""
+        """Wake a bot by POSTing an A2A ``message/send`` to its agent endpoint.
+
+        🔴 a2abridge speaks the A2A JSON-RPC protocol — the wake must be a ``message/send``
+        request to the agent's OWN url (NOT a plain JSON POST to ``<url>/a2a``; that never lands
+        in the bot's a2a inbox). The human-readable notification is ``payload['text']`` (e.g.
+        "[alice@example.com reacted 👍 on msg 27 via Delta Chat]"), delivered as the message's
+        text part — matching the proven single-bot pattern. True iff the request was accepted (2xx).
+        """
+        text = payload.get("text") or f"[Delta Chat] wake for {bot_id}"
+        mid = uuid.uuid4().hex
+        envelope = {
+            "jsonrpc": "2.0", "id": mid, "method": "message/send",
+            "params": {"message": {
+                "role": "user", "messageId": mid, "kind": "message",
+                "parts": [{"kind": "text", "text": text}],
+            }},
+        }
         try:
-            resp = await self.client.post(
-                agent_url.rstrip("/") + "/a2a",
-                json={"bot_id": bot_id, "kind": "wake", **payload},
-            )
+            resp = await self.client.post(agent_url.rstrip("/"), json=envelope)
             resp.raise_for_status()
             return True
         except Exception:
@@ -875,12 +877,14 @@ class Relay:
         1:1 (non-group, e.g. a human DM) → wake the RECEIVING bot (the account owner) so it
         sees direct messages, not just group traffic. Undeliverable targets are held.
         """
-        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id, "text": msg.text}
+        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
+                   "text": f"[Delta Chat] {msg.text}"}
         if not msg.is_group:
             bot = self.backend.localpart_for(msg.account_id)
             if not bot:
                 return []
             payload["direct"] = True
+            payload["text"] = f"[Delta Chat DM] {msg.text}"
             return [bot] if await self._deliver(bot, payload) else []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)
@@ -899,7 +903,7 @@ class Relay:
         who = r.from_addr or "someone"
         payload = {
             "chat_id": r.chat_id, "msg_id": r.msg_id, "reaction": r.emoji, "from": who,
-            "text": f"[{who} reacted {r.emoji} via Delta Chat]",
+            "text": f"[{who} reacted {r.emoji} on msg {r.msg_id} via Delta Chat]",
         }
         return [bot] if await self._deliver(bot, payload) else []
 
