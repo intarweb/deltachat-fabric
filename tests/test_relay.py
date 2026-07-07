@@ -383,14 +383,17 @@ async def test_resolve_fetches_agent_card_when_directory_lists_urls_only(tmp_pat
         path = request.url.path
         if path == "/agents":
             calls["agents"] += 1
-            # exactly what a2abridge returns — url + lastSeen, NO name
+            # exactly what a2abridge returns — url + lastSeen, NO name; includes a DEAD entry
             return httpx.Response(200, json=[
                 {"url": "http://bot-a.live:8020", "lastSeen": "2026-07-07T00:00:00Z"},
                 {"url": "http://bot-b.live:8060", "lastSeen": "2026-07-07T00:00:00Z"},
+                {"url": "http://bot-dead.live:9999", "lastSeen": "2026-07-07T00:00:00Z"},
             ])
         if path == "/.well-known/agent-card.json":
             calls["card"] += 1
             host = request.url.host
+            if host == "bot-dead.live":
+                return httpx.Response(503)   # dead/unreachable agent → must be SKIPPED, not fatal
             name = {"bot-a.live": "bot-a", "bot-b.live": "bot-b"}.get(host, "?")
             return httpx.Response(200, json={"name": name, "url": f"http://{host}:{request.url.port}"})
         return httpx.Response(404)
@@ -401,6 +404,27 @@ async def test_resolve_fetches_agent_card_when_directory_lists_urls_only(tmp_pat
     assert calls["card"] >= 1                       # it fetched the card to get the name
     assert await directory.resolve("bot-b") == "http://bot-b.live:8060"  # served from cache
     assert await directory.resolve("nobody") is None                    # unknown → None
+    # the dead agent didn't break resolve for the live ones (Bragi gotcha a)
+
+
+async def test_resolve_prefers_freshest_lastseen_on_duplicate_name(tmp_path):
+    """Bragi gotcha (c): if a name appears twice in /agents (e.g. a bot re-registered at a new
+    url), resolve() must prefer the entry with the freshest lastSeen — not deliver to the stale url."""
+    from app.relay import AgentDirectory
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/agents":
+            return httpx.Response(200, json=[
+                {"url": "http://old.live:1", "lastSeen": "2026-07-07T00:00:00Z"},   # stale
+                {"url": "http://new.live:2", "lastSeen": "2026-07-07T09:00:00Z"},   # freshest
+            ])
+        if request.url.path == "/.well-known/agent-card.json":
+            # both urls report the SAME bot name
+            return httpx.Response(200, json={"name": "bot-a", "url": str(request.url).rsplit("/.well-known", 1)[0]})
+        return httpx.Response(404)
+
+    directory = AgentDirectory(make_config(), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    assert await directory.resolve("bot-a") == "http://new.live:2"   # freshest lastSeen wins
 
 
 # --------------------------------------------------------------------------- (3) unresolvable → held + drained
