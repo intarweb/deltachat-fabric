@@ -634,14 +634,17 @@ class AgentDirectory:
         if inline:
             return str(inline)
         try:
-            resp = await self.client.get(agent_url.rstrip("/") + "/.well-known/agent-card.json")
+            resp = await self.client.get(agent_url.rstrip("/") + "/.well-known/agent-card.json",
+                                         timeout=5.0)
             resp.raise_for_status()
             return str((resp.json() or {}).get("name") or "")
         except Exception:
-            return ""
+            return ""  # dead/unreachable agent → skip it; must not break the whole resolve
 
     async def _refresh(self) -> None:
-        """Rebuild the name→url map from the directory (fetching cards for names)."""
+        """Rebuild the name→url map from the directory. Fetches agent cards CONCURRENTLY (the
+        directory has dead entries — stale worktree bots — that must be skipped, not serialize
+        or fail resolve). On a duplicate name, prefer the entry with the freshest lastSeen."""
         url = self.config.a2a_directory_url
         if not url:
             return
@@ -656,13 +659,21 @@ class AgentDirectory:
         if not isinstance(entries, list):
             log.warning("a2a directory returned non-list (%s)", type(data).__name__)
             return
+        valid = [e for e in entries if isinstance(e, dict) and e.get("url")]
+        names = await asyncio.gather(
+            *(self._agent_name(e, e["url"]) for e in valid), return_exceptions=True
+        )
         mapping: dict[str, str] = {}
-        for e in entries:
-            if not isinstance(e, dict) or not e.get("url"):
+        freshest: dict[str, str] = {}
+        for e, name in zip(valid, names):
+            if isinstance(name, BaseException) or not name:
                 continue
-            name = await self._agent_name(e, e["url"])
-            if name:
-                mapping[name.lower()] = e["url"]
+            key = str(name).lower()
+            last_seen = str(e.get("lastSeen") or "")
+            if key in mapping and freshest.get(key, "") >= last_seen:
+                continue  # already have a fresher-or-equal entry for this name
+            mapping[key] = e["url"]
+            freshest[key] = last_seen
         if mapping:
             self._name_to_url = mapping
             self._refreshed_at = time.monotonic()
