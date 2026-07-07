@@ -467,8 +467,27 @@ class DeltaChat2Backend:
         return out
 
     def _resolve_contact(self, account_id: int, contact: str) -> int:  # pragma: no cover
-        """Resolve a member address to a contact id (create_contact is create-or-get)."""
-        return self.rpc.create_contact(account_id, contact, None)
+        """Resolve a member address to its KEY-CONTACT id (the encryptable contact established
+        by securejoin), NOT an address-contact.
+
+        create_contact(addr) ALWAYS makes an address-contact (no key) — the core refuses to add
+        it to an encrypted chat ("Only key-contacts can be added to encrypted chats"). And
+        lookup_contact_id_by_addr returns the most-recently-seen contact (may be the
+        address-contact) per deltachat-core api.rs ("do not use to look them up"). So enumerate
+        contacts matching the address and return the key-contact (prefer a verified one). Raise
+        if none — the member must securejoin first.
+        """
+        matches = self.rpc.get_contacts(account_id, 0, contact) or []
+        addr = contact.strip().lower()
+        keyc = [c for c in matches
+                if getattr(c, "is_key_contact", False)
+                and (getattr(c, "address", "") or "").strip().lower() == addr]
+        if not keyc:
+            raise KeyError(
+                f"no key-contact for {contact} — securejoin required before adding to an "
+                f"encrypted group (create_contact would make an unaddable address-contact)")
+        keyc.sort(key=lambda c: 0 if getattr(c, "is_verified", False) else 1)
+        return keyc[0].id
 
     def create_channel(self, account_id: int, name: str, members: list[str]) -> int:  # pragma: no cover
         chat_id = self.rpc.create_group_chat(account_id, name, False)
