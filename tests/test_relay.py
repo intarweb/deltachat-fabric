@@ -369,6 +369,40 @@ async def test_wake_posts_a2a_jsonrpc_message_send_to_agent_url(tmp_path):
     assert msg["parts"][0] == {"kind": "text", "text": "hello bot"}
 
 
+async def test_resolve_fetches_agent_card_when_directory_lists_urls_only(tmp_path):
+    """🔴 Regression + REAL a2abridge contract: the /agents endpoint lists {url,lastSeen} with
+    NO name — identity is only in each agent's /.well-known/agent-card.json. resolve() must fetch
+    the card to get the name. The old code matched an inline `name` that isn't there → None for
+    EVERY bot → every wake pinned in the hold-queue forever (held:5, drained:0). This uses a
+    transport that mimics the real nameless /agents + a card endpoint; FAILS on the old resolve."""
+    from app.relay import AgentDirectory
+
+    calls = {"agents": 0, "card": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/agents":
+            calls["agents"] += 1
+            # exactly what a2abridge returns — url + lastSeen, NO name
+            return httpx.Response(200, json=[
+                {"url": "http://bot-a.live:8020", "lastSeen": "2026-07-07T00:00:00Z"},
+                {"url": "http://bot-b.live:8060", "lastSeen": "2026-07-07T00:00:00Z"},
+            ])
+        if path == "/.well-known/agent-card.json":
+            calls["card"] += 1
+            host = request.url.host
+            name = {"bot-a.live": "bot-a", "bot-b.live": "bot-b"}.get(host, "?")
+            return httpx.Response(200, json={"name": name, "url": f"http://{host}:{request.url.port}"})
+        return httpx.Response(404)
+
+    directory = AgentDirectory(make_config(), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    assert await directory.resolve("bot-a") == "http://bot-a.live:8020"
+    assert calls["card"] >= 1                       # it fetched the card to get the name
+    assert await directory.resolve("bot-b") == "http://bot-b.live:8060"  # served from cache
+    assert await directory.resolve("nobody") is None                    # unknown → None
+
+
 # --------------------------------------------------------------------------- (3) unresolvable → held + drained
 
 
