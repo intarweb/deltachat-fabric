@@ -52,7 +52,7 @@ from typing import Awaitable, Callable, Optional
 from . import backup as backup_mod
 from . import reconciler
 from .config import Config
-from .relay import InboundReaction, Relay, build_default, create_app
+from .relay import InboundReaction, InboundVerified, Relay, build_default, create_app
 
 log = logging.getLogger("dcf")
 
@@ -248,33 +248,36 @@ def provision_channels(config: Config, backend) -> list[dict]:
     return results
 
 
-def securejoin_star(config: Config, backend, *,
-                    poll_nudges: int = 6, poll_wait: float = 5.0,
-                    _sleep: Optional[Callable[[float], None]] = None) -> list[dict]:
-    """Establish a securejoin STAR to each realm's lead, so the lead can populate the realm's
+def securejoin_star(config: Config, backend) -> list[dict]:
+    """Fire the securejoin STAR to each realm's lead, so the lead can populate the realm's
     encrypted group (Vikunja proj-23 step 5a — the prerequisite for 5b/``provision_channels``).
 
-    🔴 Why this must run BEFORE ``provision_channels``: with break #1's key-contact fix, the
-    lead can only ``create_channel``/``add_member`` a member who is a VERIFIED KEY-CONTACT of
-    the lead (deltachat refuses "Only key-contacts can be added to encrypted chats"). Onboarding
-    only create-on-logins each account — it never securejoins bots to each other. So for each
-    realm we drive a star: the LEAD creates a securejoin invite and each non-lead member
-    ``secure_join``s it. Both accounts live on THIS relay process, so we drive both sides
-    locally and nudge the IMAP key-exchange with ``force_poll`` (reused from the IDLE-push
-    workaround) until the member is a verified key-contact of the lead.
+    🔴 Why the securejoin must happen: with break #1's key-contact fix, the lead can only
+    ``create_channel``/``add_member`` a member who is a VERIFIED KEY-CONTACT of the lead
+    (deltachat refuses "Only key-contacts can be added to encrypted chats"). Onboarding only
+    create-on-logins each account — it never securejoins bots to each other. So for each realm
+    we drive a star: the LEAD creates a securejoin invite and each non-lead member
+    ``secure_join``s it. Both accounts live on THIS relay process, so we drive both sides locally.
+
+    🔴 FULLY EVENT-DRIVEN, NO WAIT: this is fire-and-forget — it INITIATES each secure_join and
+    returns immediately. It does NOT block re-checking verification (no sleep, no poll, no
+    force_poll). The vc-request/vc-auth key-exchange completes asynchronously over the mail
+    server's NATIVE IMAP IDLE push; when a member becomes a verified key-contact the core emits
+    a securejoin-verified event, and THAT event (via the event pump → provision_verified_member)
+    adds the member to the realm's encrypted channel. Verification is never waited on inline.
 
     A star (every member ↔ lead) is sufficient: once all members are in the lead-created group,
     members learn each OTHER's keys via Autocrypt gossip in the group — no full mesh needed.
 
-    Idempotent: a (lead, member) pair whose member is already a verified key-contact of the
-    lead is skipped, so reconcile doesn't re-handshake every run. Blocking (rpc + IMAP) — the
-    loop runs it via ``asyncio.to_thread``. Uses only the injectable ``DeltaBackend`` surface
-    (account_id_for/create_invite/secure_join/is_verified_key_contact/force_poll) so it's
-    unit-testable with a fake backend, no live core.
+    Idempotent: a (lead, member) pair whose member is already a verified key-contact of the lead
+    is skipped (no re-handshake). Blocking rpc only (secure_join initiation) — the loop runs it
+    via ``asyncio.to_thread``. Uses only the injectable ``DeltaBackend`` surface
+    (account_id_for/create_invite/secure_join/is_verified_key_contact).
 
-    Returns ``[{realm, joined:[member,...], skipped_verified:[member,...], pending:[member,...]}]``.
+    Returns ``[{realm, initiated:[member,...], skipped_verified:[member,...], pending:[member,...]}]``
+    where ``initiated`` = securejoin fired (verification arrives async → verified event provisions),
+    ``pending`` = member not onboarded yet (retry next reconcile pass).
     """
-    sleep = _sleep or time.sleep
     domain = config.mail_domain
     results: list[dict] = []
     for ch in desired_channels(config):
@@ -284,7 +287,7 @@ def securejoin_star(config: Config, backend, *,
             results.append({"realm": ch["realm"], "skipped": "lead-not-onboarded"})
             continue
         members = [m for m in ch["members"] if m != lead]
-        joined: list[str] = []
+        initiated: list[str] = []
         skipped_verified: list[str] = []
         pending: list[str] = []
         for m in members:
@@ -303,28 +306,60 @@ def securejoin_star(config: Config, backend, *,
                 log.exception("securejoin-star %s → %s failed", m, lead)
                 pending.append(m)
                 continue
-            # Drive the IMAP key-exchange: the vc-request/vc-auth round-trips ride on mail the
-            # broken IDLE won't wake the core for, so nudge force_poll until verified (bounded).
-            verified = False
-            for _ in range(max(1, poll_nudges)):
-                try:
-                    backend.force_poll()
-                except Exception:
-                    log.exception("securejoin-star force_poll failed")
-                sleep(poll_wait)
-                if backend.is_verified_key_contact(lead_accid, m_addr):
-                    verified = True
-                    break
-            (joined if verified else pending).append(m)
-        results.append({"realm": ch["realm"], "joined": joined,
+            # Fire-and-forget: the vc-request/vc-auth round-trips complete async over native IDLE.
+            # The core's securejoin-verified event (handled by provision_verified_member) adds the
+            # member to the channel — we do NOT wait/re-check here.
+            initiated.append(m)
+        results.append({"realm": ch["realm"], "initiated": initiated,
                         "skipped_verified": skipped_verified, "pending": pending})
-        if joined:
-            log.info("reconcile: securejoin-star realm %s — %d member(s) verified to lead %s",
-                     ch["realm"], len(joined), lead)
+        if initiated:
+            log.info("reconcile: securejoin-star realm %s — %d member(s) initiated to lead %s "
+                     "(verification completes async → event provisions)", ch["realm"],
+                     len(initiated), lead)
         if pending:
-            log.warning("reconcile: securejoin-star realm %s — %d member(s) NOT yet verified: %s",
+            log.warning("reconcile: securejoin-star realm %s — %d member(s) not onboarded yet: %s",
                         ch["realm"], len(pending), pending)
     return results
+
+
+def provision_verified_member(config: Config, backend, lead_accid: int,
+                              addr: str) -> Optional[dict]:
+    """Add a just-VERIFIED member to their realm's encrypted channel — the EVENT-DRIVEN half of
+    provisioning (triggered by the core's securejoin-verified event, NOT a reconcile wait/poll).
+
+    Given the lead account that emitted the verified event and the member's ``addr``, find the
+    realm this bot leads where that member belongs, ensure the channel exists, and add the member
+    (create-with-member if the channel doesn't exist yet, else add_member). Idempotent: a no-op if
+    the member is already in the channel. Returns a small result dict, or None if the addr isn't a
+    member of any realm this bot leads. Blocking rpc — the caller runs it off the loop.
+    """
+    lead_lp = backend.localpart_for(lead_accid)
+    if lead_lp is None:
+        return None
+    member_lp = addr.split("@", 1)[0]
+    domain = config.mail_domain
+    for ch in desired_channels(config):
+        if ch["lead"] != lead_lp or member_lp == lead_lp or member_lp not in ch["members"]:
+            continue
+        name = ch["name"]
+        try:
+            existing = backend.list_channels(lead_accid) or []
+            match = next((c for c in existing if c.get("name") == name), None)
+            if match is None:
+                chat_id = backend.create_channel(lead_accid, name, [f"{member_lp}@{domain}"])
+                log.info("provision(event): realm %s — created channel %s with %s",
+                         ch["realm"], chat_id, member_lp)
+                return {"realm": ch["realm"], "created": chat_id, "added": member_lp}
+            if member_lp not in set(match.get("members", [])):
+                backend.add_member(lead_accid, match["id"], f"{member_lp}@{domain}")
+                log.info("provision(event): realm %s — added %s to channel %s",
+                         ch["realm"], member_lp, match["id"])
+                return {"realm": ch["realm"], "channel_id": match["id"], "added": member_lp}
+            return {"realm": ch["realm"], "channel_id": match["id"], "already": member_lp}
+        except Exception:
+            log.exception("provision(event) failed: realm %s member %s", ch["realm"], member_lp)
+            return {"realm": ch["realm"], "error": True}
+    return None
 
 
 async def reconciler_loop(config: Config, secrets: SecretsStore,
@@ -366,10 +401,14 @@ async def reconciler_loop(config: Config, secrets: SecretsStore,
 
 
 def _event_pump(backend, relay: Relay, loop: asyncio.AbstractEventLoop,
-                *, _should_stop: Optional[Callable[[], bool]] = None,
+                *, on_verified: Optional[Callable[["InboundVerified"], Awaitable]] = None,
+                _should_stop: Optional[Callable[[], bool]] = None,
                 _submit: Optional[Callable[[Awaitable], object]] = None) -> None:
     """Consume the blocking deltachat event stream in THIS thread; dispatch each incoming
     message to ``relay.handle_inbound`` on the asyncio ``loop``. Never call this on the loop.
+
+    ``on_verified`` (opt) is invoked with each ``InboundVerified`` — a member became a verified
+    key-contact of a realm lead — so provisioning is EVENT-DRIVEN (no reconcile-time wait/poll).
 
     ``_submit`` (test seam) schedules a coroutine on the loop and waits for it; the default
     uses ``asyncio.run_coroutine_threadsafe`` — the standard cross-thread → asyncio bridge.
@@ -393,6 +432,11 @@ def _event_pump(backend, relay: Relay, loop: asyncio.AbstractEventLoop,
         try:
             if isinstance(msg, InboundReaction):
                 submit(relay.handle_reaction(msg))  # human reacted → wake bot w/ {who,emoji,msg_id}
+            elif isinstance(msg, InboundVerified):
+                # a member became a verified key-contact of a realm lead → EVENT-DRIVEN provision
+                # (add them to the realm's encrypted channel); no reconcile-time wait/poll.
+                if on_verified is not None:
+                    submit(on_verified(msg))
             else:
                 # Relay is wake+deliver+surface ONLY — it must NOT react on the bot's behalf.
                 # The 👀 proof-of-life is AGENT-side: the woken bot calls delta_react as its
@@ -411,24 +455,6 @@ async def drain_loop(relay: Relay, interval: float = 5.0,
         except Exception:
             log.exception("hold-drain failed")
         await asyncio.sleep(interval)
-
-
-async def poll_loop(relay: Relay, interval: float = 45.0,
-                    *, _should_stop: Optional[Callable[[], bool]] = None) -> None:
-    """Periodically force an IMAP fetch (deltachat ``maybe_network``) so queued mail is pulled
-    even when the server's IDLE push doesn't wake the core.
-
-    🔴 Stalwart v0.16.x (#339) pushes ``* STATUS INBOX (MESSAGES n)`` on new mail, NOT
-    ``* n EXISTS`` — deltachat-core's IDLE only wakes on EXISTS, so it never notices delivered
-    mail (e.g. a securejoin vc-request) until its ~15-min fallback poll. This loop nudges a
-    fetch on a short interval, sidestepping the broken IDLE entirely. Blocking rpc → to_thread.
-    """
-    while not (_should_stop and _should_stop()):
-        await asyncio.sleep(interval)  # sleep first: onboarding/reconcile already fetched
-        try:
-            await asyncio.to_thread(relay.force_poll)
-        except Exception:
-            log.exception("force-poll failed")
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +549,6 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
     backup_dir = os.environ.get("DELTA_BACKUP_DIR", "/backup")
     backup_retain = int(os.environ.get("DELTA_BACKUP_RETAIN", "7"))
     backup_interval = float(os.environ.get("DELTA_BACKUP_INTERVAL", "86400"))
-    poll_interval = float(os.environ.get("DELTA_POLL_INTERVAL", "45"))
 
     server = uvicorn.Server(uvicorn.Config(service.app, host=host, port=port, log_level="info"))
 
@@ -545,17 +570,24 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         return list(idx.keys())
 
     async def after_reconcile() -> None:
-        # 🔴 Order matters: establish the per-realm securejoin STAR to the lead FIRST (so every
-        # member is a verified key-contact of the lead), THEN provision the encrypted realm
-        # channel — the lead can only add verified key-contacts to an encrypted group. Both run
-        # off the loop (blocking rpc + IMAP).
+        # securejoin_star FIRES the per-realm handshakes (fire-and-forget — verification completes
+        # async over native IDLE and the verified EVENT provisions each member). provision_channels
+        # is the idempotent catch-up for members ALREADY verified from persisted state (e.g. after a
+        # restart, when no new event will fire for an already-verified contact). Neither waits/polls.
         await asyncio.to_thread(securejoin_star, cfg, service.relay.backend)
         await asyncio.to_thread(provision_channels, cfg, service.relay.backend)
+
+    async def on_verified(ev: InboundVerified) -> None:
+        # EVENT-DRIVEN provisioning: a member just became a verified key-contact of a realm lead →
+        # add them to the realm's encrypted channel now. Runs off the loop (blocking rpc).
+        await asyncio.to_thread(provision_verified_member, cfg, service.relay.backend,
+                                ev.account_id, ev.addr)
 
     loop = asyncio.get_running_loop()
     # 🔴 blocking deltachat event stream → dedicated daemon thread (NEVER on the loop).
     threading.Thread(
         target=_event_pump, args=(service.relay.backend, service.relay, loop),
+        kwargs={"on_verified": on_verified},
         daemon=True, name="dcf-event-pump",
     ).start()
 
@@ -564,7 +596,6 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         server.serve(),
         mcp_server.serve(),
         drain_loop(service.relay),
-        poll_loop(service.relay, poll_interval),
         reconciler_loop(cfg, service.secrets, reconcile_interval, run_on_start, existing_fn,
                         onboard=_make_onboard(service),
                         after_reconcile=after_reconcile),

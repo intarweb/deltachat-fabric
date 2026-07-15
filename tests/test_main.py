@@ -306,27 +306,51 @@ def test_event_pump_does_NOT_auto_react_on_inbound():
     asyncio.run(_run())
 
 
-def test_poll_loop_forces_periodic_fetch():
-    """poll_loop nudges relay.force_poll on its interval — the Stalwart #339 IDLE workaround
-    (server pushes STATUS not EXISTS, so the core never wakes on new mail; we poll instead)."""
+def test_event_pump_dispatches_verified_to_provision_not_wake():
+    """A securejoin-verified event (InboundVerified) is routed to on_verified (event-driven
+    provisioning), NOT to the wake path — proving verification provisioning is event-driven with
+    no reconcile-time wait/poll."""
     import asyncio
+    from app.relay import InboundVerified
 
     async def _run():
-        calls = {"n": 0}
-        stop = {"v": False}
+        provisioned: list = []
+        waked: list = []
+
+        class SpyBackend:
+            def __init__(self):
+                self.calls = 0
+
+            def next_inbound(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return InboundVerified(account_id=10, contact_id=3, addr="m1@d.example")
+                raise StopIteration
 
         class FakeRelay:
-            def force_poll(self):
-                calls["n"] += 1
-                if calls["n"] >= 2:
-                    stop["v"] = True
-                return {"status": "polled"}
+            async def handle_inbound(self, msg):
+                waked.append(msg)
 
-        await asyncio.wait_for(
-            main.poll_loop(FakeRelay(), 0.01, _should_stop=lambda: stop["v"]),
-            timeout=2.0,
-        )
-        assert calls["n"] >= 2
+            async def handle_reaction(self, r):
+                waked.append(r)
+
+        async def on_verified(ev):
+            provisioned.append(ev)
+
+        loop = asyncio.get_running_loop()
+
+        def _submit(coro):
+            # run the coroutine to completion so the append fires, in-thread
+            try:
+                coro.send(None)
+            except StopIteration:
+                pass
+
+        main._event_pump(SpyBackend(), FakeRelay(), loop, on_verified=on_verified,
+                         _should_stop=lambda: False, _submit=_submit)
+
+        assert len(provisioned) == 1 and provisioned[0].addr == "m1@d.example"
+        assert waked == []  # a verified event must NOT hit the wake/deliver path
 
     asyncio.run(_run())
 
@@ -539,19 +563,25 @@ def test_provision_channels_resolves_lead_when_id_ne_localpart():
 
 
 class _StarBackend:
-    """Fake DeltaBackend surface for securejoin_star (no live core, no IMAP)."""
+    """Fake DeltaBackend surface for securejoin_star + provision_verified_member (no live core)."""
 
-    def __init__(self, accounts, *, verify_after_nudges=1, verified=None):
+    def __init__(self, accounts, *, verified=None, channels=None):
         self._acc = accounts                       # localpart -> accid
-        self._verify_after = verify_after_nudges    # how many force_polls until a pair verifies
-        self._verified = set(verified or [])        # (lead_accid, addr) already verified
+        self._verified = set(verified or [])        # (lead_accid, addr) verified key-contacts
         self.invites = 0
         self.joins: list = []                       # (member_accid, invite)
-        self.polls = 0
-        self._pending_nudges: dict = {}             # (lead_accid, addr) -> nudges seen so far
+        self._channels = channels or {}             # lead_accid -> [ {id,name,members:[lp]} ]
+        self.created: list = []                     # (lead_accid, name, [addr])
+        self.added: list = []                       # (lead_accid, chat_id, addr)
 
     def account_id_for(self, lp):
         return self._acc.get(lp)
+
+    def localpart_for(self, accid):
+        for lp, a in self._acc.items():
+            if a == accid:
+                return lp
+        return None
 
     def is_verified_key_contact(self, accid, addr):
         return (accid, addr.strip().lower()) in self._verified
@@ -564,42 +594,40 @@ class _StarBackend:
         self.joins.append((member_accid, invite))
         return 1
 
-    def force_poll(self):
-        self.polls += 1
-        # advance every in-flight pair; verify once it has seen `_verify_after` nudges
-        for key in list(self._pending_nudges):
-            self._pending_nudges[key] += 1
-            if self._pending_nudges[key] >= self._verify_after:
-                self._verified.add(key)
+    # provisioning surface
+    def list_channels(self, accid):
+        return list(self._channels.get(accid, []))
+
+    def create_channel(self, accid, name, member_addrs):
+        chat_id = 100 + len(self.created)
+        self.created.append((accid, name, list(member_addrs)))
+        self._channels.setdefault(accid, []).append(
+            {"id": chat_id, "name": name,
+             "members": [a.split("@", 1)[0] for a in member_addrs]})
+        return chat_id
+
+    def add_member(self, accid, chat_id, addr):
+        self.added.append((accid, chat_id, addr))
+        for c in self._channels.get(accid, []):
+            if c["id"] == chat_id:
+                c["members"].append(addr.split("@", 1)[0])
 
 
 def _star_be(accounts, **kw):
-    be = _StarBackend(accounts, **kw)
-    _orig = be.secure_join
-
-    def _sj(member_accid, invite):
-        # arm the pending pair keyed by lead accid + this member's addr (single-realm helper)
-        lead_accid = accounts["lead"] if "lead" in accounts else 10
-        for lp, a in accounts.items():
-            if a == member_accid:
-                be._pending_nudges[(lead_accid, f"{lp}@d.example")] = 0
-        return _orig(member_accid, invite)
-
-    be.secure_join = _sj
-    return be
+    return _StarBackend(accounts, **kw)
 
 
-def test_securejoin_star_joins_each_member_to_lead():
+def test_securejoin_star_fires_and_forgets_each_member():
     cfg = Config(mail_domain="d.example", imap_host="m",
                  roster=[BotSpec(id="lead", realm="r1", localpart="lead"),
                          BotSpec(id="m1", realm="r1", localpart="m1"),
                          BotSpec(id="m2", realm="r1", localpart="m2")],
                  realm_leads={"r1": "lead"})
-    be = _star_be({"lead": 10, "m1": 11, "m2": 12}, verify_after_nudges=1)
-    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
-    # each non-lead member secure_joins the lead's invite and ends up verified
-    assert sorted(res[0]["joined"]) == ["m1", "m2"]
-    assert res[0]["pending"] == []
+    be = _star_be({"lead": 10, "m1": 11, "m2": 12})
+    res = main.securejoin_star(cfg, be)
+    # fire-and-forget: each non-lead member's securejoin is INITIATED, never waited on
+    assert sorted(res[0]["initiated"]) == ["m1", "m2"]
+    assert res[0]["pending"] == [] and res[0]["skipped_verified"] == []
     assert be.invites == 2 and len(be.joins) == 2
 
 
@@ -610,9 +638,9 @@ def test_securejoin_star_idempotent_skips_already_verified():
                  realm_leads={"r1": "lead"})
     # m1 is ALREADY a verified key-contact of the lead → no invite, no securejoin
     be = _star_be({"lead": 10, "m1": 11}, verified={(10, "m1@d.example")})
-    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
+    res = main.securejoin_star(cfg, be)
     assert res[0]["skipped_verified"] == ["m1"]
-    assert res[0]["joined"] == [] and be.invites == 0 and be.joins == []
+    assert res[0]["initiated"] == [] and be.invites == 0 and be.joins == []
 
 
 def test_securejoin_star_skips_lead_not_onboarded():
@@ -620,7 +648,7 @@ def test_securejoin_star_skips_lead_not_onboarded():
                  roster=[BotSpec(id="lead", realm="r1", localpart="lead")],
                  realm_leads={"r1": "lead"})
     be = _star_be({})                              # lead has no account yet
-    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
+    res = main.securejoin_star(cfg, be)
     assert res[0]["skipped"] == "lead-not-onboarded"
     assert be.invites == 0
 
@@ -631,9 +659,50 @@ def test_securejoin_star_pending_when_member_not_onboarded():
                          BotSpec(id="m1", realm="r1", localpart="m1")],
                  realm_leads={"r1": "lead"})
     be = _star_be({"lead": 10})                    # m1 not onboarded yet → retried next pass
-    res = main.securejoin_star(cfg, be, poll_wait=0, _sleep=lambda _: None)
+    res = main.securejoin_star(cfg, be)
     assert res[0]["pending"] == ["m1"]
-    assert be.invites == 0
+    assert res[0]["initiated"] == [] and be.invites == 0
+
+
+# -- event-driven provisioning (a verified-key-contact EVENT adds the member to the channel) --
+
+
+def _prov_cfg():
+    return Config(mail_domain="d.example", imap_host="m",
+                  roster=[BotSpec(id="lead", realm="r1", localpart="lead"),
+                          BotSpec(id="m1", realm="r1", localpart="m1")],
+                  realm_leads={"r1": "lead"})
+
+
+def test_provision_verified_member_creates_channel_when_missing():
+    # verified EVENT for m1 → lead has no channel yet → create it WITH the member
+    be = _star_be({"lead": 10, "m1": 11})
+    res = main.provision_verified_member(_prov_cfg(), be, 10, "m1@d.example")
+    assert res["created"] == 100 and res["added"] == "m1"
+    assert be.created == [(10, "r1", ["m1@d.example"])]
+
+
+def test_provision_verified_member_adds_to_existing_channel():
+    be = _star_be({"lead": 10, "m1": 11},
+                  channels={10: [{"id": 55, "name": "r1", "members": ["lead"]}]})
+    res = main.provision_verified_member(_prov_cfg(), be, 10, "m1@d.example")
+    assert res["channel_id"] == 55 and res["added"] == "m1"
+    assert be.added == [(10, 55, "m1@d.example")]
+
+
+def test_provision_verified_member_idempotent_when_already_in_channel():
+    be = _star_be({"lead": 10, "m1": 11},
+                  channels={10: [{"id": 55, "name": "r1", "members": ["lead", "m1"]}]})
+    res = main.provision_verified_member(_prov_cfg(), be, 10, "m1@d.example")
+    assert res["already"] == "m1" and be.added == [] and be.created == []
+
+
+def test_provision_verified_member_ignores_non_member_or_non_led_realm():
+    be = _star_be({"lead": 10, "m1": 11})
+    # a verified contact that isn't a member of any realm this bot leads → no-op (None)
+    assert main.provision_verified_member(_prov_cfg(), be, 10, "stranger@d.example") is None
+    assert be.created == [] and be.added == []
+
 
 
 # -- env-selectable secret backend (the atomic chatmaild→Stalwart cutover) -------------------

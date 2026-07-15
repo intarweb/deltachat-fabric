@@ -116,9 +116,6 @@ class FakeBackend:
         self.deleted = getattr(self, "deleted", [])
         self.deleted.append((account_id, chat_id))
 
-    def force_poll(self) -> None:
-        self.polls = getattr(self, "polls", 0) + 1
-
 
 def directory_transport(agents: list[dict], wake_sink: list[dict], *,
                         directory_status: int = 200):
@@ -723,6 +720,27 @@ def test_reaction_ids_selects_incoming_reaction_and_skips_removals():
     assert DeltaChat2Backend.reaction_ids(object()) is None
 
 
+def test_securejoin_ids_selects_completed_inviter_progress():
+    """A securejoin completes for the INVITER (realm lead) as EventTypeSecurejoinInviterProgress
+    with progress==1000 (deltachat's done sentinel). securejoin_ids returns the joiner's
+    contact_id on completion, None for in-progress or the wrong event type. Verified vs installed
+    deltachat2 (EventTypeSecurejoinInviterProgress.fields = chat_id,chat_type,contact_id,progress)."""
+    from deltachat2 import EventTypeSecurejoinInviterProgress, EventTypeSecurejoinJoinerProgress
+
+    from app.relay import DeltaChat2Backend
+
+    done = EventTypeSecurejoinInviterProgress(chat_id=5, chat_type=120, contact_id=42, progress=1000)
+    assert DeltaChat2Backend.securejoin_ids(done) == 42
+    # in-progress (< 1000) → not yet verified → None
+    assert DeltaChat2Backend.securejoin_ids(
+        EventTypeSecurejoinInviterProgress(chat_id=5, chat_type=120, contact_id=42, progress=400)) is None
+    # the JOINER-side progress event is not what drives lead provisioning → None
+    assert DeltaChat2Backend.securejoin_ids(
+        EventTypeSecurejoinJoinerProgress(contact_id=42, progress=1000)) is None
+    # a non-securejoin typed event → None
+    assert DeltaChat2Backend.securejoin_ids(object()) is None
+
+
 class _FakeRpc:
     """Records core onboarding calls so ensure_account is unit-tested with no live rpc-server.
     Mirrors the deltachat2 Rpc surface ensure_account uses (verified against the package)."""
@@ -884,22 +902,6 @@ def test_delete_chat_endpoint(tmp_path):
 
     miss = client.post("/delete_chat", json={"bot_id": "nobody", "chat_id": 12})
     assert miss.status_code == 404
-
-
-def test_relay_force_poll_calls_backend(tmp_path):
-    backend = FakeBackend(accounts={"bot-a": 3})
-    relay = make_relay(backend, [], [], tmp_path)
-    assert relay.force_poll() == {"status": "polled"}
-    assert backend.polls == 1
-
-
-def test_poll_endpoint(tmp_path):
-    backend = FakeBackend(accounts={"bot-a": 3})
-    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
-    resp = client.post("/poll")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "polled"}
-    assert backend.polls == 1
 
 
 # --------------------------------------------------------------------------- (9) messages (receipt read-back)
