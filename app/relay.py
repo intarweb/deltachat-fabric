@@ -81,6 +81,21 @@ class InboundReaction:
     from_addr: str = ""
 
 
+@dataclass
+class InboundVerified:
+    """Normalized securejoin-verified event — a member just became a VERIFIED KEY-CONTACT of a
+    realm lead (the core emitted inviter-progress == complete on the lead's account).
+
+    ``account_id`` is the LEAD's account (the securejoin inviter); ``addr`` the member's email
+    (resolved by the backend, so provisioning never sees deltachat2). This is the event that
+    drives channel provisioning — when it fires, the member can be added to the realm's
+    encrypted channel — replacing the old reconcile-time wait/poll for verification.
+    """
+    account_id: int
+    contact_id: int
+    addr: str = ""
+
+
 class DeltaBackend(Protocol):
     """Thin injectable seam over the deltachat account-manager + rpc-server.
 
@@ -105,7 +120,8 @@ class DeltaBackend(Protocol):
 
     def next_inbound(self):
         """Pop the next inbound event from the stream: an ``InboundMessage``, an
-        ``InboundReaction``, or ``None`` if idle / not a routable event.
+        ``InboundReaction``, an ``InboundVerified`` (a member became a verified key-contact of a
+        realm lead), or ``None`` if idle / not a routable event.
 
         Non-blocking: the inbound loop calls this repeatedly per tick. Returning None
         means "nothing routable waiting right now".
@@ -176,13 +192,6 @@ class DeltaBackend(Protocol):
         """Delete ``chat_id`` from ``account_id`` (drops the chat + any in-progress securejoin
         half-handshake it holds). Used to clear a stale/tangled securejoin so a single clean
         one can complete. BLOCKING. (Optional on fakes.)"""
-        ...
-
-    def force_poll(self) -> None:
-        """Nudge the core to do an IMAP fetch cycle NOW (deltachat ``maybe_network``), instead
-        of waiting on IDLE. Needed where the server's IDLE push doesn't wake the core — e.g.
-        Stalwart #339 pushes a STATUS notification, not EXISTS, so the IDLE client never wakes
-        and queued mail (a securejoin vc-request) sits unfetched. BLOCKING. (Optional on fakes.)"""
         ...
 
 
@@ -324,13 +333,6 @@ class DeltaChat2Backend:
         """
         self.rpc.delete_chat(account_id, int(chat_id))
 
-    def force_poll(self) -> None:  # pragma: no cover - real rpc
-        """Force an IMAP fetch cycle now via ``maybe_network`` — the core reconnects/fetches on
-        all accounts rather than waiting on IDLE. Sidesteps servers whose IDLE push the core
-        doesn't wake on (Stalwart #339: STATUS not EXISTS). Verified vs installed deltachat2
-        (``maybe_network() -> None``)."""
-        self.rpc.maybe_network()
-
     # -- inbound -----------------------------------------------------------
     @staticmethod
     def incoming_ids(ev) -> tuple[Optional[int], Optional[int]]:
@@ -379,6 +381,31 @@ class DeltaChat2Backend:
             return getattr(ev, "chat_id", None), getattr(ev, "contact_id", None), getattr(ev, "msg_id", None), emoji
         return None
 
+    @staticmethod
+    def securejoin_ids(ev):
+        """contact_id if ``ev`` is a securejoin INVITER-progress event that COMPLETED (the joiner
+        became a verified key-contact of this inviter), else None.
+
+        🔴 The realm lead is the securejoin INVITER (it creates the invite; members join), so
+        completion surfaces as ``EventTypeSecurejoinInviterProgress`` with ``progress == 1000``
+        (deltachat-core's "securejoin done" sentinel) on the LEAD's account. Select by isinstance
+        (the type is the discriminator), mirroring incoming_ids/reaction_ids. This is the event
+        that drives EVENT-DRIVEN channel provisioning — no wait, no poll. Verified vs the
+        installed deltachat2 (EventTypeSecurejoinInviterProgress.fields =
+        chat_id,chat_type,contact_id,progress)."""
+        try:
+            from deltachat2 import EventTypeSecurejoinInviterProgress  # type: ignore
+            if isinstance(ev, EventTypeSecurejoinInviterProgress):
+                if int(getattr(ev, "progress", 0) or 0) >= 1000:
+                    return getattr(ev, "contact_id", None)
+                return None
+        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
+            pass
+        if (type(ev).__name__ == "EventTypeSecurejoinInviterProgress"
+                and int(getattr(ev, "progress", 0) or 0) >= 1000):
+            return getattr(ev, "contact_id", None)
+        return None
+
     def next_inbound(self):  # pragma: no cover - real rpc entry
         raw = self.rpc.get_next_event()
         if raw is None:
@@ -395,7 +422,19 @@ class DeltaChat2Backend:
         if react is not None:
             r_chat, r_contact, r_msg, emoji = react
             return self._build_reaction(accid, r_chat, r_contact, r_msg, emoji)
+        sj_contact = self.securejoin_ids(ev)
+        if sj_contact is not None:
+            return self._build_verified(accid, sj_contact)
         return None
+
+    def _build_verified(self, accid: int, contact_id) -> InboundVerified:  # pragma: no cover
+        addr = ""
+        try:
+            contact = self.rpc.get_contact(accid, contact_id)
+            addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
+        except Exception:
+            pass
+        return InboundVerified(account_id=accid, contact_id=contact_id or 0, addr=addr)
 
     def _build_reaction(self, accid: int, chat_id, contact_id, msg_id, emoji: str) -> InboundReaction:  # pragma: no cover
         from_addr = ""
@@ -944,12 +983,6 @@ class Relay:
         self.backend.delete_chat(accid, int(chat_id))
         return {"status": "deleted", "account_id": accid, "chat_id": int(chat_id)}
 
-    def force_poll(self) -> dict:
-        """Force an IMAP fetch cycle now (all accounts) so queued mail is pulled without waiting
-        on IDLE — see backend.force_poll. Global (not per-bot): deltachat maybe_network nudges
-        every account. Returns {"status":"polled"}."""
-        self.backend.force_poll()
-        return {"status": "polled"}
 
     # -- wake routing ------------------------------------------------------
     def _channel_main(self, members: list[str]) -> Optional[str]:
@@ -1220,12 +1253,6 @@ def create_app(relay: Relay):
     @app.post("/delete_chat")
     async def delete_chat(req: DeleteChatRequest):
         return await _run(lambda: relay.delete_chat(req.bot_id, req.chat_id))
-
-    @app.post("/poll")
-    async def poll():
-        """Force an IMAP fetch now (maybe_network) — on-demand trigger for the IDLE-push
-        workaround; the poll_loop also fires this periodically."""
-        return await _run(relay.force_poll)
 
     return app
 
