@@ -102,6 +102,83 @@ class SecretsStore:
 
 
 # ---------------------------------------------------------------------------
+# Onboarded-registry + state-loss guard.
+#
+# 🔴 The registry MUST live on a store that is MORE DURABLE than the deltachat accounts DB —
+# i.e. next to the mounted roster (/config), NOT under DATA_DIR/ACCOUNTS_DIR. That is the whole
+# point: if the accounts volume is replaced (recreate onto a fresh dir), the accounts + their
+# keypairs are lost but the registry survives, so we can DETECT the loss. A registry on the same
+# volume as the accounts would be wiped with them and could never signal.
+# ---------------------------------------------------------------------------
+
+
+class OnboardRegistry:
+    """Durable record of bot localparts that have been successfully onboarded at least once.
+
+    Anchors the state-loss guard: a roster bot that is ``known()`` here but whose deltachat
+    account is absent at startup means the accounts DB was lost/replaced (a fresh keypair on
+    re-onboard silently breaks every prior securejoin invite + verified contact). Default path is
+    a sibling of the mounted roster (durable /config), overridable via ``DELTA_ONBOARD_REGISTRY``.
+    """
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._data: set[str] = self._read()
+
+    def _read(self) -> set[str]:
+        if self.path.exists():
+            try:
+                return set(json.loads(self.path.read_text()) or [])
+            except Exception:
+                return set()
+        return set()
+
+    def _flush(self) -> None:
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(sorted(self._data)))
+        tmp.replace(self.path)
+
+    def known(self) -> set[str]:
+        return set(self._data)
+
+    def mark(self, localparts) -> None:
+        """Record one or more localparts as onboarded (idempotent; persists only on change)."""
+        lps = [localparts] if isinstance(localparts, str) else list(localparts)
+        new = [lp for lp in lps if lp not in self._data]
+        if new:
+            self._data.update(new)
+            self._flush()
+
+    @staticmethod
+    def default_path(config: Config) -> str:
+        """Registry path: env override, else a sibling of the roster (its durable /config mount)."""
+        env = os.environ.get("DELTA_ONBOARD_REGISTRY")
+        if env:
+            return env
+        roster = os.environ.get("DELTA_ROSTER_PATH", "/config/roster.yaml")
+        return str(Path(roster).with_name(".dcf-onboarded.json"))
+
+
+def detect_state_loss(config: Config, backend, registry: OnboardRegistry) -> list[str]:
+    """Roster bots that were onboarded before (in the registry) but whose account is absent NOW.
+
+    Non-empty = state loss: the accounts DB/keypairs were lost while the durable registry
+    survived (typically a fresh/replaced ACCOUNTS_DIR). Run at STARTUP, before reconcile
+    re-onboards them (which would silently re-create with fresh keypairs). Pure over the injected
+    backend, so it's unit-testable. First-ever boot → registry empty → []; normal restart with
+    durable data → accounts present → []; wiped data → the known bots show absent → alarm list.
+    """
+    known = registry.known()
+    return [lp for lp in desired_localparts(config)
+            if lp in known and backend.account_id_for(lp) is None]
+
+
+
+# ---------------------------------------------------------------------------
 # Reconciler loop — pure schedule decision + one testable pass.
 # ---------------------------------------------------------------------------
 
@@ -173,13 +250,16 @@ Onboard = Callable[[str, str], Awaitable[bool]]
 
 
 async def reconcile_once(config: Config, secrets: SecretsStore,
-                         existing: list[str], *, onboard: Onboard) -> dict:
+                         existing: list[str], *, onboard: Onboard,
+                         registry: "Optional[OnboardRegistry]" = None) -> dict:
     """One reconcile pass: onboard each desired account into the deltachat core, then diff.
 
     ``existing`` = localparts already onboarded (caller supplies; the prune list is reported
     only — server-side removal is the operator's lane). ``onboard`` is the injectable
     onboarding seam (production = add_account+add_or_update_transport in a thread; tests
-    inject a fake) so this is unit-testable with no live core.
+    inject a fake) so this is unit-testable with no live core. ``registry`` (opt) is the durable
+    onboarded-registry: each successfully-provisioned bot is recorded so the startup state-loss
+    guard can later tell "this bot was onboarded before" from "first-ever onboarding".
 
     Returns {"provisioned":[...],"failed":[...],"prune":[...],"to_provision":[...]}.
     """
@@ -196,6 +276,8 @@ async def reconcile_once(config: Config, secrets: SecretsStore,
             log.exception("onboard raised for %s", lp)
             ok = False
         (provisioned if ok else failed).append(lp)
+    if registry is not None and provisioned:
+        registry.mark(provisioned)  # durable "known-onboarded" record (anchors the state-loss guard)
     if provisioned:
         log.info("reconcile: %d/%d account(s) onboarded", len(provisioned), len(desired))
     if failed:
@@ -367,17 +449,20 @@ async def reconciler_loop(config: Config, secrets: SecretsStore,
                           existing_fn: Callable[[], list[str]],
                           *, onboard: Onboard,
                           after_reconcile: Optional[Callable[[], Awaitable]] = None,
+                          registry: "Optional[OnboardRegistry]" = None,
                           _should_stop: Optional[Callable[[], bool]] = None) -> None:  # pragma: no cover - loop
     """Periodic reconciler. ``existing_fn`` supplies current onboarded localparts each pass
     (default in build wiring = the relay backend's account index). ``after_reconcile`` (opt)
     runs once per pass AFTER account onboarding — production wires it to per-realm channel
-    provisioning (accounts must exist before their channels can be created)."""
+    provisioning (accounts must exist before their channels can be created). ``registry`` (opt)
+    records successfully-onboarded bots for the state-loss guard."""
     last_run: Optional[float] = None
     while not (_should_stop and _should_stop()):
         now = asyncio.get_event_loop().time()
         if should_reconcile(now, last_run, interval, run_on_start):
             try:
-                await reconcile_once(config, secrets, existing_fn(), onboard=onboard)
+                await reconcile_once(config, secrets, existing_fn(), onboard=onboard,
+                                     registry=registry)
                 if after_reconcile is not None:
                     await after_reconcile()
             except Exception:
@@ -468,11 +553,13 @@ class Service:
     beyond what the injected backend does."""
 
     def __init__(self, config: Config, relay: Relay, secrets: SecretsStore,
-                 *, backup_backend: Optional[backup_mod.BackupBackend] = None):
+                 *, backup_backend: Optional[backup_mod.BackupBackend] = None,
+                 registry: "Optional[OnboardRegistry]" = None):
         self.config = config
         self.relay = relay
         self.secrets = secrets
         self.backup_backend = backup_backend
+        self.registry = registry
         self.app = create_app(relay)
 
 
@@ -516,7 +603,8 @@ def build_service(config: Optional[Config] = None,
         secrets = SecretsStore(secrets_path, config.password_min_length)
         log.info("secret store: local mint-to-disk (chatmaild-era)")
     backup_backend = backup_mod.DeltaChat2BackupBackend(relay.backend)
-    return Service(config, relay, secrets, backup_backend=backup_backend)
+    registry = OnboardRegistry(OnboardRegistry.default_path(config))
+    return Service(config, relay, secrets, backup_backend=backup_backend, registry=registry)
 
 
 def _make_onboard(service: Service) -> Onboard:  # pragma: no cover - real core onboarding
@@ -584,6 +672,17 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
                                 ev.account_id, ev.addr)
 
     loop = asyncio.get_running_loop()
+    # 🔴 STATE-LOSS GUARD — run BEFORE reconcile re-onboards anything: any roster bot that was
+    # onboarded before (durable registry) but whose account is absent NOW = the accounts DB was
+    # lost/replaced (a fresh-keypair re-onboard would silently break every prior securejoin
+    # invite + verified contact). Loud alarm; reconcile still proceeds to re-establish them.
+    if service.registry is not None:
+        lost = detect_state_loss(cfg, service.relay.backend, service.registry)
+        if lost:
+            log.error("🔴 STATE-LOSS: %d roster bot(s) were onboarded before but their account is "
+                      "GONE now (accounts dir replaced?) — prior securejoin invites/verified "
+                      "contacts for these are INVALID; they will re-onboard with FRESH keypairs: %s",
+                      len(lost), lost)
     # 🔴 blocking deltachat event stream → dedicated daemon thread (NEVER on the loop).
     threading.Thread(
         target=_event_pump, args=(service.relay.backend, service.relay, loop),
@@ -598,7 +697,7 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         drain_loop(service.relay),
         reconciler_loop(cfg, service.secrets, reconcile_interval, run_on_start, existing_fn,
                         onboard=_make_onboard(service),
-                        after_reconcile=after_reconcile),
+                        after_reconcile=after_reconcile, registry=service.registry),
         backup_mod.run_forever(cfg, service.backup_backend, backup_dir,
                                retain=backup_retain, interval=backup_interval),
     )

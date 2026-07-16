@@ -727,3 +727,70 @@ def test_both_secret_stores_share_get_or_create_interface():
     from app.opconnect import OpConnectStore
     assert callable(getattr(SecretsStore, "get_or_create", None))
     assert callable(getattr(OpConnectStore, "get_or_create", None))
+
+
+# -- onboarded-registry + state-loss guard ----------------------------------
+
+
+class _AcctBackend:
+    """Fake backend exposing only account_id_for (what detect_state_loss needs)."""
+
+    def __init__(self, accounts):
+        self._acc = accounts   # localpart -> accid (present = configured)
+
+    def account_id_for(self, lp):
+        return self._acc.get(lp)
+
+
+def test_onboard_registry_marks_and_persists(tmp_path):
+    path = str(tmp_path / ".dcf-onboarded.json")
+    reg = main.OnboardRegistry(path)
+    assert reg.known() == set()
+    reg.mark("bot-a")
+    reg.mark(["bot-b", "bot-a"])          # idempotent + list form
+    assert reg.known() == {"bot-a", "bot-b"}
+    # durable: a fresh instance on the same path reloads the record
+    assert main.OnboardRegistry(path).known() == {"bot-a", "bot-b"}
+
+
+def test_onboard_registry_default_path_is_roster_sibling(monkeypatch):
+    monkeypatch.delenv("DELTA_ONBOARD_REGISTRY", raising=False)
+    monkeypatch.setenv("DELTA_ROSTER_PATH", "/config/roster.yaml")
+    assert main.OnboardRegistry.default_path(_cfg()) == "/config/.dcf-onboarded.json"
+    # env override wins
+    monkeypatch.setenv("DELTA_ONBOARD_REGISTRY", "/config/custom.json")
+    assert main.OnboardRegistry.default_path(_cfg()) == "/config/custom.json"
+
+
+def test_detect_state_loss_flags_known_bot_with_missing_account(tmp_path):
+    cfg = _cfg("bot-a", "bot-b")
+    reg = main.OnboardRegistry(str(tmp_path / "r.json"))
+    reg.mark(["bot-a", "bot-b"])          # both onboarded before (durable)
+    # bot-a's account is GONE (accounts dir wiped), bot-b survived → only bot-a is state-loss
+    lost = main.detect_state_loss(cfg, _AcctBackend({"bot-b": 11}), reg)
+    assert lost == ["bot-a"]
+
+
+def test_detect_state_loss_silent_on_first_boot_and_normal_restart(tmp_path):
+    cfg = _cfg("bot-a", "bot-b")
+    empty = main.OnboardRegistry(str(tmp_path / "empty.json"))
+    # first-ever boot: registry empty → nothing was onboarded before → no alarm
+    assert main.detect_state_loss(cfg, _AcctBackend({}), empty) == []
+    # normal restart: known bots + their accounts present (durable data) → no alarm
+    reg = main.OnboardRegistry(str(tmp_path / "r.json"))
+    reg.mark(["bot-a", "bot-b"])
+    assert main.detect_state_loss(cfg, _AcctBackend({"bot-a": 10, "bot-b": 11}), reg) == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_records_provisioned_in_registry(tmp_path):
+    cfg = _cfg("bot-a", "bot-b")
+    secrets = main.SecretsStore(str(tmp_path / "s.json"), cfg.password_min_length)
+    reg = main.OnboardRegistry(str(tmp_path / "r.json"))
+
+    async def ok_onboard(localpart, password):
+        return localpart == "bot-a"   # only bot-a succeeds
+
+    await main.reconcile_once(cfg, secrets, existing=[], onboard=ok_onboard, registry=reg)
+    # only successfully-provisioned bots are recorded (bot-b failed → not marked)
+    assert reg.known() == {"bot-a"}
