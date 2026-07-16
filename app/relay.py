@@ -1116,11 +1116,22 @@ class Relay:
         own = self.backend.localpart_for(msg.account_id)
         if msg.from_localpart and own and msg.from_localpart == own:
             return []
+        # Carry the resolved sender so consumers can label the wake ("who sent this") instead of
+        # each rendering its own default for a missing sender. ``wake()`` forwards only
+        # ``payload['text']`` into the a2a envelope, so the sender is baked into the text below;
+        # ``from`` is kept as a structured mirror. from_localpart is resolved in _build_inbound;
+        # fall back to "someone" when a contact address doesn't resolve.
+        sender = msg.from_localpart or "someone"
+        payload["from"] = sender
         if not msg.is_group:
             if not own:
                 return []
+            # Dedup the 1:1 wake too: a re-delivery/re-fetch of an already-handled DM (same global
+            # rfc724_mid) must not re-wake the recipient. Group had this; the DM path didn't.
+            if not self._wake_once(msg.rfc724_mid, own):
+                return []
             payload["direct"] = True
-            payload["text"] = f"[Delta Chat DM] {msg.text}"
+            payload["text"] = f"[Delta Chat DM from {sender}] {msg.text}"
             return [own] if await self._deliver(own, payload) else []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)
