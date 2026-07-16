@@ -62,6 +62,8 @@ class InboundMessage:
     members: list[str] = field(default_factory=list)
     mentioned: list[str] = field(default_factory=list)
     from_id: int = 0
+    from_localpart: str = ""   # sender's localpart (resolved) — for sender-exclusion from wakes
+    rfc724_mid: str = ""       # GLOBAL message-id (same across every member account) — wake dedup key
 
 
 @dataclass
@@ -79,6 +81,9 @@ class InboundReaction:
     emoji: str
     from_id: int = 0
     from_addr: str = ""
+    own_message: bool = False   # is the reacted-to message THIS account's own? (only the author wakes)
+    rfc724_mid: str = ""        # GLOBAL id of the reacted-to message — wake dedup key
+
 
 
 @dataclass
@@ -406,6 +411,37 @@ class DeltaChat2Backend:
             return getattr(ev, "contact_id", None)
         return None
 
+    @staticmethod
+    def core_diagnostic(ev):
+        """(level, text) for a deltachat CORE event worth surfacing to the relay log, else None.
+
+        Surfaces the diagnostically-useful core events so failures aren't silent — e.g. a
+        human→bot securejoin that can't decrypt emits core Warnings ("Could not find symmetric
+        secret" → "Fetched unencrypted message, ignoring"). Mapped to a log level (select by
+        isinstance, mirroring incoming_ids/reaction_ids/securejoin_ids; verified vs installed
+        deltachat2):
+          Error → error · Warning → warning (covers decrypt/SMTP/IMAP-connect failures) ·
+          Securejoin{Inviter,Joiner}Progress → info (shows a handshake advancing / stuck / silent).
+        EventTypeInfo is intentionally NOT surfaced (too chatty). Returns None for everything else.
+        """
+        try:
+            from deltachat2 import (EventTypeError, EventTypeWarning,  # type: ignore
+                                    EventTypeSecurejoinInviterProgress,
+                                    EventTypeSecurejoinJoinerProgress)
+            if isinstance(ev, EventTypeError):
+                return ("error", getattr(ev, "msg", "") or "")
+            if isinstance(ev, EventTypeWarning):
+                return ("warning", getattr(ev, "msg", "") or "")
+            if isinstance(ev, EventTypeSecurejoinInviterProgress):
+                return ("info", f"securejoin inviter: contact={getattr(ev, 'contact_id', None)} "
+                                f"progress={getattr(ev, 'progress', None)}")
+            if isinstance(ev, EventTypeSecurejoinJoinerProgress):
+                return ("info", f"securejoin joiner: contact={getattr(ev, 'contact_id', None)} "
+                                f"progress={getattr(ev, 'progress', None)}")
+        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
+            pass
+        return None
+
     def next_inbound(self):  # pragma: no cover - real rpc entry
         raw = self.rpc.get_next_event()
         if raw is None:
@@ -415,6 +451,11 @@ class DeltaChat2Backend:
         accid = (getattr(raw, "context_id", None) or getattr(raw, "account_id", None)
                  or getattr(raw, "accid", None) or 0)
         ev = getattr(raw, "event", raw)
+        # Surface diagnostically-useful core events to the relay log (never invisible again).
+        diag = self.core_diagnostic(ev)
+        if diag is not None:
+            level, text = diag
+            getattr(log, level, log.info)("delta core [acct %s]: %s", accid, text)
         chat_id, msg_id = self.incoming_ids(ev)
         if chat_id is not None and msg_id is not None:
             return self._build_inbound(accid, chat_id, msg_id)
@@ -443,9 +484,26 @@ class DeltaChat2Backend:
             from_addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
         except Exception:
             pass
+        # Only the AUTHOR of the reacted-to message should be woken; the reaction event is
+        # delivered to every member account, so gate on "is this account the message author?"
+        # (msg.from_id == self) + carry the reacted msg's GLOBAL id for cross-account dedup.
+        own_message = False
+        rfc724_mid = ""
+        try:
+            from deltachat2 import SpecialContactId  # type: ignore
+            m = self.rpc.get_message(accid, msg_id)
+            own_message = int(getattr(m, "from_id", 0) or 0) == int(SpecialContactId.SELF)
+        except Exception:
+            pass
+        try:
+            info = self.rpc.get_message_info_object(accid, msg_id)
+            rfc724_mid = getattr(info, "rfc724_mid", "") or ""
+        except Exception:
+            pass
         return InboundReaction(
             account_id=accid, chat_id=chat_id or 0, msg_id=msg_id or 0,
             emoji=emoji, from_id=contact_id or 0, from_addr=from_addr,
+            own_message=own_message, rfc724_mid=rfc724_mid,
         )
 
     def localpart_for(self, account_id: int) -> Optional[str]:  # pragma: no cover - real rpc
@@ -469,11 +527,28 @@ class DeltaChat2Backend:
                     members.append(addr.split("@", 1)[0])
             except Exception:
                 continue
+        from_id = getattr(msg, "from_id", 0) or 0
+        # sender localpart — for sender-exclusion (a bot is never woken by its own post)
+        from_localpart = ""
+        try:
+            fc = self.rpc.get_contact(accid, from_id)
+            faddr = getattr(fc, "address", None) or getattr(fc, "addr", None) or ""
+            if faddr:
+                from_localpart = faddr.split("@", 1)[0]
+        except Exception:
+            pass
+        # GLOBAL message-id — identical across every member account's copy → wake dedup key
+        rfc724_mid = ""
+        try:
+            info = self.rpc.get_message_info_object(accid, msg_id)
+            rfc724_mid = getattr(info, "rfc724_mid", "") or ""
+        except Exception:
+            pass
         return InboundMessage(
             account_id=accid, chat_id=chat_id, msg_id=msg_id, text=text,
             is_group=is_group, members=members,
             mentioned=extract_mentions(text, members),
-            from_id=getattr(msg, "from_id", 0) or 0,
+            from_id=from_id, from_localpart=from_localpart, rfc724_mid=rfc724_mid,
         )
 
     # -- contacts / channels ----------------------------------------------
@@ -886,6 +961,31 @@ class Relay:
         self.backend = backend
         self.directory = directory
         self.hold = hold_queue
+        # Wake dedup: the same group message is delivered to EVERY member account in this one
+        # process, so each account's handle_inbound would independently wake the same target
+        # (N× amplification in an N-member room). Key on (rfc724_mid, target) — the GLOBAL
+        # message-id is identical across copies — and wake each target at most once per TTL.
+        # Touched only from handle_inbound/handle_reaction on the single asyncio loop → no lock.
+        self._wake_dedup: dict[tuple[str, str], float] = {}
+        self._wake_dedup_ttl = 300.0
+
+    def _wake_once(self, mid: str, target: str) -> bool:
+        """True if (mid, target) should wake now (records it); False if already woken within TTL.
+        Empty mid (shouldn't happen) → fail-open (always wake), never suppress on missing id."""
+        if not mid:
+            return True
+        now = time.monotonic()
+        cache = self._wake_dedup
+        if len(cache) > 4096:  # opportunistic prune of expired entries
+            for k, ts in list(cache.items()):
+                if now - ts >= self._wake_dedup_ttl:
+                    del cache[k]
+        key = (mid, target)
+        seen = cache.get(key)
+        if seen is not None and (now - seen) < self._wake_dedup_ttl:
+            return False
+        cache[key] = now
+        return True
 
     # -- outbound (/send) --------------------------------------------------
     def send(self, bot: str, target: int, text: str) -> dict:
@@ -1012,27 +1112,46 @@ class Relay:
         """
         payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
                    "text": f"[Delta Chat] {msg.text}"}
+        # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
+        own = self.backend.localpart_for(msg.account_id)
+        if msg.from_localpart and own and msg.from_localpart == own:
+            return []
         if not msg.is_group:
-            bot = self.backend.localpart_for(msg.account_id)
-            if not bot:
+            if not own:
                 return []
             payload["direct"] = True
             payload["text"] = f"[Delta Chat DM] {msg.text}"
-            return [bot] if await self._deliver(bot, payload) else []
+            return [own] if await self._deliver(own, payload) else []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)
+        # Sender-exclusion: never wake the bot that SENT the message (covers the leader posting
+        # untagged → main==sender, and self-@mention) — regardless of which account surfaced it.
+        if msg.from_localpart:
+            targets = [t for t in targets if t != msg.from_localpart]
         woken: list[str] = []
         for bot in targets:
+            # Global dedup: the same group message hits every member account in this process;
+            # wake each target at most once (keyed on the global rfc724_mid).
+            if not self._wake_once(msg.rfc724_mid, bot):
+                continue
             if await self._deliver(bot, payload):
                 woken.append(bot)
         return woken
 
     async def handle_reaction(self, r: InboundReaction) -> list[str]:
-        """Route one inbound REACTION → wake the bot whose message was reacted to, with an
-        envelope carrying {who, emoji, msg_id}. Returns woken bot ids (the single owner, or [])."""
+        """Route one inbound REACTION → wake the AUTHOR of the reacted-to message, with an
+        envelope carrying {who, emoji, msg_id}. Returns woken bot ids (the single owner, or []).
+
+        The reaction event is delivered to every member account in this process, so wake ONLY the
+        account that AUTHORED the reacted-to message (``own_message``), and dedup on the reacted
+        message's global id — otherwise a single reaction wakes every member (N× amplification)."""
         bot = self.backend.localpart_for(r.account_id)
         if not bot:
             return []
+        if not r.own_message:
+            return []  # not the author's account — the author's copy handles it
+        if not self._wake_once(r.rfc724_mid, bot):
+            return []  # already woken for this reaction via another account's copy
         who = r.from_addr or "someone"
         payload = {
             "chat_id": r.chat_id, "msg_id": r.msg_id, "reaction": r.emoji, "from": who,

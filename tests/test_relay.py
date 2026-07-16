@@ -313,10 +313,11 @@ async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
 
 
 async def test_handle_reaction_wakes_owner_with_envelope(tmp_path):
-    # a human reacted to bot-a's message → wake bot-a with {who, emoji, msg_id}
+    # a human reacted to bot-a's OWN message → wake bot-a with {who, emoji, msg_id}
     from app.relay import InboundReaction
     r = InboundReaction(account_id=7, chat_id=11, msg_id=17, emoji="👍",
-                        from_id=12, from_addr="person@example.com")
+                        from_id=12, from_addr="person@example.com",
+                        own_message=True, rfc724_mid="<react-1@x>")
     backend = FakeBackend(accounts={"bot-a": 7})
     wakes: list[dict] = []
     agents = [{"name": "bot-a", "url": "http://bot-a.live:8020"}]
@@ -340,6 +341,73 @@ async def test_handle_reaction_unknown_account_noop(tmp_path):
     relay = make_relay(FakeBackend(accounts={"bot-a": 7}),
                        [{"name": "bot-a", "url": "http://bot-a.live:8020"}], [], tmp_path)
     assert await relay.handle_reaction(r) == []
+
+
+async def test_handle_reaction_skips_non_author_account(tmp_path):
+    # the reaction event reaches every member account; only the AUTHOR's account wakes.
+    # own_message=False → this account didn't author the reacted-to message → no wake.
+    from app.relay import InboundReaction
+    r = InboundReaction(account_id=7, chat_id=11, msg_id=17, emoji="👍",
+                        from_addr="person@example.com", own_message=False, rfc724_mid="<r@x>")
+    relay = make_relay(FakeBackend(accounts={"bot-a": 7}),
+                       [{"name": "bot-a", "url": "http://bot-a.live:8020"}], [], tmp_path)
+    assert await relay.handle_reaction(r) == []
+
+
+async def test_group_wake_dedup_collapses_n_member_amplification(tmp_path):
+    # SAME group message surfaces on 3 member accounts (same global rfc724_mid); the target
+    # (bot-a, @mentioned) must be woken EXACTLY ONCE across all copies — not 3×.
+    wakes: list[dict] = []
+    backend = FakeBackend(accounts={"bot-lead": 1, "bot-a": 2, "bot-b": 3})
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], wakes, tmp_path)
+    woken_total = []
+    for acct in (1, 2, 3):   # bot-lead, bot-a, bot-b accounts each get the same message
+        msg = InboundMessage(account_id=acct, chat_id=555, msg_id=acct, text="hey @bot-a",
+                             is_group=True, members=["bot-lead", "bot-a", "bot-b"],
+                             mentioned=["bot-a"], rfc724_mid="<same-global-id@chatmail>")
+        woken_total += await relay.handle_inbound(msg)
+    assert woken_total == ["bot-a"]        # exactly one wake, not 3×
+    assert len(wakes) == 1
+
+
+async def test_group_wake_excludes_sender_leader_untagged(tmp_path):
+    # the LEADER posts an untagged message → wake_targets=[main=bot-lead]=sender → excluded → no wake
+    # (this is the self-wake bug: leader self-waking on its own untagged post).
+    wakes: list[dict] = []
+    backend = FakeBackend(accounts={"bot-lead": 1, "bot-a": 2})
+    relay = make_relay(backend, [{"name": "bot-lead", "url": "http://bot-lead.live:7780"}], wakes, tmp_path)
+    msg = InboundMessage(account_id=2, chat_id=555, msg_id=5, text="chatter", is_group=True,
+                         members=["bot-lead", "bot-a"], mentioned=[],
+                         from_localpart="bot-lead", rfc724_mid="<g1@x>")
+    assert await relay.handle_inbound(msg) == []      # sender (leader) excluded from its own wake
+    assert wakes == []
+
+
+async def test_inbound_self_echo_skipped(tmp_path):
+    # a bot's own message echoed back to ITS OWN account (from_localpart == account owner) → no wake
+    backend = FakeBackend(accounts={"bot-a": 7})
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], [], tmp_path)
+    msg = InboundMessage(account_id=7, chat_id=555, msg_id=9, text="my own post @bot-a",
+                         is_group=True, members=["bot-a", "bot-b"], mentioned=["bot-a"],
+                         from_localpart="bot-a", rfc724_mid="<self@x>")
+    assert await relay.handle_inbound(msg) == []
+
+
+def test_core_diagnostic_maps_surfaceable_events():
+    """core_diagnostic maps Error/Warning/Securejoin*Progress → (level, text), else None —
+    so the decrypt/SMTP/securejoin core events are surfaced to the relay log. Verified vs the
+    installed deltachat2 types."""
+    from deltachat2 import (EventTypeError, EventTypeWarning, EventTypeInfo,
+                            EventTypeSecurejoinInviterProgress)
+    from app.relay import DeltaChat2Backend
+    cd = DeltaChat2Backend.core_diagnostic
+    assert cd(EventTypeError(msg="boom")) == ("error", "boom")
+    lvl, txt = cd(EventTypeWarning(msg="Could not find symmetric secret"))
+    assert lvl == "warning" and "symmetric secret" in txt
+    lvl, txt = cd(EventTypeSecurejoinInviterProgress(chat_id=5, chat_type=120, contact_id=9, progress=400))
+    assert lvl == "info" and "progress=400" in txt and "contact=9" in txt
+    assert cd(EventTypeInfo(msg="chatty")) is None      # Info intentionally not surfaced
+    assert cd(object()) is None
 
 
 async def test_wake_posts_a2a_jsonrpc_message_send_to_agent_url(tmp_path):
