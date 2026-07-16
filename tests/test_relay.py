@@ -301,6 +301,30 @@ async def test_inbound_direct_1to1_wakes_receiving_bot(tmp_path):
     assert w["url"] == "http://bot-a.live:8020"
     assert w["method"] == "message/send"
     assert "DM" in w["text"] and "Hrllo" in w["text"]
+    # no resolvable sender → falls back to "someone" (never a bare/blank sender)
+    assert "someone" in w["text"]
+
+
+async def test_inbound_direct_1to1_surfaces_sender_and_dedups_redelivery(tmp_path):
+    # A human DM must (a) name the sender in the wake text — a bare "[Delta Chat DM]" is what
+    # consumers render as "unknown"/"not found" — and (b) NOT re-wake on a re-delivery of the
+    # SAME message (same global rfc724_mid), the same dedup the group path applies per target.
+    msg = InboundMessage(account_id=7, chat_id=11, msg_id=16, text="hello there",
+                         is_group=False, members=[], mentioned=[],
+                         from_localpart="terafin", rfc724_mid="<dm-1@chatmail>")
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    wakes: list[dict] = []
+    agents = [{"name": "bot-a", "url": "http://bot-a.live:8020"}]
+    relay = make_relay(backend, agents, wakes, tmp_path)
+
+    first = await relay.handle_inbound(msg)
+    second = await relay.handle_inbound(msg)   # same rfc724_mid → already handled
+
+    assert first == ["bot-a"]
+    assert second == []                        # #1: 1:1 re-wake suppressed
+    assert len(wakes) == 1                     # exactly one wake delivered
+    assert "terafin" in wakes[0]["text"]       # #2: sender surfaced in the envelope text
+    assert "hello there" in wakes[0]["text"]
 
 
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
