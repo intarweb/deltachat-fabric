@@ -1111,7 +1111,10 @@ class Relay:
         sees direct messages, not just group traffic. Undeliverable targets are held.
         """
         payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
-                   "text": f"[Delta Chat] {msg.text}"}
+                   "text": (f"[Delta Chat] {msg.text}\n"
+                            f"[\u21b3 To REPLY into this channel use the delta_send_channel "
+                            f"tool (channel_id={msg.chat_id}, text=<your reply>) \u2014 "
+                            f"a2a_complete_task does NOT reach the channel.]")}
         # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
         own = self.backend.localpart_for(msg.account_id)
         if msg.from_localpart and own and msg.from_localpart == own:
@@ -1131,7 +1134,12 @@ class Relay:
             if not self._wake_once(msg.rfc724_mid, own):
                 return []
             payload["direct"] = True
-            payload["text"] = f"[Delta Chat DM from {sender}] {msg.text}"
+            payload["text"] = (
+                f"[Delta Chat DM from {sender}] {msg.text}\n"
+                f'[\u21b3 To REPLY on Delta use the delta_send tool (bot_id="{own}", '
+                f"target={msg.chat_id}, text=<your reply>) \u2014 a2a_complete_task "
+                f"does NOT reach them on Delta.]"
+            )
             return [own] if await self._deliver(own, payload) else []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)

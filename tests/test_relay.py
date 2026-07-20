@@ -327,6 +327,27 @@ async def test_inbound_direct_1to1_surfaces_sender_and_dedups_redelivery(tmp_pat
     assert "hello there" in wakes[0]["text"]
 
 
+async def test_inbound_dm_wake_text_carries_delta_send_reply_instruction(tmp_path):
+    # A human-DM wake MUST tell the bot HOW to reply on Delta (delta_send tool + chat_id).
+    # a2a_complete_task does NOT bridge back to Delta, so without this the human never sees
+    # the reply (the bug Justin hit 2026-07-20).
+    msg = InboundMessage(account_id=7, chat_id=11, msg_id=16, text="ping",
+                         is_group=False, members=[], mentioned=[],
+                         from_localpart="terafin", rfc724_mid="<dm-reply@chatmail>")
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    wakes: list[dict] = []
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], wakes, tmp_path)
+
+    woken = await relay.handle_inbound(msg)
+
+    assert woken == ["bot-a"]
+    t = wakes[0]["text"]
+    assert "delta_send" in t                 # names the reply tool
+    assert "target=11" in t                  # carries the chat_id to reply into
+    assert 'bot_id="bot-a"' in t             # which account to send AS
+    assert "ping" in t and "terafin" in t    # original DM + sender still present
+
+
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
     # non-group message for an account with no known bot → nothing to wake
     msg = InboundMessage(account_id=99, chat_id=1, msg_id=1, text="hi", is_group=False,
