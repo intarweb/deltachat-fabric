@@ -70,6 +70,18 @@ def _reply_hint(kind: str, own: str, chat_id: int) -> str:
             f"does NOT reach them on Delta.]")
 
 
+def _reply_target(kind: str, own: str, chat_id: int) -> dict:
+    """The STRUCTURED, machine-readable companion to ``_reply_hint`` — the same reply handle a
+    consumer would otherwise have to parse out of the prose. ``kind`` ∈ {'dm','channel'}. Carries
+    exactly the identifiers the reply primitive needs to address the reply:
+      channel → {"kind":"channel","channel_id":<id>}  → delta_send_channel(channel_id, text=…)
+      dm      → {"kind":"dm","bot_id":<own>,"chat_id":<id>} → delta_send(bot_id=own, target=chat_id, text=…)
+    A consumer reads ``metadata.reply_target`` and dispatches on ``kind`` — no text parsing."""
+    if kind == "channel":
+        return {"kind": "channel", "channel_id": chat_id}
+    return {"kind": "dm", "bot_id": own, "chat_id": chat_id}
+
+
 
 # ---------------------------------------------------------------------------
 # Delta backend — the ONLY place deltachat2 is touched. Injectable + swappable.
@@ -918,6 +930,13 @@ class AgentDirectory:
         #     hook renders "From `<sender>`" instead of the "someone" fallback. Forwarded ONLY
         #     when resolved (see handle_inbound); the text still carries a human-readable label.
         #   sender_kind=human|bot → lets the hook prioritize a real person over peer-bot chatter.
+        #   reply_target=<dict> → the STRUCTURED, machine-readable reply handle (mirrors what
+        #     delta_send / delta_send_channel need to address a reply): a consumer replies
+        #     WITHOUT parsing the "[↳ Reply here …]" prose out of the text. Carries the exact
+        #     identifiers — a "dm" target {kind,bot_id,chat_id} → delta_send(bot_id, target=chat_id);
+        #     a "channel" target {kind,channel_id} → delta_send_channel(channel_id). Built in
+        #     handle_inbound (the only place that knows own-bot + dm-vs-group); the human-readable
+        #     hint stays in the text (backward-compatible), this is the parse-free companion.
         meta = {"notification": True}
         sender = payload.get("from")
         if sender:
@@ -925,6 +944,9 @@ class AgentDirectory:
         sender_kind = payload.get("sender_kind")
         if sender_kind:
             meta["sender_kind"] = sender_kind
+        reply_target = payload.get("reply_target")
+        if reply_target:
+            meta["reply_target"] = reply_target
         envelope = {
             "jsonrpc": "2.0", "id": mid, "method": "message/send",
             "params": {"message": {
@@ -1417,7 +1439,8 @@ class Relay:
         sees direct messages, not just group traffic. Undeliverable targets are held.
         """
         payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
-                   "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id)}
+                   "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id),
+                   "reply_target": _reply_target("channel", "", msg.chat_id)}
         # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
         own = self.backend.localpart_for(msg.account_id)
         if msg.from_localpart and own and msg.from_localpart == own:
@@ -1446,6 +1469,9 @@ class Relay:
                 f"[Delta Chat DM from {sender}] {msg.text}\n"
                 + _reply_hint("dm", own, msg.chat_id)
             )
+            # Override the channel-default reply_target with the DM handle now that ``own`` (the
+            # account to reply AS) is known — mirrors the text hint above, parse-free.
+            payload["reply_target"] = _reply_target("dm", own, msg.chat_id)
             return [own] if await self._deliver(own, payload) else []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)

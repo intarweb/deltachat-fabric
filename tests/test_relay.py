@@ -414,6 +414,43 @@ async def test_sender_kind_unresolved_sender_defaults_human(tmp_path):
     assert relay._sender_kind("bot-lead") == "bot"
 
 
+async def test_wake_metadata_reply_target_dm_is_structured(tmp_path):
+    # A 1:1 DM wake carries a STRUCTURED reply_target so a consumer replies WITHOUT parsing the
+    # "[↳ Reply here …]" prose: kind=dm + the exact identifiers delta_send needs (bot_id=own to
+    # send AS, chat_id=target chat). Mirrors the sender/notification structured-metadata pattern.
+    msg = InboundMessage(account_id=7, chat_id=11, msg_id=18, text="ping",
+                         is_group=False, members=[], mentioned=[],
+                         from_localpart="terafin", rfc724_mid="<rt-dm@chatmail>")
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    wakes: list[dict] = []
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], wakes, tmp_path)
+
+    await relay.handle_inbound(msg)
+
+    meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
+    assert meta.get("reply_target") == {"kind": "dm", "bot_id": "bot-a", "chat_id": 11}
+    # The human-readable hint is still in the text (backward-compatible) — structured field is additive.
+    assert "Reply here on Delta" in wakes[0]["text"]
+
+
+async def test_wake_metadata_reply_target_channel_is_structured(tmp_path):
+    # A group/channel wake carries kind=channel + channel_id (what delta_send_channel needs) —
+    # no bot_id, matching the channel reply primitive. Two roster bots so the group routes.
+    msg = InboundMessage(account_id=7, chat_id=99, msg_id=19, text="@bot-a hi all",
+                         is_group=True, members=["bot-a", "bot-b"], mentioned=["bot-a"],
+                         from_localpart="terafin", rfc724_mid="<rt-chan@chatmail>")
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    wakes: list[dict] = []
+    relay = make_relay(backend,
+                       [{"name": "bot-a", "url": "http://bot-a.live:8020"},
+                        {"name": "bot-b", "url": "http://bot-b.live:8020"}], wakes, tmp_path)
+
+    await relay.handle_inbound(msg)
+
+    meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
+    assert meta.get("reply_target") == {"kind": "channel", "channel_id": 99}
+
+
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
     # non-group message for an account with no known bot → nothing to wake
     msg = InboundMessage(account_id=99, chat_id=1, msg_id=1, text="hi", is_group=False,
