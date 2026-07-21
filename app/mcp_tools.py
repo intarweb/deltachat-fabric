@@ -80,6 +80,24 @@ class DeltaSendToTool(_RelayTool):
         )
 
 
+class DeltaSendToPeerTool(_RelayTool):
+    """``delta_send_to_peer`` — send to a ROSTER peer bot over the LAZY securejoin mesh.
+
+    ``target`` is the peer's bot id/localpart (not a raw address). The relay establishes the
+    per-pair verified 1:1 on first use: if the pair is already verified it sends immediately;
+    otherwise it initiates the securejoin and QUEUES the message until verification lands
+    (returns ``status: queued``). This is the bot↔bot cutover path that fixes the "no contact
+    for address" 404 without every pair being provisioned upfront. Raises RuntimeError on a
+    non-2xx (404 = unknown sender bot)."""
+
+    name = "delta_send_to_peer"
+
+    async def send_to_peer(self, bot_id: str, target: str, text: str) -> dict:
+        return await self._post(
+            "/send_to_peer", {"bot_id": bot_id, "target": target, "text": text}, self.name
+        )
+
+
 class DeltaListContactsTool(_RelayTool):
     """``delta_list_contacts`` — list a bot account's known contacts."""
 

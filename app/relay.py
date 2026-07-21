@@ -999,6 +999,206 @@ class HoldQueue:
 
 
 # ---------------------------------------------------------------------------
+# PeerMesh — LAZY per-pair securejoin + queue-until-verified for bot↔bot 1:1.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PendingPeerMsg:
+    """One queued bot→bot 1:1 message, awaiting the pair's securejoin verification.
+
+    ``text`` is the message body; ``enqueued`` the monotonic timestamp at enqueue (for TTL
+    age-out). Runtime-ephemeral — never persisted (the queue is in-memory, see PeerMesh)."""
+    text: str
+    enqueued: float
+
+
+class PeerMesh:
+    """LAZY, on-demand peer↔peer securejoin mesh with a QUEUE-UNTIL-VERIFIED buffer.
+
+    The a2a→Delta cutover requires every pair of bots to be VERIFIED KEY-CONTACTS of each
+    other before ``send_to_addr`` can resolve a 1:1 chat (an unverified Autocrypt-gossip
+    contact 404s "no contact for address"). Establishing every pair upfront is wasteful; this
+    establishes a pair on its FIRST 1:1 send and buffers the message until verification lands.
+
+    Mechanism (mirrors ``main.securejoin_star`` for the per-pair op, but on-demand + buffered):
+      * ``send_to_peer(sender, target)``:
+          - target already a verified key-contact of sender → send IMMEDIATELY (no securejoin,
+            no enqueue) — IDEMPOTENT.
+          - else → initiate the securejoin ONCE per pair (idempotent; skipped if already
+            in-flight), ENQUEUE the message keyed on (sender, target_addr), return "queued".
+            Never blocks on verification.
+      * ``flush_verified(sender_accid, target_addr)`` (called from the securejoin-verified
+        EVENT, composed with the existing on_verified): sends the pair's queued messages
+        IN-ORDER, EXACTLY-ONCE (pop-then-send; the queue is cleared atomically before send so a
+        re-fired event can't double-send), then clears the in-flight marker.
+
+    BOUNDED: a per-pair cap (``max_per_pair``) and an age-out TTL (``ttl``) prevent unbounded
+    growth if a securejoin never verifies. Dropped/aged-out messages are logged LOUDLY
+    (warning/error) — never silently swallowed.
+
+    Runtime-ephemeral: the queue + in-flight set live only in memory. Securejoin invites are
+    created + consumed inline and never stored (secret-hygiene: nothing persisted/committed).
+    v1 tradeoff: in-memory means a process restart drops still-pending (unverified) messages —
+    acceptable because an un-verified pair's send hasn't landed anyway and the sender can retry;
+    durability (a HoldQueue-style JSON store) is a follow-up if warranted.
+
+    All state is mutated only from the single asyncio loop (send_to_peer via /send_to_peer's
+    to_thread wrapper resolves+mutates, flush from on_verified) — kept simple, no lock; the
+    ops are short and the queue dict is only touched on that path.
+    """
+
+    def __init__(self, config: Config, backend: DeltaBackend, *,
+                 max_per_pair: int = 50, ttl: float = 3600.0):
+        self.config = config
+        self.backend = backend
+        self.max_per_pair = max_per_pair
+        self.ttl = ttl
+        # (sender_localpart, target_addr) -> [_PendingPeerMsg, ...] in enqueue order
+        self._queues: dict[tuple[str, str], list[_PendingPeerMsg]] = {}
+        # pairs whose securejoin has been initiated and not yet verified (in-flight) —
+        # dedups re-invocation so we never re-handshake / dup contacts.
+        self._inflight: set[tuple[str, str]] = set()
+
+    def _peer_addr(self, target_bot: str) -> str:
+        """Full Delta address for a roster bot id/localpart: ``{localpart}@{domain}``.
+        Resolves via the roster (id or localpart) and falls back to using the given token as
+        the localpart — generic, no names baked."""
+        domain = self.config.mail_domain
+        for b in self.config.roster:
+            if target_bot in (b.id, b.localpart):
+                return f"{b.localpart}@{domain}"
+        return f"{target_bot}@{domain}"
+
+    def _age_out(self, key: tuple[str, str], now: float) -> None:
+        """Drop any queued messages for ``key`` older than TTL — LOUDLY (never silent)."""
+        q = self._queues.get(key)
+        if not q:
+            return
+        kept = [m for m in q if (now - m.enqueued) < self.ttl]
+        dropped = len(q) - len(kept)
+        if dropped:
+            log.error("peer-mesh: AGED OUT %d message(s) for pair %s→%s — securejoin never "
+                      "verified within %.0fs TTL (DROPPED, not delivered)",
+                      dropped, key[0], key[1], self.ttl)
+        if kept:
+            self._queues[key] = kept
+        else:
+            self._queues.pop(key, None)
+
+    def send_to_peer(self, sender_bot: str, target_bot: str, text: str) -> dict:
+        """LAZY-establish the (sender→target) pair and send-or-queue ``text``.
+
+        Returns one of:
+          {"status":"sent", ...}                       — pair already verified, sent now
+          {"status":"queued", "reason":"securejoin-pending", "queued": N, ...}
+          {"status":"dropped", "reason":"pair-cap-exceeded", ...}   — cap hit, dropped LOUDLY
+
+        Raises KeyError if the SENDER bot has no Delta account.
+        """
+        sender_accid = self.backend.account_id_for(sender_bot)
+        if sender_accid is None:
+            raise KeyError(f"no delta account for bot {sender_bot!r}")
+        target_addr = self._peer_addr(target_bot)
+        key = (sender_bot, target_addr)
+        now = time.monotonic()
+
+        # GATE 4 (idempotent): already a verified key-contact → send immediately, no securejoin.
+        if self.backend.is_verified_key_contact(sender_accid, target_addr):
+            # If a stale in-flight marker/queue lingers (verified out-of-band), flush the
+            # backlog FIRST so the queued-earlier messages precede this live one (order-preserving).
+            self._inflight.discard(key)
+            flushed = self._flush_queue(sender_accid, key, now)
+            chat_id, msg_id = self.backend.send_to_addr(sender_accid, target_addr, text)
+            result = {"status": "sent", "account_id": sender_accid,
+                      "chat_id": chat_id, "msg_id": msg_id, "target_addr": target_addr}
+            if flushed:
+                result["flushed_backlog"] = flushed
+            return result
+
+        # Not verified yet → age out stale entries, then enforce the per-pair cap (GATE 2).
+        self._age_out(key, now)
+        q = self._queues.setdefault(key, [])
+        if len(q) >= self.max_per_pair:
+            log.error("peer-mesh: pair %s→%s at cap (%d) — DROPPING new message (securejoin "
+                      "not yet verified); backlog not delivered", sender_bot, target_addr,
+                      self.max_per_pair)
+            return {"status": "dropped", "reason": "pair-cap-exceeded",
+                    "cap": self.max_per_pair, "target_addr": target_addr}
+
+        # GATE 4 (idempotent handshake): initiate the securejoin ONCE per pair.
+        if key not in self._inflight:
+            target_accid = self.backend.account_id_for(target_bot)
+            if target_accid is None:
+                # Target bot isn't onboarded on this relay → can't drive the join locally.
+                # Still enqueue (a later reconcile may onboard it) but surface it LOUDLY.
+                log.error("peer-mesh: target bot %r not onboarded on this relay — cannot "
+                          "initiate securejoin for pair %s→%s; message QUEUED pending onboard",
+                          target_bot, sender_bot, target_addr)
+            else:
+                try:
+                    invite = self.backend.create_invite(sender_accid)  # ephemeral, never stored
+                    self.backend.secure_join(target_accid, invite)     # target accepts sender's invite
+                    self._inflight.add(key)
+                    log.info("peer-mesh: initiated securejoin for pair %s→%s (verification "
+                             "completes async → verified event flushes the queue)",
+                             sender_bot, target_addr)
+                except Exception:
+                    log.exception("peer-mesh: securejoin initiation failed for pair %s→%s "
+                                  "(message still QUEUED for retry on next send/verify)",
+                                  sender_bot, target_addr)
+
+        q.append(_PendingPeerMsg(text=text, enqueued=now))
+        return {"status": "queued", "reason": "securejoin-pending",
+                "queued": len(q), "account_id": sender_accid, "target_addr": target_addr}
+
+    def _flush_queue(self, sender_accid: int, key: tuple[str, str], now: float) -> int:
+        """Pop the pair's queue ATOMICALLY, then send each in order — EXACTLY-ONCE.
+
+        The queue entry is removed BEFORE sending so a re-fired verified event (which re-calls
+        this) finds nothing to flush → no dupes. Returns the count delivered. Aged-out entries
+        are dropped LOUDLY first. On a send failure the remaining un-sent messages are dropped
+        LOUDLY (they can't be re-flushed — the queue was already popped)."""
+        self._age_out(key, now)          # drop TTL-expired (loud) before flushing
+        q = self._queues.pop(key, None)  # ATOMIC pop → exactly-once
+        if not q:
+            return 0
+        target_addr = key[1]
+        sent = 0
+        for i, m in enumerate(q):
+            try:
+                self.backend.send_to_addr(sender_accid, target_addr, m.text)
+                sent += 1
+            except Exception:
+                remaining = len(q) - i
+                log.error("peer-mesh: flush send failed for pair %s→%s after %d/%d delivered "
+                          "— %d message(s) DROPPED (queue already popped, not re-flushable)",
+                          key[0], target_addr, sent, len(q), remaining)
+                break
+        if sent:
+            log.info("peer-mesh: flushed %d queued message(s) for verified pair %s→%s",
+                     sent, key[0], target_addr)
+        return sent
+
+    def flush_verified(self, sender_accid: int, target_addr: str) -> int:
+        """Flush the (sender_accid→target_addr) pair's queue — invoked from the securejoin
+        VERIFIED event. Clears the in-flight marker and sends the backlog in-order/exactly-once.
+
+        Returns the number of messages delivered (0 if no pair matches). Never raises for a
+        non-matching event (composes with the existing on_verified handler)."""
+        sender_lp = self.backend.localpart_for(sender_accid)
+        if sender_lp is None:
+            return 0
+        key = (sender_lp, target_addr)
+        self._inflight.discard(key)
+        return self._flush_queue(sender_accid, key, time.monotonic())
+
+    def pending_count(self) -> int:
+        """Total queued (un-verified) messages across all pairs — for /healthz visibility."""
+        return sum(len(q) for q in self._queues.values())
+
+
+# ---------------------------------------------------------------------------
 # Relay engine — ties backend + directory + hold-queue together.
 # ---------------------------------------------------------------------------
 
@@ -1010,11 +1210,14 @@ class Relay:
     """
 
     def __init__(self, config: Config, backend: DeltaBackend, directory: AgentDirectory,
-                 hold_queue: HoldQueue):
+                 hold_queue: HoldQueue, peer_mesh: "Optional[PeerMesh]" = None):
         self.config = config
         self.backend = backend
         self.directory = directory
         self.hold = hold_queue
+        # LAZY peer↔peer securejoin mesh (queue-until-verified) for bot↔bot 1:1 sends.
+        # Additive: does NOT touch send/send_to_addr/securejoin_star/the All-Hands group.
+        self.peer_mesh = peer_mesh or PeerMesh(config, backend)
         # Wake dedup: the same group message is delivered to EVERY member account in this one
         # process, so each account's handle_inbound would independently wake the same target
         # (N× amplification in an N-member room). Key on (rfc724_mid, target) — the GLOBAL
@@ -1063,6 +1266,23 @@ class Relay:
             raise KeyError(f"no delta account for bot {bot!r}")
         chat_id, msg_id = self.backend.send_to_addr(accid, addr, text)
         return {"status": "sent", "account_id": accid, "chat_id": chat_id, "msg_id": msg_id}
+
+    def send_to_peer(self, sender_bot: str, target_bot: str, text: str) -> dict:
+        """Send ``text`` from ``sender_bot`` to a ROSTER peer ``target_bot`` over the LAZY
+        securejoin mesh: sends immediately if the pair is already a verified key-contact, else
+        initiates the per-pair securejoin (idempotent) and QUEUES the message until verified.
+
+        Distinct from ``send_to_addr`` (reach a HUMAN by raw address, no queue) — this is the
+        bot↔bot path that self-establishes verification on first use. Returns the PeerMesh
+        result dict ({"status":"sent"|"queued"|"dropped", ...}). Raises KeyError if the sender
+        bot has no Delta account (map to 404 at the endpoint)."""
+        return self.peer_mesh.send_to_peer(sender_bot, target_bot, text)
+
+    def flush_verified_pair(self, account_id: int, addr: str) -> int:
+        """On a securejoin-VERIFIED event, flush any peer-mesh messages queued for the
+        (account_id→addr) pair — in order, exactly-once. Returns the count delivered.
+        Composed alongside provision_verified_member (does not replace it)."""
+        return self.peer_mesh.flush_verified(account_id, addr)
 
     def _accid(self, bot: str) -> int:
         """Resolve a bot id/localpart to its Delta account id. KeyError if none."""
@@ -1335,6 +1555,18 @@ class SendToRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SendToPeerRequest(BaseModel):
+    """Send to a ROSTER peer bot over the lazy securejoin mesh (queue-until-verified).
+
+    ``target`` is the peer's bot id/localpart (NOT a raw address — the relay resolves it to
+    ``{localpart}@{domain}`` from the roster). On first 1:1 to an unverified peer the relay
+    initiates the per-pair securejoin and queues the message until verified."""
+    bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
+    target: str
+    text: str
+    model_config = {"populate_by_name": True}
+
+
 class ReactRequest(BaseModel):
     bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
     chat_id: int
@@ -1366,7 +1598,8 @@ def create_app(relay: Relay):
 
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "held": len(relay.hold)}
+        return {"status": "ok", "held": len(relay.hold),
+                "peer_queued": relay.peer_mesh.pending_count()}
 
     @app.post("/send", response_model=SendResponse)
     async def send(req: SendRequest) -> SendResponse:
@@ -1420,6 +1653,13 @@ def create_app(relay: Relay):
     async def send_to(req: SendToRequest):
         """Message a HUMAN by email address (resolves their 1:1 chat) — 404 on unknown bot/addr."""
         return await _run(lambda: relay.send_to_addr(req.bot_id, req.addr, req.text))
+
+    @app.post("/send_to_peer")
+    async def send_to_peer(req: SendToPeerRequest):
+        """Send to a ROSTER peer bot over the lazy securejoin mesh (queue-until-verified).
+        Sends now if the pair is verified, else initiates the securejoin + queues. 404 on
+        unknown sender bot; 200 with status queued/sent/dropped otherwise."""
+        return await _run(lambda: relay.send_to_peer(req.bot_id, req.target, req.text))
 
     @app.post("/channel")
     async def create_channel(req: CreateChannelRequest):

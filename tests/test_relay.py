@@ -47,7 +47,8 @@ class FakeBackend:
 
     def __init__(self, accounts: dict[str, int], inbound: Optional[list[InboundMessage]] = None,
                  contacts: Optional[dict[int, list[dict]]] = None,
-                 channels: Optional[dict[int, list[dict]]] = None):
+                 channels: Optional[dict[int, list[dict]]] = None,
+                 verified: Optional[set[tuple[int, str]]] = None):
         self._accounts = accounts                 # localpart -> account_id
         self._inbox = list(inbound or [])
         self.sent: list[tuple[int, int, str]] = []
@@ -58,6 +59,11 @@ class FakeBackend:
         self.added: list[tuple[int, int, str]] = []
         self.reacted: list[tuple[int, int, str]] = []
         self._next_chat_id = 500
+        # (account_id, addr) pairs that are verified key-contacts. send_to_peer tests toggle
+        # these to simulate a securejoin completing.
+        self._verified: set[tuple[int, str]] = set(verified or ())
+        self.invites: list[int] = []              # account_ids we minted a securejoin invite for
+        self.sent_to: list[tuple[int, str, str]] = []  # (account_id, addr, text) via send_to_addr
 
     def account_id_for(self, localpart: str) -> Optional[int]:
         return self._accounts.get(localpart)
@@ -74,7 +80,6 @@ class FakeBackend:
         return self._next_msg_id
 
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:
-        self.sent_to = getattr(self, "sent_to", [])
         self._next_chat_id += 1
         self._next_msg_id += 1
         self.sent_to.append((account_id, addr, text))
@@ -94,6 +99,7 @@ class FakeBackend:
         return list(msgs)[-limit:]
 
     def create_invite(self, account_id: int) -> str:
+        self.invites.append(account_id)
         return f"https://i.delta.chat/#FAKEINVITE-acc{account_id}"
 
     def create_channel(self, account_id: int, name: str, members: list[str]) -> int:
@@ -111,6 +117,13 @@ class FakeBackend:
         self.securejoined = getattr(self, "securejoined", [])
         self.securejoined.append((account_id, invite))
         return 4321
+
+    def is_verified_key_contact(self, account_id: int, addr: str) -> bool:
+        return (account_id, addr) in self._verified
+
+    def mark_verified(self, account_id: int, addr: str) -> None:
+        """Test helper: simulate a securejoin completing for (account_id, addr)."""
+        self._verified.add((account_id, addr))
 
     def delete_chat(self, account_id: int, chat_id: int) -> None:
         self.deleted = getattr(self, "deleted", [])
