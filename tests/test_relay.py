@@ -383,6 +383,35 @@ async def test_wake_envelope_carries_notification_marker(tmp_path):
     # Sender forwarded in structured metadata (not just prose) so lite → the hook renders
     # "From `terafin`", never the "someone" fallback.
     assert meta.get("from") == "terafin"
+    # terafin is NOT a roster bot → classified human (so the hook prioritizes the person).
+    assert meta.get("sender_kind") == "human"
+
+
+async def test_wake_metadata_sender_kind_bot_for_roster_peer(tmp_path):
+    # A DM from a fleet-roster bot → sender_kind=bot (so the hook can DEprioritize peer chatter
+    # vs a real person). bot-b is in make_config()'s roster; the receiving account is bot-a.
+    msg = InboundMessage(account_id=7, chat_id=11, msg_id=17, text="peer ping",
+                         is_group=False, members=[], mentioned=[],
+                         from_localpart="bot-b", rfc724_mid="<peer@chatmail>")
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    wakes: list[dict] = []
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], wakes, tmp_path)
+
+    await relay.handle_inbound(msg)
+
+    meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
+    assert meta.get("sender_kind") == "bot"
+    assert meta.get("from") == "bot-b"
+
+
+async def test_sender_kind_unresolved_sender_defaults_human(tmp_path):
+    # An unresolved sender (empty from_localpart) errs toward "human" — never silently
+    # deprioritize a possible person as unknown.
+    backend = FakeBackend(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path)
+    assert relay._sender_kind("") == "human"
+    assert relay._sender_kind("someone-external") == "human"
+    assert relay._sender_kind("bot-lead") == "bot"
 
 
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
