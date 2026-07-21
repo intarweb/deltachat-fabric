@@ -558,15 +558,27 @@ class DeltaChat2Backend:
             except Exception:
                 continue
         from_id = getattr(msg, "from_id", 0) or 0
-        # sender localpart — for sender-exclusion (a bot is never woken by its own post)
-        from_localpart = ""
-        try:
-            fc = self.rpc.get_contact(accid, from_id)
-            faddr = getattr(fc, "address", None) or getattr(fc, "addr", None) or ""
-            if faddr:
-                from_localpart = faddr.split("@", 1)[0]
-        except Exception:
-            pass
+        # Sender localpart — used for sender-exclusion (a bot is never woken by its own post)
+        # AND forwarded as the wake's "from" metadata so the inbox renders "From `<sender>`"
+        # instead of "someone". Resolve via the sender Contact EMBEDDED in the message first,
+        # then a get_contact(from_id) lookup — chatmail key-contacts (securejoin/PGP) can populate
+        # .address on only one of the two. Warn-log if still unresolved so a real relayed DM that
+        # fails leaves from_id/sender in the log to finish the diagnosis (verified vs installed
+        # deltachat2: Message has .from_id + .sender, Contact has .address).
+        def _localpart(c) -> str:
+            if c is None:
+                return ""
+            addr = getattr(c, "address", None) or getattr(c, "addr", None) or ""
+            return addr.split("@", 1)[0] if "@" in addr else ""
+        from_localpart = _localpart(getattr(msg, "sender", None))
+        if not from_localpart and from_id:
+            try:
+                from_localpart = _localpart(self.rpc.get_contact(accid, from_id))
+            except Exception:
+                pass
+        if not from_localpart:
+            log.warning("inbound sender UNRESOLVED (renders 'someone'): accid=%s msg=%s from_id=%s sender=%r",
+                        accid, msg_id, from_id, getattr(msg, "sender", None))
         # GLOBAL message-id — identical across every member account's copy → wake dedup key
         rfc724_mid = ""
         try:
@@ -898,18 +910,23 @@ class AgentDirectory:
         """
         text = payload.get("text") or f"[Delta Chat] wake for {bot_id}"
         mid = uuid.uuid4().hex
+        # Metadata a2abridge-lite reads off the message (msg.Metadata[...]):
+        #   notification=True → lite TERMINALIZES the wake task at delivery (live fleet-wide,
+        #     proven 2026-07-21) so there's no completable task to mis-manage. All wakes are
+        #     fire-and-forget. Message-level placement (params.message.metadata), confirmed.
+        #   from=<sender localpart> → lite carries it onto the inbox item so the UserPromptSubmit
+        #     hook renders "From `<sender>`" instead of the "someone" fallback. Forwarded ONLY
+        #     when resolved (see handle_inbound); the text still carries a human-readable label.
+        meta = {"notification": True}
+        sender = payload.get("from")
+        if sender:
+            meta["from"] = sender
         envelope = {
             "jsonrpc": "2.0", "id": mid, "method": "message/send",
             "params": {"message": {
                 "role": "user", "messageId": mid, "kind": "message",
                 "parts": [{"kind": "text", "text": text}],
-                # Wake marker: flags this as a fire-and-forget notification so a2abridge can
-                # TERMINALIZE (auto-close) the wake task at delivery — no completable task for the
-                # bot to mis-manage (the core wake→reply confusion). Applies to ALL wakes
-                # (DM/group/reaction) since every wake is fire-and-forget. PROVISIONAL placement:
-                # params.message.metadata.notification — Bragi confirms message-metadata vs
-                # params-metadata; flipping = move this one `metadata` key up to params level.
-                "metadata": {"notification": True},
+                "metadata": meta,
             }},
         }
         try:
