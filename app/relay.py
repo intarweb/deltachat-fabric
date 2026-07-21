@@ -917,10 +917,14 @@ class AgentDirectory:
         #   from=<sender localpart> → lite carries it onto the inbox item so the UserPromptSubmit
         #     hook renders "From `<sender>`" instead of the "someone" fallback. Forwarded ONLY
         #     when resolved (see handle_inbound); the text still carries a human-readable label.
+        #   sender_kind=human|bot → lets the hook prioritize a real person over peer-bot chatter.
         meta = {"notification": True}
         sender = payload.get("from")
         if sender:
             meta["from"] = sender
+        sender_kind = payload.get("sender_kind")
+        if sender_kind:
+            meta["sender_kind"] = sender_kind
         envelope = {
             "jsonrpc": "2.0", "id": mid, "method": "message/send",
             "params": {"message": {
@@ -1396,6 +1400,15 @@ class Relay:
                 return m
         return None
 
+    def _sender_kind(self, localpart: str) -> str:
+        """Classify a resolved sender as 'bot' (a fleet-roster localpart) or 'human' (anyone
+        else, including an unresolved sender). Drives the wake's metadata.sender_kind so a
+        consumer's hook can prioritize a real person over peer-bot chatter. Roster membership is
+        the deterministic fleet signal — humans (Justin/Elene/external) are never in the roster."""
+        if localpart and any(localpart == b.localpart for b in self.config.roster):
+            return "bot"
+        return "human"
+
     async def handle_inbound(self, msg: InboundMessage) -> list[str]:
         """Route one inbound message → wake the right bot(s). Returns woken bot ids.
 
@@ -1416,6 +1429,11 @@ class Relay:
         # fall back to "someone" when a contact address doesn't resolve.
         sender = msg.from_localpart or "someone"
         payload["from"] = sender
+        # sender_kind (human|bot): forwarded in the wake metadata so the hook can prioritize a
+        # real person over peer-bot chatter. "bot" iff the resolved sender is a fleet-roster
+        # localpart; anyone else — incl. an unresolved sender — is "human" (err toward attention,
+        # never silently deprioritize a possible person as unknown).
+        payload["sender_kind"] = self._sender_kind(msg.from_localpart)
         if not msg.is_group:
             if not own:
                 return []
