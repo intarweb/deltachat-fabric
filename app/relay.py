@@ -1116,7 +1116,18 @@ class PeerMesh:
                 result["flushed_backlog"] = flushed
             return result
 
-        # Not verified yet → age out stale entries, then enforce the per-pair cap (GATE 2).
+        # GATE (fail-fast, per review): a target with no Delta account on this relay is NOT
+        # onboarded (not in the roster / never logged in) — REJECT fast + loud rather than enqueue
+        # for a securejoin verification that will never arrive (slow-fail via age-out).
+        target_accid = self.backend.account_id_for(target_bot)
+        if target_accid is None:
+            log.error("peer-mesh: target bot %r not onboarded (no Delta account on this relay) — "
+                      "REJECTING send from %s (not enqueued; nothing to verify against)",
+                      target_bot, sender_bot)
+            return {"status": "rejected", "reason": "target-not-onboarded",
+                    "target_addr": target_addr}
+
+        # Onboarded but not yet verified → age out stale entries, then enforce the per-pair cap (GATE 2).
         self._age_out(key, now)
         q = self._queues.setdefault(key, [])
         if len(q) >= self.max_per_pair:
@@ -1128,25 +1139,17 @@ class PeerMesh:
 
         # GATE 4 (idempotent handshake): initiate the securejoin ONCE per pair.
         if key not in self._inflight:
-            target_accid = self.backend.account_id_for(target_bot)
-            if target_accid is None:
-                # Target bot isn't onboarded on this relay → can't drive the join locally.
-                # Still enqueue (a later reconcile may onboard it) but surface it LOUDLY.
-                log.error("peer-mesh: target bot %r not onboarded on this relay — cannot "
-                          "initiate securejoin for pair %s→%s; message QUEUED pending onboard",
-                          target_bot, sender_bot, target_addr)
-            else:
-                try:
-                    invite = self.backend.create_invite(sender_accid)  # ephemeral, never stored
-                    self.backend.secure_join(target_accid, invite)     # target accepts sender's invite
-                    self._inflight.add(key)
-                    log.info("peer-mesh: initiated securejoin for pair %s→%s (verification "
-                             "completes async → verified event flushes the queue)",
-                             sender_bot, target_addr)
-                except Exception:
-                    log.exception("peer-mesh: securejoin initiation failed for pair %s→%s "
-                                  "(message still QUEUED for retry on next send/verify)",
-                                  sender_bot, target_addr)
+            try:
+                invite = self.backend.create_invite(sender_accid)  # ephemeral, never stored
+                self.backend.secure_join(target_accid, invite)     # target accepts sender's invite
+                self._inflight.add(key)
+                log.info("peer-mesh: initiated securejoin for pair %s→%s (verification "
+                         "completes async → verified event flushes the queue)",
+                         sender_bot, target_addr)
+            except Exception:
+                log.exception("peer-mesh: securejoin initiation failed for pair %s→%s "
+                              "(message still QUEUED for retry on next send/verify)",
+                              sender_bot, target_addr)
 
         q.append(_PendingPeerMsg(text=text, enqueued=now))
         return {"status": "queued", "reason": "securejoin-pending",
@@ -1196,6 +1199,22 @@ class PeerMesh:
     def pending_count(self) -> int:
         """Total queued (un-verified) messages across all pairs — for /healthz visibility."""
         return sum(len(q) for q in self._queues.values())
+
+    def log_dropped_backlog(self) -> int:
+        """GATE 3c: on shutdown/restart, LOUDLY log any un-flushed in-memory backlog (which pairs,
+        how many) — an in-memory queue must NEVER silently drop on restart (that IS the silent
+        swallow we gate against). Returns the total message count that would be lost. Durable
+        persistence (the HoldQueue JSON pattern) is a nice-to-have follow-on if this proves painful."""
+        pairs = [(k, len(q)) for k, q in self._queues.items() if q]
+        total = sum(n for _, n in pairs)
+        for (sender, target_addr), n in pairs:
+            log.error("peer-mesh: SHUTDOWN with %d undelivered queued message(s) for pair %s→%s "
+                      "— securejoin never verified; backlog LOST on restart (in-memory queue)",
+                      n, sender, target_addr)
+        if total:
+            log.error("peer-mesh: SHUTDOWN dropped %d total queued message(s) across %d pair(s)",
+                      total, len(pairs))
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -1595,6 +1614,11 @@ def create_app(relay: Relay):
     from fastapi import FastAPI, HTTPException
 
     app = FastAPI(title="Delta Chat Fabric Relay", version="1.0")
+
+    @app.on_event("shutdown")
+    def _log_peer_backlog_on_shutdown():
+        # GATE 3c: never silently drop the in-memory peer-mesh backlog on restart — log it loudly.
+        relay.peer_mesh.log_dropped_backlog()
 
     @app.get("/healthz")
     async def healthz():

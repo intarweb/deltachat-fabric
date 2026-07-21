@@ -193,20 +193,33 @@ def test_ttl_age_out_on_flush_drops_stale_loudly(caplog):
     assert any("AGED OUT" in r.message for r in caplog.records)
 
 
-# --------------------------------------------------------------------------- fail-loud: target not onboarded
+# --------------------------------------------------------------------------- fail-fast: target not onboarded
 
 
-def test_target_not_onboarded_queues_and_logs_error(caplog):
+def test_target_not_onboarded_rejects_fast_and_logs_error(caplog):
     mesh, backend = make_mesh({"bot-a": 7})  # bot-b NOT onboarded on this relay
     with caplog.at_level(logging.ERROR, logger="dcf"):
         res = mesh.send_to_peer("bot-a", "bot-b", "waiting")
 
-    assert res["status"] == "queued"
-    # no securejoin could be driven (target absent) — but it's surfaced LOUDLY, not swallowed
+    # Fail-fast: a target with no Delta account is REJECTED loudly, NOT enqueued for a
+    # verification that will never arrive (no slow-fail via age-out).
+    assert res["status"] == "rejected"
+    assert res["reason"] == "target-not-onboarded"
     assert getattr(backend, "securejoined", []) == []
     assert any("not onboarded" in r.message and r.levelno >= logging.ERROR
                for r in caplog.records)
-    assert mesh.pending_count() == 1
+    assert mesh.pending_count() == 0   # nothing enqueued
+
+
+def test_log_dropped_backlog_on_shutdown_is_loud(caplog):
+    mesh, backend = make_mesh({"bot-a": 7, "bot-b": 8})
+    mesh.send_to_peer("bot-a", "bot-b", "one")   # bot-b onboarded, unverified → enqueued
+    mesh.send_to_peer("bot-a", "bot-b", "two")
+    assert mesh.pending_count() == 2
+    with caplog.at_level(logging.ERROR, logger="dcf"):
+        dropped = mesh.log_dropped_backlog()
+    assert dropped == 2
+    assert any("SHUTDOWN" in r.message and r.levelno >= logging.ERROR for r in caplog.records)
 
 
 def test_unknown_sender_bot_raises_keyerror():
