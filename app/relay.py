@@ -41,12 +41,13 @@ from .config import Config
 log = logging.getLogger("dcf")
 from .routing import wake_targets
 
-# Flip to True (or set env DCF_TERMINALIZED=1) once a2abridge TERMINALIZATION — auto-closing
-# the wake task at delivery, keyed on the params.message.metadata.notification marker above — is
-# confirmed live. Then the wake text drops the "a2a_complete_task does NOT reach" caveat (there's
-# no task left to mis-complete) and shrinks to a crisp one-liner. Until then the caveat MUST stay,
-# or bots see a completable task and mis-complete it (the exact confusion we're removing).
-TERMINALIZED = os.environ.get("DCF_TERMINALIZED", "") in ("1", "true", "True")
+# a2abridge TERMINALIZATION (auto-close the wake task at delivery, keyed on the
+# params.message.metadata.notification marker above) is LIVE fleet-wide (proven 2026-07-21:
+# bridge #5 + hook #127 deployed; Brokkr's marker → task state=completed on send, no
+# a2a_complete_task). So there's no completable task left to mis-manage → the wake text uses
+# the crisp one-liner (no a2a-negation caveat). Default ON; set DCF_TERMINALIZED=0 to force the
+# old caveat back if a host ever runs a pre-terminalize bridge.
+TERMINALIZED = os.environ.get("DCF_TERMINALIZED", "1") not in ("0", "false", "False")
 
 
 def _reply_hint(kind: str, own: str, chat_id: int) -> str:
