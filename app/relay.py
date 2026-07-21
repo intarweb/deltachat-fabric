@@ -41,6 +41,36 @@ from .config import Config
 log = logging.getLogger("dcf")
 from .routing import wake_targets
 
+# a2abridge TERMINALIZATION (auto-close the wake task at delivery, keyed on the
+# params.message.metadata.notification marker above) is LIVE fleet-wide (proven 2026-07-21:
+# bridge #5 + hook #127 deployed; Brokkr's marker → task state=completed on send, no
+# a2a_complete_task). So there's no completable task left to mis-manage → the wake text uses
+# the crisp one-liner (no a2a-negation caveat). Default ON; set DCF_TERMINALIZED=0 to force the
+# old caveat back if a host ever runs a pre-terminalize bridge.
+TERMINALIZED = os.environ.get("DCF_TERMINALIZED", "1") not in ("0", "false", "False")
+
+
+def _reply_hint(kind: str, own: str, chat_id: int) -> str:
+    """The '↳ reply here' line appended to a wake. ``kind`` ∈ {'dm','channel'}. Names the EXACT
+    single tool call with the chat/channel id PRE-FILLED — zero which-tool/which-id decision.
+    Once TERMINALIZED, drops the a2a-negation caveat (no task left to mis-complete) for a crisp
+    one-liner."""
+    if kind == "channel":
+        call = f"delta_send_channel(channel_id={chat_id}, text=<your reply>)"
+        if TERMINALIZED:
+            return f"[↳ Reply here on Delta: {call}]"
+        return (f"[↳ To REPLY into this channel use the delta_send_channel "
+                f"tool (channel_id={chat_id}, text=<your reply>) — "
+                f"a2a_complete_task does NOT reach the channel.]")
+    call = f'delta_send(bot_id="{own}", target={chat_id}, text=<your reply>)'
+    if TERMINALIZED:
+        return f"[↳ Reply here on Delta: {call}]"
+    return (f'[↳ To REPLY on Delta use the delta_send tool (bot_id="{own}", '
+            f"target={chat_id}, text=<your reply>) — a2a_complete_task "
+            f"does NOT reach them on Delta.]")
+
+
+
 # ---------------------------------------------------------------------------
 # Delta backend — the ONLY place deltachat2 is touched. Injectable + swappable.
 # ---------------------------------------------------------------------------
@@ -873,6 +903,13 @@ class AgentDirectory:
             "params": {"message": {
                 "role": "user", "messageId": mid, "kind": "message",
                 "parts": [{"kind": "text", "text": text}],
+                # Wake marker: flags this as a fire-and-forget notification so a2abridge can
+                # TERMINALIZE (auto-close) the wake task at delivery — no completable task for the
+                # bot to mis-manage (the core wake→reply confusion). Applies to ALL wakes
+                # (DM/group/reaction) since every wake is fire-and-forget. PROVISIONAL placement:
+                # params.message.metadata.notification — Bragi confirms message-metadata vs
+                # params-metadata; flipping = move this one `metadata` key up to params level.
+                "metadata": {"notification": True},
             }},
         }
         try:
@@ -1111,10 +1148,7 @@ class Relay:
         sees direct messages, not just group traffic. Undeliverable targets are held.
         """
         payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
-                   "text": (f"[Delta Chat] {msg.text}\n"
-                            f"[\u21b3 To REPLY into this channel use the delta_send_channel "
-                            f"tool (channel_id={msg.chat_id}, text=<your reply>) \u2014 "
-                            f"a2a_complete_task does NOT reach the channel.]")}
+                   "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id)}
         # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
         own = self.backend.localpart_for(msg.account_id)
         if msg.from_localpart and own and msg.from_localpart == own:
@@ -1136,9 +1170,7 @@ class Relay:
             payload["direct"] = True
             payload["text"] = (
                 f"[Delta Chat DM from {sender}] {msg.text}\n"
-                f'[\u21b3 To REPLY on Delta use the delta_send tool (bot_id="{own}", '
-                f"target={msg.chat_id}, text=<your reply>) \u2014 a2a_complete_task "
-                f"does NOT reach them on Delta.]"
+                + _reply_hint("dm", own, msg.chat_id)
             )
             return [own] if await self._deliver(own, payload) else []
         main = self._channel_main(msg.members)
