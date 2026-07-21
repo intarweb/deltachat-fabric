@@ -367,6 +367,9 @@ async def test_wake_envelope_carries_notification_marker(tmp_path):
 
     meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
     assert meta.get("notification") is True
+    # Sender forwarded in structured metadata (not just prose) so lite → the hook renders
+    # "From `terafin`", never the "someone" fallback.
+    assert meta.get("from") == "terafin"
 
 
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):
