@@ -668,8 +668,13 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
     async def on_verified(ev: InboundVerified) -> None:
         # EVENT-DRIVEN provisioning: a member just became a verified key-contact of a realm lead →
         # add them to the realm's encrypted channel now. Runs off the loop (blocking rpc).
+        # COMPOSED (not replaced): also flush any LAZY peer-mesh 1:1 messages queued for this
+        # pair (queue-until-verified). Both run on every verified event — the channel provision
+        # is a no-op for a non-realm pair, and the peer-mesh flush is a no-op for a pair with no
+        # queued messages, so they compose cleanly.
         await asyncio.to_thread(provision_verified_member, cfg, service.relay.backend,
                                 ev.account_id, ev.addr)
+        await asyncio.to_thread(service.relay.flush_verified_pair, ev.account_id, ev.addr)
 
     loop = asyncio.get_running_loop()
     # 🔴 STATE-LOSS GUARD — run BEFORE reconcile re-onboards anything: any roster bot that was

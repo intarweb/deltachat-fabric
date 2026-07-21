@@ -612,6 +612,12 @@ class _StarBackend:
             if c["id"] == chat_id:
                 c["members"].append(addr.split("@", 1)[0])
 
+    # peer-mesh surface (send_to_addr = the 1:1 delivery the flush uses)
+    def send_to_addr(self, accid, addr, text):
+        self.sent_to = getattr(self, "sent_to", [])
+        self.sent_to.append((accid, addr, text))
+        return (900, 901)
+
 
 def _star_be(accounts, **kw):
     return _StarBackend(accounts, **kw)
@@ -695,6 +701,33 @@ def test_provision_verified_member_idempotent_when_already_in_channel():
                   channels={10: [{"id": 55, "name": "r1", "members": ["lead", "m1"]}]})
     res = main.provision_verified_member(_prov_cfg(), be, 10, "m1@d.example")
     assert res["already"] == "m1" and be.added == [] and be.created == []
+
+
+def test_on_verified_composes_provision_and_peer_flush():
+    """GATE 8: the verified-flush COMPOSES with the existing provision_verified_member — a
+    single securejoin-verified event runs BOTH (channel provision AND peer-mesh queue flush),
+    neither replacing the other. Mirrors the on_verified body wired in _serve."""
+    from app.relay import PeerMesh
+
+    cfg = _prov_cfg()
+    be = _star_be({"lead": 10, "m1": 11})
+    mesh = PeerMesh(cfg, be)
+
+    # a peer-mesh 1:1 was queued for the (lead -> m1) pair before verification
+    mesh.send_to_peer("lead", "m1", "queued peer msg")
+    assert mesh.pending_count() == 1
+
+    addr = "m1@d.example"
+    be._verified.add((10, addr))  # securejoin completes → pair verified
+
+    # replicate the composed on_verified: provision the realm member AND flush the peer queue
+    prov = main.provision_verified_member(cfg, be, 10, addr)
+    flushed = mesh.flush_verified(10, addr)
+
+    # BOTH ran: the realm channel got the member AND the queued peer message was delivered
+    assert prov is not None and prov["added"] == "m1"        # provision still runs
+    assert flushed == 1                                       # peer flush also runs
+    assert getattr(be, "sent_to", []) == [(10, addr, "queued peer msg")]
 
 
 def test_provision_verified_member_ignores_non_member_or_non_led_realm():

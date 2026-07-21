@@ -17,7 +17,7 @@ Transport / endpoint (what an MCP client connects to):
   - auth      NONE at this endpoint — access is Virtual-Key-gated upstream at the MCP gateway.
 
 Usage:
-  ``build_mcp(relay_url)`` -> a configured ``FastMCP`` with the 7 tools registered.
+  ``build_mcp(relay_url)`` -> a configured ``FastMCP`` with the delta tools registered.
   ``build_mcp_app(relay_url)`` -> the Starlette ASGI app (``streamable_http_app()``), which
   ALSO wires ``session_manager.run()` into its own lifespan — so it can be served directly
   by uvicorn with no extra lifespan plumbing. Mount it into another ASGI app via
@@ -48,6 +48,7 @@ from .mcp_tools import (
     DeltaSecureJoinTool,
     DeltaSendChannelTool,
     DeltaSendTool,
+    DeltaSendToPeerTool,
     DeltaSendToTool,
 )
 
@@ -55,6 +56,7 @@ from .mcp_tools import (
 TOOL_NAMES = (
     "delta_send",
     "delta_send_to",
+    "delta_send_to_peer",
     "delta_list_contacts",
     "delta_list_channels",
     "delta_send_channel",
@@ -98,7 +100,7 @@ def _transport_security():
 
 
 def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
-    """Build the ``FastMCP`` with the 8 delta tools registered.
+    """Build the ``FastMCP`` with the 13 delta tools registered.
 
     ``relay_url`` is injected into every underlying relay client (falls back to the
     ``RELAY_URL`` env / in-container loopback via ``_RelayTool``). The server is
@@ -111,6 +113,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
     # One relay client per operation, all pointed at the same injected relay_url.
     send_tool = DeltaSendTool(relay_url=relay_url)
     send_to_tool = DeltaSendToTool(relay_url=relay_url)
+    send_to_peer_tool = DeltaSendToPeerTool(relay_url=relay_url)
     contacts_tool = DeltaListContactsTool(relay_url=relay_url)
     channels_tool = DeltaListChannelsTool(relay_url=relay_url)
     send_channel_tool = DeltaSendChannelTool(relay_url=relay_url)
@@ -151,6 +154,26 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         Returns ``{"status":"sent","account_id":int,"chat_id":int,"msg_id":int}``.
         """
         return await send_to_tool.send_to(bot_id=bot_id, addr=addr, text=text)
+
+    @mcp.tool(name="delta_send_to_peer")
+    async def delta_send_to_peer(bot_id: str, target: str, text: str) -> dict:
+        """Send to a ROSTER PEER BOT over the lazy securejoin mesh (queue-until-verified).
+
+        Use this for bot↔bot 1:1 messaging under the a2a→Delta cutover. Unlike delta_send_to
+        (which needs the target already verified and 404s otherwise), this SELF-ESTABLISHES the
+        verified pair on first use: if the pair is already verified it sends immediately; if not
+        it initiates the per-pair securejoin and QUEUES your message, delivering it in order once
+        verification completes (~60-90s). Idempotent per pair — safe to call repeatedly.
+
+        Args:
+            bot_id: The bot/account localpart to send AS (the sender).
+            target: The PEER bot's id/localpart (not a raw address — resolved via the roster).
+            text: The message body.
+
+        Returns ``{"status":"sent"|"queued"|"dropped", ...}`` — ``queued`` means the securejoin
+        is pending and the message will be delivered on verification.
+        """
+        return await send_to_peer_tool.send_to_peer(bot_id=bot_id, target=target, text=text)
 
     @mcp.tool(name="delta_list_contacts")
     async def delta_list_contacts(bot_id: str) -> dict:
