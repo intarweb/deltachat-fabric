@@ -807,15 +807,18 @@ class DeltaChat2Backend:
 def extract_mentions(text: str, members: list[str]) -> list[str]:
     """Parse ``@localpart`` mentions from text, filtered to known member localparts.
 
-    Order-preserving, de-duped. Generic: knows no bot names — only what's in ``members``.
+    Order-preserving, de-duped, CASE-INSENSITIVE. ``@Mimir``/``@MIMIR``/``@mimir`` all
+    resolve to the same member and return its canonical localpart, so a capitalized
+    mention wakes the bot. Generic: knows no bot names — only what's in ``members``.
     """
     tokens = re.findall(r"@([A-Za-z0-9._-]+)", text or "")
-    member_set = set(members)
+    by_lower = {m.lower(): m for m in members}  # lowercased mention -> canonical localpart
     seen, out = set(), []
     for t in tokens:
-        if t in member_set and t not in seen:
-            seen.add(t)
-            out.append(t)
+        m = by_lower.get(t.lower())
+        if m is not None and m not in seen:
+            seen.add(m)
+            out.append(m)
     return out
 
 
