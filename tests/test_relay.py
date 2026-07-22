@@ -178,6 +178,14 @@ def test_extract_mentions_filters_to_members_and_dedupes():
     assert extract_mentions("no mentions here", ["bot-a"]) == []
 
 
+def test_extract_mentions_is_case_insensitive_and_returns_canonical():
+    # a capitalized mention must wake the bot; returns the canonical (roster) localpart
+    assert extract_mentions("ping @Mimir", ["mimir", "heimdall"]) == ["mimir"]
+    assert extract_mentions("@MIMIR @Heimdall", ["mimir", "heimdall"]) == ["mimir", "heimdall"]
+    # mixed-case dupes of the same bot collapse to one canonical entry
+    assert extract_mentions("@Bot-A @bot-a @BOT-A", ["bot-a"]) == ["bot-a"]
+
+
 # --------------------------------------------------------------------------- (1) /send
 
 
