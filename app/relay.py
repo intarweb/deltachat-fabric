@@ -1373,14 +1373,22 @@ class Relay:
         # (N× amplification in an N-member room). Key on (rfc724_mid, target) — the GLOBAL
         # message-id is identical across copies — and wake each target at most once per TTL.
         # Touched only from handle_inbound/handle_reaction on the single asyncio loop → no lock.
+        #
+        # RESERVE-then-commit (not seen-then-commit): the N member-account copies of one group
+        # message now run their handlers FIRE-AND-FORGET (main.py _event_pump), so they overlap on
+        # the loop and all N would clear a read-only 'seen' gate before ANY of them commits (commit
+        # only lands AFTER the awaited POST). Instead each handler atomically RESERVES the key with
+        # a sentinel timestamp BEFORE awaiting delivery: the check-and-set is a single synchronous
+        # step (no await), so exactly one copy wins the reservation and the rest collapse. A
+        # reservation is a live entry too, so a re-fetch within the TTL is still suppressed. On
+        # delivery FAILURE the reservation is RELEASED so a held-then-retry can wake again.
         self._wake_dedup: dict[tuple[str, str], float] = {}
         self._wake_dedup_ttl = 300.0
 
-    def _wake_seen(self, mid: str, target: str) -> bool:
-        """True if (mid, target) was already SUCCESSFULLY woken within TTL (so skip). Empty mid
-        → never suppress (fail-open). Read-only — does NOT record; recording happens on delivery
-        success via ``_wake_commit`` so a held-then-failed first attempt isn't wrongly treated as
-        'seen' (a real re-delivery within the TTL would otherwise be silently dropped)."""
+    def _wake_live(self, mid: str, target: str) -> bool:
+        """True if (mid, target) has a live entry within TTL — a committed wake OR an in-flight
+        reservation. Read-only; opportunistically prunes expired entries. Empty mid never suppress
+        (fail-open)."""
         if not mid:
             return False
         now = time.monotonic()
@@ -1389,14 +1397,32 @@ class Relay:
             for k, ts in list(cache.items()):
                 if now - ts >= self._wake_dedup_ttl:
                     del cache[k]
-        seen = cache.get((mid, target))
-        return seen is not None and (now - seen) < self._wake_dedup_ttl
+        ts = cache.get((mid, target))
+        return ts is not None and (now - ts) < self._wake_dedup_ttl
+
+    def _wake_reserve(self, mid: str, target: str) -> bool:
+        """Atomically claim the (mid, target) wake. Returns True iff THIS caller won (no live
+        entry) and should proceed to deliver; False if another copy already holds it (committed or
+        in-flight) — collapse. The check-and-set is synchronous (no await between the read and the
+        write) so, with the fire-and-forget handler fan-out, exactly one of the N concurrent copies
+        of a group message wins. Empty mid → always win (fail-open, never suppress)."""
+        if not mid:
+            return True
+        if self._wake_live(mid, target):
+            return False
+        self._wake_dedup[(mid, target)] = time.monotonic()
+        return True
+
+    def _wake_release(self, mid: str, target: str) -> None:
+        """Drop the reservation for (mid, target) after a FAILED (held) delivery so a genuine
+        re-delivery/retry within the TTL can wake again. No-op if the entry is gone."""
+        if mid:
+            self._wake_dedup.pop((mid, target), None)
 
     def _wake_commit(self, mid: str, target: str) -> None:
-        """Record (mid, target) as woken NOW — call only after delivery SUCCEEDED. Keyed on the
-        GLOBAL rfc724_mid so the N member-account copies of one group message collapse to one wake,
-        while a genuine re-delivery after a FAILED (held) attempt is NOT suppressed (it was never
-        committed)."""
+        """Record (mid, target) as woken NOW — call after delivery SUCCEEDED to refresh the
+        reservation into a committed wake. Keyed on the GLOBAL rfc724_mid so the N member-account
+        copies of one group message collapse to one wake."""
         if mid:
             self._wake_dedup[(mid, target)] = time.monotonic()
 
@@ -1574,9 +1600,9 @@ class Relay:
                 return []
             # Dedup the 1:1 wake too: a re-delivery/re-fetch of an already-DELIVERED DM (same
             # global rfc724_mid) must not re-wake the recipient. Group had this; the DM path didn't.
-            # Committed only on delivery success (below) so a held-then-failed first attempt does
-            # NOT suppress a genuine re-delivery.
-            if self._wake_seen(msg.rfc724_mid, own):
+            # RESERVE before delivery so overlapping copies collapse; RELEASE on failure so a
+            # held-then-retry still wakes.
+            if not self._wake_reserve(msg.rfc724_mid, own):
                 return []
             payload["direct"] = True
             payload["text"] = (
@@ -1589,6 +1615,7 @@ class Relay:
             if await self._deliver(own, payload):
                 self._wake_commit(msg.rfc724_mid, own)
                 return [own]
+            self._wake_release(msg.rfc724_mid, own)
             return []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)
@@ -1602,13 +1629,16 @@ class Relay:
         woken: list[str] = []
         for bot in targets:
             # Global dedup: the same group message hits every member account in this process;
-            # wake each target at most once (keyed on the global rfc724_mid). Committed only on
-            # delivery success so a held-then-failed attempt can still be re-driven.
-            if self._wake_seen(msg.rfc724_mid, bot):
+            # wake each target at most once (keyed on the global rfc724_mid). RESERVE atomically
+            # before delivery so the N overlapping fire-and-forget copies collapse to one POST;
+            # RELEASE on failure so a held-then-retry can still wake.
+            if not self._wake_reserve(msg.rfc724_mid, bot):
                 continue
             if await self._deliver(bot, payload):
                 self._wake_commit(msg.rfc724_mid, bot)
                 woken.append(bot)
+            else:
+                self._wake_release(msg.rfc724_mid, bot)
         return woken
 
     async def handle_reaction(self, r: InboundReaction) -> list[str]:
@@ -1632,8 +1662,8 @@ class Relay:
         # would collapse distinct reactions (different emoji / reactor) into one wake. Discriminate
         # them with emoji + reactor so each real reaction still wakes exactly once (per success).
         dedup_key = f"{r.rfc724_mid}:react:{r.emoji}:{reactor_local}"
-        if self._wake_seen(dedup_key, bot):
-            return []  # already woken for THIS reaction via another account's copy
+        if not self._wake_reserve(dedup_key, bot):
+            return []  # already woken (or in-flight) for THIS reaction via another account's copy
         who = r.from_addr or "someone"
         payload = {
             "chat_id": r.chat_id, "msg_id": r.msg_id, "reaction": r.emoji, "from": who,
@@ -1643,6 +1673,7 @@ class Relay:
         if await self._deliver(bot, payload):
             self._wake_commit(dedup_key, bot)
             return [bot]
+        self._wake_release(dedup_key, bot)
         return []
 
     async def _deliver(self, bot: str, payload: dict) -> bool:
