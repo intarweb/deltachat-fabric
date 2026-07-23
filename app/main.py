@@ -499,7 +499,21 @@ def _event_pump(backend, relay: Relay, loop: asyncio.AbstractEventLoop,
     uses ``asyncio.run_coroutine_threadsafe`` — the standard cross-thread → asyncio bridge.
     """
     def _default_submit(coro):
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
+        # FIRE-AND-FORGET: schedule the handler on the loop and return immediately. The old
+        # ``.result(timeout=30)`` BLOCKED this pump thread up to 30s per message on a slow
+        # directory/target — the pump only calls get_next_event again once submit returns, so a
+        # slow a2a target stalled the WHOLE fleet's inbound and, on timeout, the coroutine's result
+        # was dropped (wake never POSTed = silent loss). handle_inbound already holds+retries any
+        # undeliverable wake via the HoldQueue, so we don't need the pump thread to wait. A rejected
+        # schedule (loop closing) is logged, not raised.
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        def _log_err(f):
+            try:
+                f.result()
+            except Exception:
+                log.exception("inbound handler raised (scheduled fire-and-forget)")
+        fut.add_done_callback(_log_err)
+        return fut
 
     submit = _submit or _default_submit
     log.info("event pump thread started")
