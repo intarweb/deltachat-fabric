@@ -70,6 +70,31 @@ def _reply_hint(kind: str, own: str, chat_id: int) -> str:
             f"does NOT reach them on Delta.]")
 
 
+def _stable_task_id(bot_id: str, payload: dict) -> str:
+    """A deterministic, producer-owned a2a taskId for a wake — STABLE across re-deliveries.
+
+    The bridge dedup / has_unseen gate / hook seen-set all key on taskId; if it changes per
+    delivery (the bug — the bridge mints a random UUID when the relay omits it) dedup is defeated.
+    We derive it from the GLOBAL ``rfc724_mid`` (identical for every member-account copy of one
+    message AND across a Delta re-fetch), scoped by the target ``bot_id`` so the same message
+    woking two different bots stays two distinct identities. Fall back to (chat:msg) when the
+    rfc724_mid is unavailable (best-effort — ``_build_inbound`` swallows the lookup on error),
+    and return "" only when neither exists (caller then uses the random mid = old behavior, never
+    worse). Pure/side-effect-free so producer + any future consumer can recompute it."""
+    rid = str(payload.get("rfc724_mid") or "").strip()
+    # A reaction shares the reacted-to message's rfc724_mid, so a plain rid would collide across
+    # distinct reactions (different emoji / reactor) to the same message — dedup them apart with
+    # the emoji + reactor so each reaction is its own identity (mirrors holdqueue-key discipline).
+    react = str(payload.get("reaction") or "")
+    disc = f":react:{react}:{payload.get('from') or ''}" if react else ""
+    if rid:
+        return f"{bot_id}:{rid}{disc}"
+    chat_id, msg_id = payload.get("chat_id"), payload.get("msg_id")
+    if chat_id is not None and msg_id is not None:
+        return f"{bot_id}:{chat_id}:{msg_id}{disc}"
+    return ""
+
+
 def _reply_target(kind: str, own: str, chat_id: int) -> dict:
     """The STRUCTURED, machine-readable companion to ``_reply_hint`` — the same reply handle a
     consumer would otherwise have to parse out of the prose. ``kind`` ∈ {'dm','channel'}. Carries
@@ -840,6 +865,8 @@ class AgentDirectory:
         self.client = client
         self._name_to_url: dict[str, str] = {}   # cached bot-name(lower) → live a2a url
         self._refreshed_at: float = 0.0
+        self._refreshing: bool = False            # in-flight guard (thundering-herd)
+        self._last_refresh_ok: bool = True        # did the last refresh yield a usable directory?
         self._ttl = float(os.environ.get("A2A_DIRECTORY_TTL", "30"))
 
     async def _agent_name(self, entry: dict, agent_url: str) -> str:
@@ -861,39 +888,59 @@ class AgentDirectory:
     async def _refresh(self) -> None:
         """Rebuild the name→url map from the directory. Fetches agent cards CONCURRENTLY (the
         directory has dead entries — stale worktree bots — that must be skipped, not serialize
-        or fail resolve). On a duplicate name, prefer the entry with the freshest lastSeen."""
+        or fail resolve). On a duplicate name, prefer the entry with the freshest lastSeen.
+
+        Three robustness properties:
+          * IN-FLIGHT GUARD: concurrent resolve()s that all hit the TTL together do NOT each fire
+            a full refresh (N×N card GETs = directory thundering herd) — a single refresh runs.
+          * THROTTLE-ON-EMPTY: ``_refreshed_at`` advances even when the result is empty / the
+            directory GET failed, so an outage doesn't spin resolve()→_refresh() every call.
+          * MERGE-NOT-REPLACE: a bot whose card times out THIS pass keeps its previous URL instead
+            of vanishing from the map (which would hold+churn its wakes)."""
         url = self.config.a2a_directory_url
         if not url:
             return
+        if self._refreshing:
+            return  # another refresh is in-flight; don't pile on (thundering-herd guard)
+        self._refreshing = True
+        ok = False   # True iff the directory GET itself succeeded and returned a JSON list
         try:
-            resp = await self.client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            log.warning("a2a directory GET %s failed: %s", url, e)
-            return
-        entries = data.get("agents", data) if isinstance(data, dict) else data
-        if not isinstance(entries, list):
-            log.warning("a2a directory returned non-list (%s)", type(data).__name__)
-            return
-        valid = [e for e in entries if isinstance(e, dict) and e.get("url")]
-        names = await asyncio.gather(
-            *(self._agent_name(e, e["url"]) for e in valid), return_exceptions=True
-        )
-        mapping: dict[str, str] = {}
-        freshest: dict[str, str] = {}
-        for e, name in zip(valid, names):
-            if isinstance(name, BaseException) or not name:
-                continue
-            key = str(name).lower()
-            last_seen = str(e.get("lastSeen") or "")
-            if key in mapping and freshest.get(key, "") >= last_seen:
-                continue  # already have a fresher-or-equal entry for this name
-            mapping[key] = e["url"]
-            freshest[key] = last_seen
-        if mapping:
-            self._name_to_url = mapping
+            # Advance the timestamp up-front so even a failing/empty refresh throttles retries.
             self._refreshed_at = time.monotonic()
+            try:
+                resp = await self.client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                log.warning("a2a directory GET %s failed: %s", url, e)
+                return
+            entries = data.get("agents", data) if isinstance(data, dict) else data
+            if not isinstance(entries, list):
+                log.warning("a2a directory returned non-list (%s)", type(data).__name__)
+                return
+            ok = True  # the directory answered with a list — NOT an outage (even if empty)
+            valid = [e for e in entries if isinstance(e, dict) and e.get("url")]
+            names = await asyncio.gather(
+                *(self._agent_name(e, e["url"]) for e in valid), return_exceptions=True
+            )
+            # MERGE into the existing map: start from what we already know so a bot whose card
+            # fetch failed/timed-out this pass keeps its previous URL rather than being dropped.
+            mapping: dict[str, str] = dict(self._name_to_url)
+            freshest: dict[str, str] = {}
+            for e, name in zip(valid, names):
+                if isinstance(name, BaseException) or not name:
+                    continue
+                key = str(name).lower()
+                last_seen = str(e.get("lastSeen") or "")
+                if key in freshest and freshest.get(key, "") >= last_seen:
+                    continue  # already saw a fresher-or-equal entry for this name THIS pass
+                mapping[key] = e["url"]
+                freshest[key] = last_seen
+            if mapping:
+                self._name_to_url = mapping
+        finally:
+            self._refreshing = False
+            self._last_refresh_ok = ok
 
     async def resolve(self, bot_id: str) -> Optional[str]:
         """Return the live a2a URL for ``bot_id`` from the a2abridge directory, or None.
@@ -902,9 +949,22 @@ class AgentDirectory:
         build+cache a name→url map (TTL ``A2A_DIRECTORY_TTL``, default 30s) and refresh on a
         cache MISS so a newly-appeared bot resolves promptly. Logs the result — resolve()
         silently returning None (the old name-inline assumption) is exactly what pinned every
-        wake in the hold-queue."""
+        wake in the hold-queue.
+
+        THROTTLE: a miss also re-refreshes (a new bot should resolve promptly), BUT only if the
+        last refresh is older than a short MISS_MIN interval — otherwise a directory OUTAGE (every
+        lookup misses) would fire a refresh on EVERY resolve() = retry storm. _refresh advances
+        _refreshed_at even on empty/failure, so the miss path is bounded to ~one refresh per
+        MISS_MIN during an outage."""
         key = bot_id.lower()
-        if key not in self._name_to_url or (time.monotonic() - self._refreshed_at) > self._ttl:
+        age = time.monotonic() - self._refreshed_at
+        stale = age > self._ttl
+        miss = key not in self._name_to_url
+        miss_min = min(self._ttl, 5.0)
+        # A miss re-refreshes promptly IF the directory is healthy (last refresh returned agents) —
+        # a new bot should resolve fast. If the directory is DOWN (last refresh failed/empty), the
+        # miss path is throttled to ~one refresh per miss_min so an outage can't storm it.
+        if stale or (miss and (self._last_refresh_ok or age > miss_min)):
             await self._refresh()
         target = self._name_to_url.get(key)
         if target is None:
@@ -925,6 +985,16 @@ class AgentDirectory:
         """
         text = payload.get("text") or f"[Delta Chat] wake for {bot_id}"
         mid = uuid.uuid4().hex
+        # 🔴 STABLE, PRODUCER-OWNED taskId. Without it the bridge mints a fresh random UUID per
+        # delivery (store.AcceptInbound: taskID==""→a2a.NewID()), so the dedup digest
+        # (from∥taskId∥text) is unique per delivery and the hook's .delivered seen-set + the
+        # watcher's has_unseen gate can NEVER match a re-delivery/re-persist → duplicate injection
+        # AND the empty/phantom wake they exist to prevent still fire. We derive a deterministic id
+        # from the GLOBAL rfc724_mid (identical across every member-account copy + across a
+        # re-fetch/retry) so the identity is stable end-to-end; fall back to (chat:msg) then the
+        # random mid only when no stabler id exists. The bridge honors a non-empty msg.TaskID
+        # verbatim, and the hook/has_unseen digest keys on it — the three stay byte-identical.
+        task_id = _stable_task_id(bot_id, payload) or mid
         # Metadata a2abridge-lite reads off the message (msg.Metadata[...]):
         #   notification=True → lite TERMINALIZES the wake task at delivery (live fleet-wide,
         #     proven 2026-07-21) so there's no completable task to mis-manage. All wakes are
@@ -954,6 +1024,7 @@ class AgentDirectory:
             "jsonrpc": "2.0", "id": mid, "method": "message/send",
             "params": {"message": {
                 "role": "user", "messageId": mid, "kind": "message",
+                "taskId": task_id,
                 "parts": [{"kind": "text", "text": text}],
                 "metadata": meta,
             }},
@@ -982,9 +1053,11 @@ class HoldQueue:
     Survives a process reload because it's read back from disk on construction.
     """
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, ttl: float = 86400.0):
         self.path = Path(data_dir) / "hold_queue.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.ttl = ttl   # age-out (wall-clock seconds); a wake for a departed/renamed bot is
+                         # retried every 5s forever otherwise (PeerMesh has a TTL; this didn't).
         self._items: list[dict] = self._read()
 
     def _read(self) -> list[dict]:
@@ -996,24 +1069,53 @@ class HoldQueue:
         return []
 
     def _flush(self) -> None:
-        tmp = self.path.with_suffix(".json.tmp")
+        # path.name + ".tmp" (not with_suffix(".json.tmp"), which only works for a
+        # single-dotted name) — consistent multi-dot-safe atomic-temp idiom.
+        tmp = self.path.parent / (self.path.name + ".tmp")
         tmp.write_text(json.dumps(self._items))
         tmp.replace(self.path)  # atomic
 
     @staticmethod
     def _key(item: dict) -> tuple:
-        return (item.get("bot_id"), item.get("chat_id"), item.get("msg_id"))
+        # Idempotency key. Includes rfc724_mid (globally-unique — survives an accounts-DB wipe
+        # that reuses local (chat_id,msg_id)) plus an event discriminator (reaction emoji + reactor)
+        # so a held reaction and a held message for the same (bot,chat,msg) do NOT collide (the old
+        # 3-tuple silently dropped the second), and two different reactions to one message stay
+        # distinct. Falls back to (chat_id,msg_id) when rfc724_mid is absent (legacy/mesh-direct).
+        return (
+            item.get("bot_id"),
+            item.get("chat_id"),
+            item.get("msg_id"),
+            item.get("rfc724_mid") or "",
+            item.get("reaction") or "",
+            item.get("from") or "" if item.get("reaction") else "",
+        )
 
     def add(self, bot_id: str, payload: dict) -> None:
-        """Persist a pending wake for ``bot_id``. Idempotent on (bot_id,chat_id,msg_id)."""
-        item = {"bot_id": bot_id, **payload}
+        """Persist a pending wake for ``bot_id``. Idempotent on the event key (see _key)."""
+        item = {"bot_id": bot_id, "_hq_ts": time.time(), **payload}
         k = self._key(item)
         if any(self._key(existing) == k for existing in self._items):
             return
         self._items.append(item)
         self._flush()
 
+    def _prune_expired(self) -> bool:
+        """Drop items older than TTL (LOUDLY). Returns True if anything was dropped."""
+        if not self.ttl:
+            return False
+        now = time.time()
+        kept = [i for i in self._items if (now - float(i.get("_hq_ts") or 0)) < self.ttl]
+        dropped = len(self._items) - len(kept)
+        if dropped:
+            log.warning("hold-queue: AGED OUT %d undeliverable wake(s) past %.0fs TTL "
+                        "(target bot likely departed/renamed)", dropped, self.ttl)
+            self._items = kept
+            self._flush()
+        return dropped > 0
+
     def pending(self) -> list[dict]:
+        self._prune_expired()
         return list(self._items)
 
     def remove(self, item: dict) -> None:
@@ -1274,23 +1376,29 @@ class Relay:
         self._wake_dedup: dict[tuple[str, str], float] = {}
         self._wake_dedup_ttl = 300.0
 
-    def _wake_once(self, mid: str, target: str) -> bool:
-        """True if (mid, target) should wake now (records it); False if already woken within TTL.
-        Empty mid (shouldn't happen) → fail-open (always wake), never suppress on missing id."""
+    def _wake_seen(self, mid: str, target: str) -> bool:
+        """True if (mid, target) was already SUCCESSFULLY woken within TTL (so skip). Empty mid
+        → never suppress (fail-open). Read-only — does NOT record; recording happens on delivery
+        success via ``_wake_commit`` so a held-then-failed first attempt isn't wrongly treated as
+        'seen' (a real re-delivery within the TTL would otherwise be silently dropped)."""
         if not mid:
-            return True
+            return False
         now = time.monotonic()
         cache = self._wake_dedup
         if len(cache) > 4096:  # opportunistic prune of expired entries
             for k, ts in list(cache.items()):
                 if now - ts >= self._wake_dedup_ttl:
                     del cache[k]
-        key = (mid, target)
-        seen = cache.get(key)
-        if seen is not None and (now - seen) < self._wake_dedup_ttl:
-            return False
-        cache[key] = now
-        return True
+        seen = cache.get((mid, target))
+        return seen is not None and (now - seen) < self._wake_dedup_ttl
+
+    def _wake_commit(self, mid: str, target: str) -> None:
+        """Record (mid, target) as woken NOW — call only after delivery SUCCEEDED. Keyed on the
+        GLOBAL rfc724_mid so the N member-account copies of one group message collapse to one wake,
+        while a genuine re-delivery after a FAILED (held) attempt is NOT suppressed (it was never
+        committed)."""
+        if mid:
+            self._wake_dedup[(mid, target)] = time.monotonic()
 
     # -- outbound (/send) --------------------------------------------------
     def send(self, bot: str, target: int, text: str) -> dict:
@@ -1430,7 +1538,7 @@ class Relay:
         else, including an unresolved sender). Drives the wake's metadata.sender_kind so a
         consumer's hook can prioritize a real person over peer-bot chatter. Roster membership is
         the deterministic fleet signal — humans (Justin/Elene/external) are never in the roster."""
-        if localpart and any(localpart == b.localpart for b in self.config.roster):
+        if localpart and any(localpart.lower() == b.localpart.lower() for b in self.config.roster):
             return "bot"
         return "human"
 
@@ -1442,6 +1550,7 @@ class Relay:
         sees direct messages, not just group traffic. Undeliverable targets are held.
         """
         payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
+                   "rfc724_mid": msg.rfc724_mid,
                    "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id),
                    "reply_target": _reply_target("channel", "", msg.chat_id)}
         # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
@@ -1463,9 +1572,11 @@ class Relay:
         if not msg.is_group:
             if not own:
                 return []
-            # Dedup the 1:1 wake too: a re-delivery/re-fetch of an already-handled DM (same global
-            # rfc724_mid) must not re-wake the recipient. Group had this; the DM path didn't.
-            if not self._wake_once(msg.rfc724_mid, own):
+            # Dedup the 1:1 wake too: a re-delivery/re-fetch of an already-DELIVERED DM (same
+            # global rfc724_mid) must not re-wake the recipient. Group had this; the DM path didn't.
+            # Committed only on delivery success (below) so a held-then-failed first attempt does
+            # NOT suppress a genuine re-delivery.
+            if self._wake_seen(msg.rfc724_mid, own):
                 return []
             payload["direct"] = True
             payload["text"] = (
@@ -1475,20 +1586,28 @@ class Relay:
             # Override the channel-default reply_target with the DM handle now that ``own`` (the
             # account to reply AS) is known — mirrors the text hint above, parse-free.
             payload["reply_target"] = _reply_target("dm", own, msg.chat_id)
-            return [own] if await self._deliver(own, payload) else []
+            if await self._deliver(own, payload):
+                self._wake_commit(msg.rfc724_mid, own)
+                return [own]
+            return []
         main = self._channel_main(msg.members)
         targets = wake_targets(msg.mentioned, msg.members, main)
         # Sender-exclusion: never wake the bot that SENT the message (covers the leader posting
         # untagged → main==sender, and self-@mention) — regardless of which account surfaced it.
+        # Compare on canonical (lowercased) localparts so a differently-cased member/sender list
+        # can't slip a self-wake past this filter (extract_mentions is already case-insensitive).
         if msg.from_localpart:
-            targets = [t for t in targets if t != msg.from_localpart]
+            _from_lc = msg.from_localpart.lower()
+            targets = [t for t in targets if t.lower() != _from_lc]
         woken: list[str] = []
         for bot in targets:
             # Global dedup: the same group message hits every member account in this process;
-            # wake each target at most once (keyed on the global rfc724_mid).
-            if not self._wake_once(msg.rfc724_mid, bot):
+            # wake each target at most once (keyed on the global rfc724_mid). Committed only on
+            # delivery success so a held-then-failed attempt can still be re-driven.
+            if self._wake_seen(msg.rfc724_mid, bot):
                 continue
             if await self._deliver(bot, payload):
+                self._wake_commit(msg.rfc724_mid, bot)
                 woken.append(bot)
         return woken
 
@@ -1504,14 +1623,27 @@ class Relay:
             return []
         if not r.own_message:
             return []  # not the author's account — the author's copy handles it
-        if not self._wake_once(r.rfc724_mid, bot):
-            return []  # already woken for this reaction via another account's copy
+        # Reactor self-exclusion: a bot reacting to its OWN message (e.g. the 👀 proof-of-life it
+        # just sent) must not self-wake / feedback-loop. Compare canonical localparts.
+        reactor_local = (r.from_addr or "").split("@", 1)[0].lower()
+        if reactor_local and reactor_local == bot.lower():
+            return []
+        # Dedup key: reactions to the SAME message share its rfc724_mid, so a bare rfc724_mid key
+        # would collapse distinct reactions (different emoji / reactor) into one wake. Discriminate
+        # them with emoji + reactor so each real reaction still wakes exactly once (per success).
+        dedup_key = f"{r.rfc724_mid}:react:{r.emoji}:{reactor_local}"
+        if self._wake_seen(dedup_key, bot):
+            return []  # already woken for THIS reaction via another account's copy
         who = r.from_addr or "someone"
         payload = {
             "chat_id": r.chat_id, "msg_id": r.msg_id, "reaction": r.emoji, "from": who,
+            "rfc724_mid": r.rfc724_mid,
             "text": f"[{who} reacted {r.emoji} on msg {r.msg_id} via Delta Chat]",
         }
-        return [bot] if await self._deliver(bot, payload) else []
+        if await self._deliver(bot, payload):
+            self._wake_commit(dedup_key, bot)
+            return [bot]
+        return []
 
     async def _deliver(self, bot: str, payload: dict) -> bool:
         """Resolve ``bot``'s live url + POST the wake; hold it on any failure."""
@@ -1526,7 +1658,7 @@ class Relay:
         delivered = 0
         for item in self.hold.pending():
             bot = item["bot_id"]
-            payload = {k: v for k, v in item.items() if k != "bot_id"}
+            payload = {k: v for k, v in item.items() if k not in ("bot_id", "_hq_ts")}
             agent_url = await self.directory.resolve(bot)
             if agent_url and await self.directory.wake(agent_url, bot, payload):
                 self.hold.remove(item)
