@@ -158,10 +158,11 @@ async def test_concurrent_member_copies_collapse_to_one_wake(tmp_path):
     the copies genuinely interleave — the plain MockTransport completes POSTs without a suspension
     point and would mask the race even in the broken design."""
     members = ["bot-lead", "bot-a", "bot-b"]
-    # No @mention → wake only the channel main (bot-lead); every member-account copy sees the same
-    # message and would independently wake bot-lead.
-    msg = InboundMessage(account_id=0, chat_id=11, msg_id=16, text="team status?",
-                         is_group=True, members=members, mentioned=[],
+    # @mention bot-lead → wake only the mentioned bot (bot-lead); every member-account copy sees
+    # the same message and would independently wake bot-lead. (Untagged traffic wakes nobody now,
+    # so we use a mention to exercise the wake-dedup race.)
+    msg = InboundMessage(account_id=0, chat_id=11, msg_id=16, text="@bot-lead team status?",
+                         is_group=True, members=members, mentioned=["bot-lead"],
                          from_localpart="terafin", rfc724_mid="<group@chatmail>")
     backend = FakeBackend(accounts={"bot-lead": 1, "bot-a": 2, "bot-b": 3})
     wakes: list[dict] = []
