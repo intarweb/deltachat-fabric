@@ -9,14 +9,17 @@ def test_mention_filters_non_members_and_dedupes():
     assert wake_targets(["bot-a", "bot-a", "bot-c"], ["bot-a", "bot-b"], "bot-b") == ["bot-a"]
 
 
-def test_no_mention_wakes_only_channel_main():
-    assert wake_targets([], ["bot-a", "bot-b", "bot-lead"], "bot-lead") == ["bot-lead"]
+def test_no_mention_wakes_nobody():
+    # untagged channel traffic wakes NOBODY — not even the channel main (realm lead).
+    # Only @mentions + 1:1 DMs wake. FAILS on pristine main (which returned [main]).
+    assert wake_targets([], ["bot-a", "bot-b", "bot-lead"], "bot-lead") == []
 
 
 def test_no_mention_never_wakes_all():
     # the anti-thundering-herd guarantee: unaddressed msg must NOT fan out to everyone
+    # (and now wakes nobody at all)
     out = wake_targets([], ["a", "b", "c", "d"], "a")
-    assert out == ["a"]
+    assert out == []
     assert len(out) < 4
 
 
@@ -31,5 +34,5 @@ def test_wake_targets_case_insensitive_returns_canonical():
     # `m in members` set-membership dropped a capitalized mention = silent deafness.
     assert wake_targets(["Bot-A"], ["bot-a", "bot-b"], "bot-b") == ["bot-a"]
     assert wake_targets(["BOT-A", "bot-b"], ["bot-a", "bot-b"], None) == ["bot-a", "bot-b"]
-    # channel_main matched case-insensitively too
-    assert wake_targets([], ["bot-a", "bot-lead"], "Bot-Lead") == ["bot-lead"]
+    # untagged wakes nobody regardless of channel_main casing
+    assert wake_targets([], ["bot-a", "bot-lead"], "Bot-Lead") == []
