@@ -286,8 +286,9 @@ async def test_inbound_group_mention_wakes_right_bot_via_resolved_url(tmp_path):
     assert len(relay.hold) == 0                     # delivered → nothing held
 
 
-async def test_inbound_no_mention_wakes_only_channel_main(tmp_path):
-    # unaddressed group msg → wake ONLY the realm lead (bot-lead), never all (anti-herd)
+async def test_inbound_no_mention_wakes_nobody(tmp_path):
+    # unaddressed group msg → wake NOBODY (untagged channel traffic never wakes;
+    # only @mentions + 1:1 DMs wake). The realm lead is no longer woken on untagged traffic.
     msg = InboundMessage(
         account_id=7, chat_id=555, msg_id=100, text="just chatter",
         is_group=True, members=["bot-lead", "bot-a", "bot-b"], mentioned=[],
@@ -299,9 +300,8 @@ async def test_inbound_no_mention_wakes_only_channel_main(tmp_path):
 
     woken = await relay.handle_inbound(msg)
 
-    assert woken == ["bot-lead"]
-    assert [w["url"] for w in wakes] == ["http://bot-lead.live:7780"]
-    assert all(w["method"] == "message/send" for w in wakes)
+    assert woken == []
+    assert wakes == []
 
 
 async def test_inbound_direct_1to1_wakes_receiving_bot(tmp_path):
