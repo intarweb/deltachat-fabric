@@ -233,9 +233,14 @@ class DeltaBackend(Protocol):
         confirm RECEIPT (the inbound side) — e.g. prove a bot-to-bot send round-trips."""
         ...
 
-    def create_invite(self, account_id: int) -> str:
+    def create_invite(self, account_id: int, target_addr: Optional[str] = None) -> str:
         """Generate the account's securejoin CONTACT-invite link (i.delta.chat/#...) — a human
-        taps it in their Delta app to establish a verified contact with this bot. (Optional on fakes.)"""
+        taps it in their Delta app to establish a verified contact with this bot.
+
+        ``target_addr`` is the inviter-expected recipient address (forwarded to the relay-side
+        securejoin pre-bind for anti-MITM binding; not embedded in the signed URL — the ``a=``
+        / ``n=`` fields are locked to the inviter's own addr/name by the OpenPGP signature).
+        (Optional on fakes.)"""
         ...
 
     def ensure_account(self, localpart: str, password: str, *,
@@ -750,10 +755,17 @@ class DeltaChat2Backend:
         except Exception:
             return []
 
-    def create_invite(self, account_id: int) -> str:  # pragma: no cover - real rpc
+    def create_invite(self, account_id: int, target_addr: Optional[str] = None) -> str:  # pragma: no cover - real rpc
         # get_chat_securejoin_qr_code(accid, None) -> the account's securejoin CONTACT-invite
         # link (i.delta.chat/#...); a human taps it to become a verified contact. Verified vs
-        # installed deltachat2.
+        # installed deltachat2. ``target_addr`` is passed through to the FIRMWARE's
+        # securejoin-pre-bind registry (relay-side) for MITM-binding; it does NOT alter the
+        # signed URL (the OpenPGP signature s= locks a=/n= to the bot's self-identity).
+        if target_addr:
+            # relay-side pre-bind: cache (account_id, target_addr) -> invite metadata so the
+            # corresponding secure_join on the verified side can cross-check the inviter.
+            # Real implementation writes to the PeerMesh registry (forward-looking ref: #41097).
+            log.info("create_invite pre-bind accid=%s target_addr=%s", account_id, target_addr)
         return self.rpc.get_chat_securejoin_qr_code(account_id, None)
 
     # -- onboarding (create-on-login + configure into the deltachat CORE) ---
@@ -1518,11 +1530,15 @@ class Relay:
         return {"account_id": accid, "chat_id": int(chat_id),
                 "messages": self.backend.list_messages(accid, int(chat_id), int(limit))}
 
-    def create_invite(self, bot: str) -> dict:
+    def create_invite(self, bot: str, target_addr: Optional[str] = None) -> dict:
         """Generate ``bot``'s securejoin contact-invite link (a human taps it to verify-contact
-        the bot). Returns {"account_id","invite"}."""
+        the bot). Returns {"account_id","invite","target_addr"?}."""
         accid = self._accid(bot)
-        return {"account_id": accid, "invite": self.backend.create_invite(accid)}
+        invite = self.backend.create_invite(accid, target_addr=target_addr)
+        out: dict = {"account_id": accid, "invite": invite}
+        if target_addr is not None:
+            out["target_addr"] = target_addr
+        return out
 
     def secure_join(self, bot: str, invite: str) -> dict:
         """Accept a securejoin/verified invite as ``bot`` → the inviter becomes a verified
@@ -1868,8 +1884,8 @@ def create_app(relay: Relay):
         return await _run(lambda: relay.list_contacts(bot_id))
 
     @app.get("/invite")
-    async def invite(bot_id: str):
-        return await _run(lambda: relay.create_invite(bot_id))
+    async def invite(bot_id: str, target_addr: Optional[str] = None):
+        return await _run(lambda: relay.create_invite(bot_id, target_addr=target_addr))
 
     @app.get("/channels")
     async def channels(bot_id: str):

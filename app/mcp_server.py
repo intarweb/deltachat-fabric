@@ -301,7 +301,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         return await messages_tool.messages(bot_id=bot_id, chat_id=chat_id, limit=limit)
 
     @mcp.tool(name="delta_create_invite")
-    async def delta_create_invite(bot_id: str) -> dict:
+    async def delta_create_invite(bot_id: str, target_addr: Optional[str] = None) -> dict:
         """Generate a bot's securejoin CONTACT-invite link for a human to tap.
 
         Returns an ``i.delta.chat/#...`` link the person opens in their Delta Chat app to
@@ -311,10 +311,14 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
 
         Args:
             bot_id: The bot/account localpart to generate the invite FOR.
+            target_addr: Optional inviter-expected recipient address (forwarded to the relay
+                for securejoin pre-bind; not embedded in the signed URL itself — the URL's
+                ``a=`` / ``n=`` fields are locked to the bot's self-identity by the OpenPGP
+                signature ``s=``).
 
-        Returns ``{"account_id":int,"invite":"https://i.delta.chat/#..."}``.
+        Returns ``{"account_id":int,"invite":"https://i.delta.chat/#...","target_addr":...}``.
         """
-        return await invite_tool.create_invite(bot_id=bot_id)
+        return await invite_tool.create_invite(bot_id=bot_id, target_addr=target_addr)
 
     @mcp.tool(name="delta_delete_chat")
     async def delta_delete_chat(bot_id: str, chat_id: int) -> dict:
