@@ -98,8 +98,8 @@ class FakeBackend:
         msgs = getattr(self, "_messages", {}).get((account_id, chat_id), [])
         return list(msgs)[-limit:]
 
-    def create_invite(self, account_id: int) -> str:
-        self.invites.append(account_id)
+    def create_invite(self, account_id: int, target_addr: Optional[str] = None) -> str:
+        self.invites.append((account_id, target_addr))
         return f"https://i.delta.chat/#FAKEINVITE-acc{account_id}"
 
     def create_channel(self, account_id: int, name: str, members: list[str]) -> int:
