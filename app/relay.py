@@ -23,6 +23,7 @@ whole engine is unit-testable with no live rpc-server and no live network:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -131,6 +132,12 @@ class InboundMessage:
     from_id: int = 0
     from_localpart: str = ""   # sender's localpart (resolved) — for sender-exclusion from wakes
     rfc724_mid: str = ""       # GLOBAL message-id (same across every member account) — wake dedup key
+    # Device/self-talk chats + system/info messages are NEVER human DMs: they must not wake a bot,
+    # must not be labeled "(person)", and must never emit a reply_target (a device-chat id is an
+    # unsendable handle — the core refuses with "the chat is a device chat"). Classified in
+    # _build_inbound from BasicChat.is_device_chat/is_self_talk and Message.is_info/from_id.
+    is_device_chat: bool = False   # account's own device-sync chat (login/update notices, sender=DEVICE)
+    is_system: bool = False        # core system/info message (not a human-authored DM)
 
 
 @dataclass
@@ -347,12 +354,52 @@ class DeltaChat2Backend:
         return accid
 
     # -- send --------------------------------------------------------------
-    def send(self, account_id: int, chat_id: int, text: str) -> int:  # pragma: no cover
-        # deltachat2's message-data type is MessageData (NOT MsgData — verified vs the
-        # installed package; send_msg(accid, chat_id, MessageData) -> int).
+    def send(self, account_id: int, target: int, text: str) -> int:  # pragma: no cover
+        """Send ``text`` from ``account_id`` to ``target`` (a chat id OR contact id).
+
+        ``target`` is disambiguated: a live chat id is used as-is (device/self-talk chats are
+        refused with a typed error — the core's bare "the chat is a device chat" / "Query
+        returned no rows" are opaque at the MCP layer); otherwise the id is treated as a
+        CONTACT id and resolved to (or creates) the 1:1 chat — the same resolution
+        ``send_to_addr`` uses, which is why delta_send_to works where delta_send to a contact
+        id with no existing thread fails. deltachat2's message-data type is MessageData (NOT
+        MsgData — verified vs the installed package; send_msg(accid, chat_id, MessageData) -> int).
+        """
         from deltachat2 import MessageData  # type: ignore
 
+        chat_id = self._resolve_chat_id(account_id, target)
         return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+
+    def _resolve_chat_id(self, account_id: int, target: int) -> int:  # pragma: no cover
+        """Resolve a send ``target`` to a sendable chat id (chat id OR contact id in → chat out).
+
+        - target is a live chat → use it, but REFUSE device/self-talk chats (unsendable — the
+          core refuses with an opaque error string; converting here to a typed error so the
+          caller gets an actionable message instead of a 502).
+        - target is not a chat → treat it as a CONTACT id and resolve to the 1:1 chat, creating
+          it if none exists (mirror of ``send_to_addr``). This makes the delta_send "chat id or
+          contact id" promise true instead of a trap.
+        """
+        try:
+            info = self.rpc.get_basic_chat_info(account_id, target)
+            if getattr(info, "is_device_chat", False) or getattr(info, "is_self_talk", False):
+                raise TypeError(
+                    f"target {target} is a device/self-talk chat — not sendable; "
+                    f"message the person with delta_send_to by email address instead")
+            if getattr(info, "chat_id", 0) == target:
+                return target
+        except TypeError:
+            raise
+        except Exception:
+            pass  # not a live chat → contact path below
+
+        # Not a chat → contact id. get_chat_id_by_contact_id returns None when no 1:1 chat
+        # exists (verified vs installed deltachat2); create_chat_by_contact_id is idempotent
+        # (returns the existing or newly-created 1:1 chat — the send_to_addr precedent).
+        chat_id = self.rpc.get_chat_id_by_contact_id(account_id, target)
+        if not chat_id:
+            chat_id = self.rpc.create_chat_by_contact_id(account_id, target)
+        return chat_id
 
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
         """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
@@ -628,11 +675,20 @@ class DeltaChat2Backend:
             rfc724_mid = getattr(info, "rfc724_mid", "") or ""
         except Exception:
             pass
+        # Device/self-talk chats (account's own sync channels — login/update notices) and
+        # system/info messages (core-generated, sender=SpecialContactId.DEVICE=5) are NEVER human
+        # DMs. Classify here so handle_inbound suppresses the wake entirely — killing the poison
+        # reply_target (device-chat ids are unsendable) and the random-taskId re-wake loop for
+        # id-less notices at the source. BasicChat.is_device_chat is the canonical signal; the
+        # from_id==DEVICE fallback covers a core variant that doesn't flag the chat.
+        is_device_chat = bool(getattr(chat, "is_device_chat", False)) or bool(getattr(chat, "is_self_talk", False))
+        is_system = bool(getattr(msg, "is_info", False)) or (from_id == 5)  # SpecialContactId.DEVICE
         return InboundMessage(
             account_id=accid, chat_id=chat_id, msg_id=msg_id, text=text,
             is_group=is_group, members=members,
             mentioned=extract_mentions(text, members),
             from_id=from_id, from_localpart=from_localpart, rfc724_mid=rfc724_mid,
+            is_device_chat=is_device_chat, is_system=is_system,
         )
 
     # -- contacts / channels ----------------------------------------------
@@ -996,17 +1052,21 @@ class AgentDirectory:
         text part — matching the proven single-bot pattern. True iff the request was accepted (2xx).
         """
         text = payload.get("text") or f"[Delta Chat] wake for {bot_id}"
-        mid = uuid.uuid4().hex
         # 🔴 STABLE, PRODUCER-OWNED taskId. Without it the bridge mints a fresh random UUID per
         # delivery (store.AcceptInbound: taskID==""→a2a.NewID()), so the dedup digest
         # (from∥taskId∥text) is unique per delivery and the hook's .delivered seen-set + the
         # watcher's has_unseen gate can NEVER match a re-delivery/re-persist → duplicate injection
         # AND the empty/phantom wake they exist to prevent still fire. We derive a deterministic id
         # from the GLOBAL rfc724_mid (identical across every member-account copy + across a
-        # re-fetch/retry) so the identity is stable end-to-end; fall back to (chat:msg) then the
-        # random mid only when no stabler id exists. The bridge honors a non-empty msg.TaskID
-        # verbatim, and the hook/has_unseen digest keys on it — the three stay byte-identical.
-        task_id = _stable_task_id(bot_id, payload) or mid
+        # re-fetch/retry); fall back to (chat:msg); and ONLY when neither exists, a CONTENT-ADDRESSED
+        # id (sha256 of bot+text+from+reaction) — NEVER a random uuid, which would defeat dedup for
+        # exactly the id-less wakes that matter. The bridge honors a non-empty msg.TaskID verbatim,
+        # and the hook/has_unseen digest keys on it — the three stay byte-identical.
+        task_id = _stable_task_id(bot_id, payload)
+        if not task_id:
+            task_id = "%s:content:%s" % (bot_id, hashlib.sha256(
+                ("\x1f".join([bot_id, str(text), str(payload.get("from") or ""),
+                              str(payload.get("reaction") or "")])).encode()).hexdigest()[:16])
         # Metadata a2abridge-lite reads off the message (msg.Metadata[...]):
         #   notification=True → lite TERMINALIZES the wake task at delivery (live fleet-wide,
         #     proven 2026-07-21) so there's no completable task to mis-manage. All wakes are
@@ -1033,9 +1093,13 @@ class AgentDirectory:
         if reply_target:
             meta["reply_target"] = reply_target
         envelope = {
-            "jsonrpc": "2.0", "id": mid, "method": "message/send",
+            # Transport request id — unique per POST (correlation, NOT message identity).
+            "jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": "message/send",
             "params": {"message": {
-                "role": "user", "messageId": mid, "kind": "message",
+                # messageId = the STABLE producer-owned id (== task_id). The bridge preserves a
+                # non-empty messageId verbatim, so the dedup identity is stable across retries —
+                # never a fresh per-delivery uuid.
+                "role": "user", "messageId": task_id, "kind": "message",
                 "taskId": task_id,
                 "parts": [{"kind": "text", "text": text}],
                 "metadata": meta,
@@ -1364,6 +1428,75 @@ class PeerMesh:
 # Relay engine — ties backend + directory + hold-queue together.
 # ---------------------------------------------------------------------------
 
+class Outbox:
+    """Durable per-bot OUTBOUND send queue (JSON on the local data dir).
+
+    A send that fails with a TRANSIENT error (chatmail/SMTP/RPC down) is persisted here
+    and retried by the drain loop instead of being dropped at the 502 boundary. Mirrors
+    HoldQueue's atomic JSON-on-DATA_DIR pattern. At-least-once: an entry is
+    removed only AFTER a successful send, so a crash between send-success and remove
+    can duplicate (rare, bounded) but never silently loses. Permanent failures
+    (device chat, no such contact) are raised by the caller and never enter the queue.
+
+    Entry shape: {"key", "kind"("chat"|"addr"), "bot", "target"(chat-id|addr),
+    "text", "queued_at", "attempts", "last_error"}.
+    """
+
+    def __init__(self, data_dir: str, ttl: float = 3600.0, max_attempts: int = 40):
+        self.path = Path(data_dir) / "outbox.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.ttl = ttl                      # wall-clock age-out (drop loudly, don't retry forever)
+        self.max_attempts = max_attempts    # ~40×5s ≈ 3.3 min of retries before giving up loudly
+        self._items: list[dict] = self._read()
+
+    def _read(self) -> list[dict]:
+        if self.path.exists():
+            try:
+                return json.loads(self.path.read_text()) or []
+            except Exception:
+                return []
+        return []
+
+    def _flush(self) -> None:
+        tmp = self.path.parent / (self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self._items))
+        tmp.replace(self.path)  # atomic
+
+    def enqueue(self, entry: dict) -> str:
+        """Persist an unsent message; returns its stable key (used to remove on success)."""
+        key = entry.setdefault("key", uuid.uuid4().hex)
+        entry.setdefault("queued_at", time.time())
+        entry.setdefault("attempts", 0)
+        # Idempotent: an identical (kind,bot,target,text) entry already queued is not duplicated.
+        if not any(i.get("key") == key or (
+            i.get("kind") == entry.get("kind") and i.get("bot") == entry.get("bot")
+            and i.get("target") == entry.get("target") and i.get("text") == entry.get("text"))
+            for i in self._items):
+            self._items.append(entry)
+            self._flush()
+        return key
+
+    def remove(self, key: str) -> None:
+        self._items = [i for i in self._items if i.get("key") != key]
+        self._flush()
+
+    def pending(self) -> list[dict]:
+        return list(self._items)
+
+    def age_out(self, now: float | None = None) -> None:
+        """Drop entries past TTL or max_attempts — LOUDLY (they're the caller's lost messages)."""
+        now = now if now is not None else time.time()
+        kept: list[dict] = []
+        for i in self._items:
+            if now - float(i.get("queued_at", now)) > self.ttl or int(i.get("attempts", 0)) >= self.max_attempts:
+                log.error("outbox: DROPPING undelivered message after retries (%s): bot=%s kind=%s target=%r last_error=%r",
+                          i.get("key"), i.get("bot"), i.get("kind"), i.get("target"), i.get("last_error"))
+                continue
+            kept.append(i)
+        if len(kept) != len(self._items):
+            self._items = kept
+            self._flush()
+
 
 class Relay:
     """The engine. Owns the send path, the inbound wake path, and the hold-queue drain.
@@ -1372,11 +1505,17 @@ class Relay:
     """
 
     def __init__(self, config: Config, backend: DeltaBackend, directory: AgentDirectory,
-                 hold_queue: HoldQueue, peer_mesh: "Optional[PeerMesh]" = None):
+                 hold_queue: HoldQueue, peer_mesh: "Optional[PeerMesh]" = None,
+                 outbox: "Optional[Outbox]" = None):
         self.config = config
         self.backend = backend
         self.directory = directory
         self.hold = hold_queue
+        # Durable OUTBOUND queue: a transient send failure persists here (retried by the drain
+        # loop) instead of being dropped at the 502 boundary. Injected (tests) or lazily
+        # constructed on first use so a test that never exercises a failed send doesn't touch
+        # the filesystem.
+        self.outbox = outbox
         # LAZY peer↔peer securejoin mesh (queue-until-verified) for bot↔bot 1:1 sends.
         # Additive: does NOT touch send/send_to_addr/securejoin_star/the All-Hands group.
         self.peer_mesh = peer_mesh or PeerMesh(config, backend)
@@ -1442,24 +1581,83 @@ class Relay:
     def send(self, bot: str, target: int, text: str) -> dict:
         """Send ``text`` from bot ``bot`` (id or localpart) into chat/contact ``target``.
 
-        Returns {"status","msg_id","account_id"}. Raises KeyError if the bot has no account.
-        """
+        Returns {"status","msg_id","account_id"} — or {"status":"queued",...} when a transient
+        transport failure parks the message in the durable outbox for retry (never dropped).
+        Raises KeyError if the bot has no account; TypeError for an unsendable device/self-talk
+        chat (map to a clear error, not an opaque core string)."""
         accid = self.backend.account_id_for(bot)
         if accid is None:
             raise KeyError(f"no delta account for bot {bot!r}")
-        msg_id = self.backend.send(accid, int(target), text)
-        return {"status": "sent", "msg_id": msg_id, "account_id": accid}
+        try:
+            msg_id = self.backend.send(accid, int(target), text)
+            return {"status": "sent", "msg_id": msg_id, "account_id": accid}
+        except (KeyError, TypeError):
+            raise
+        except Exception as e:
+            return self._park(bot, "chat", int(target), text, e, accid)
 
     def send_to_addr(self, bot: str, addr: str, text: str) -> dict:
         """Send ``text`` from ``bot`` to the HUMAN at email ``addr`` (resolves their 1:1 chat).
 
-        Returns {"status","account_id","chat_id","msg_id"}. Raises KeyError if the bot has no
-        account or no contact resolves for ``addr`` (map to 404 at the endpoint)."""
+        Returns {"status","account_id","chat_id","msg_id"} — or {"status":"queued",...} when a
+        transient transport failure parks the message in the durable outbox. Raises KeyError if
+        the bot has no account or no contact resolves for ``addr`` (map to 404 at the endpoint)."""
         accid = self.backend.account_id_for(bot)
         if accid is None:
             raise KeyError(f"no delta account for bot {bot!r}")
-        chat_id, msg_id = self.backend.send_to_addr(accid, addr, text)
-        return {"status": "sent", "account_id": accid, "chat_id": chat_id, "msg_id": msg_id}
+        try:
+            chat_id, msg_id = self.backend.send_to_addr(accid, addr, text)
+            return {"status": "sent", "account_id": accid, "chat_id": chat_id, "msg_id": msg_id}
+        except KeyError:
+            raise
+        except Exception as e:
+            return self._park(bot, "addr", addr, text, e, accid)
+
+    def _park(self, bot: str, kind: str, target, text: str, err: Exception, accid: int) -> dict:
+        """Persist an undeliverable send to the durable outbox; report status:queued."""
+        key = self._get_outbox().enqueue({
+            "kind": kind, "bot": bot, "target": target, "text": text,
+            "last_error": str(err), "attempts": 0,
+        })
+        log.warning("outbox: parked unsent message %s (bot=%s kind=%s target=%r): %s",
+                    key, bot, kind, target, err)
+        return {"status": "queued", "account_id": accid, "key": key}
+
+    def _get_outbox(self) -> Outbox:
+        if self.outbox is None:
+            self.outbox = Outbox(os.environ.get("DATA_DIR", "/data"))
+        return self.outbox
+
+    def drain_outbox(self) -> int:
+        """Retry the durable outbox; returns the number of messages still pending.
+
+        Success removes the entry; a permanent error (no account/contact, unsendable target)
+        drops it loudly; a transient error keeps it (attempts++) for the next drain. Backend rpc
+        is blocking — callers run this OFF the event loop (asyncio.to_thread / /drain)."""
+        outbox = self._get_outbox()
+        for item in outbox.pending():
+            key = item["key"]
+            accid = self.backend.account_id_for(item["bot"])
+            if accid is None:
+                log.error("outbox: dropping %s — no account for bot %r (permanent)", key, item["bot"])
+                outbox.remove(key)
+                continue
+            try:
+                if item["kind"] == "addr":
+                    self.backend.send_to_addr(accid, item["target"], item["text"])
+                else:
+                    self.backend.send(accid, int(item["target"]), item["text"])
+            except (KeyError, TypeError) as e:
+                log.error("outbox: dropping %s — permanent (%s): %s", key, type(e).__name__, e)
+                outbox.remove(key)
+            except Exception as e:
+                item["attempts"] = int(item.get("attempts", 0)) + 1
+                item["last_error"] = str(e)
+                log.warning("outbox: retry %s failed (%s) — stays queued", key, e)
+            else:
+                outbox.remove(key)
+        outbox.age_out()
+        return len(outbox.pending())
 
     def send_to_peer(self, sender_bot: str, target_bot: str, text: str) -> dict:
         """Send ``text`` from ``sender_bot`` to a ROSTER peer ``target_bot`` over the LAZY
@@ -1591,6 +1789,16 @@ class Relay:
         1:1 (non-group, e.g. a human DM) → wake the RECEIVING bot (the account owner) so it
         sees direct messages, not just group traffic. Undeliverable targets are held.
         """
+        # Device-chat / system notices are never human DMs: suppress the wake entirely (no
+        # payload, no reply_target, no taskId). The poison device-chat reply handle AND the
+        # random-taskId re-wake loop for id-less notices both originate here — suppressing at
+        # the source removes both. Log for diagnosability (a suppressed login/update notice
+        # must be traceable, not invisible).
+        if msg.is_device_chat or msg.is_system:
+            log.info("inbound suppressed (device/system — never a human DM): accid=%s chat=%s msg=%s from_id=%s device=%s system=%s",
+                     msg.account_id, msg.chat_id, msg.msg_id, msg.from_id,
+                     msg.is_device_chat, msg.is_system)
+            return []
         payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
                    "rfc724_mid": msg.rfc724_mid,
                    "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id),
@@ -1848,8 +2056,11 @@ def create_app(relay: Relay):
 
     @app.get("/healthz")
     async def healthz():
+        # healthz is READ-ONLY — never construct the outbox here (no /data side effect for a
+        # health probe); report 0 until a send failure actually parks something.
         return {"status": "ok", "held": len(relay.hold),
-                "peer_queued": relay.peer_mesh.pending_count()}
+                "peer_queued": relay.peer_mesh.pending_count(),
+                "outbox": len(relay.outbox.pending()) if relay.outbox is not None else 0}
 
     @app.post("/send", response_model=SendResponse)
     async def send(req: SendRequest) -> SendResponse:
@@ -1864,7 +2075,8 @@ def create_app(relay: Relay):
 
     @app.post("/drain")
     async def drain():
-        return {"drained": await relay.drain_holds(), "held": len(relay.hold)}
+        return {"drained": await relay.drain_holds(), "held": len(relay.hold),
+                "outbox": await asyncio.to_thread(relay.drain_outbox)}
 
     # -- contacts / channels (mirror /send: 404 on unknown bot, 502 on backend error) --
     async def _run(fn):

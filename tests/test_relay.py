@@ -18,6 +18,7 @@ from app.relay import (
     AgentDirectory,
     HoldQueue,
     InboundMessage,
+    Outbox,
     Relay,
     create_app,
     extract_mentions,
@@ -160,14 +161,15 @@ def directory_transport(agents: list[dict], wake_sink: list[dict], *,
 
 def make_relay(backend: FakeBackend, agents: list[dict], wake_sink: list[dict],
                tmp_path, *, directory_status: int = 200,
-               config: Optional[Config] = None) -> Relay:
+               config: Optional[Config] = None,
+               outbox: Optional[Outbox] = None) -> Relay:
     config = config or make_config()
     client = httpx.AsyncClient(
         transport=directory_transport(agents, wake_sink, directory_status=directory_status)
     )
     directory = AgentDirectory(config, client)
     hold = HoldQueue(str(tmp_path))
-    return Relay(config, backend, directory, hold)
+    return Relay(config, backend, directory, hold, outbox=outbox)
 
 
 # --------------------------------------------------------------------------- extract_mentions

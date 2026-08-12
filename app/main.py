@@ -547,12 +547,17 @@ def _event_pump(backend, relay: Relay, loop: asyncio.AbstractEventLoop,
 
 async def drain_loop(relay: Relay, interval: float = 5.0,
                      *, _should_stop: Optional[Callable[[], bool]] = None) -> None:  # pragma: no cover - loop
-    """Periodically retry undeliverable wakes parked in the hold-queue (async, loop-safe)."""
+    """Periodically retry undeliverable wakes (hold-queue) AND outbound sends (outbox)."""
     while not (_should_stop and _should_stop()):
         try:
             await relay.drain_holds()
         except Exception:
             log.exception("hold-drain failed")
+        try:
+            # backend rpc is blocking → run the outbox drain off the loop.
+            await asyncio.to_thread(relay.drain_outbox)
+        except Exception:
+            log.exception("outbox-drain failed")
         await asyncio.sleep(interval)
 
 
