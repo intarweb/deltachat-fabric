@@ -208,15 +208,26 @@ class DeltaMessagesTool(_RelayTool):
 class DeltaCreateInviteTool(_RelayTool):
     """``delta_create_invite`` — generate a bot's securejoin CONTACT-invite link.
 
-    Returns ``{account_id, invite}`` where ``invite`` is an ``i.delta.chat/#...`` link a HUMAN
-    taps in their Delta app to become a verified contact of the bot — then the bot can message
-    them. This is the human-onboarding mechanism (the inverse of delta_secure_join).
+    Returns ``{account_id, invite, target_addr?}`` where ``invite`` is an ``i.delta.chat/#...``
+    link a HUMAN taps in their Delta app to become a verified contact of the bot — then the
+    bot can message them. This is the human-onboarding mechanism (the inverse of delta_secure_join).
+
+    Optional ``target_addr`` is a hint for the relay-side securejoin pre-bind (stdout of the
+    acknowledged inviter → expected recipient pair). Forwarded to the relay; the URL itself
+    is the bot's signed contact-invite (per ``get_chat_securejoin_qr_code`` — the ``a=`` /
+    ``n=`` fields are bound to the inviter's own addr/name, never rewritten post-hoc, since
+    they are covered by the OpenPGP signature ``s=``). Pair this with the future
+    securejoin-pre-bind registry (Vikunja #41097 / #41098) to bind the invite to a known
+    recipient for anti-MITM coverage.
     """
 
     name = "delta_create_invite"
 
-    async def create_invite(self, bot_id: str) -> dict:
-        return await self._get("/invite", {"bot_id": bot_id}, self.name)
+    async def create_invite(self, bot_id: str, target_addr: Optional[str] = None) -> dict:
+        params: dict = {"bot_id": bot_id}
+        if target_addr is not None:
+            params["target_addr"] = target_addr
+        return await self._get("/invite", params, self.name)
 
 
 class DeltaDeleteChatTool(_RelayTool):

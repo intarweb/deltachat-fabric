@@ -131,10 +131,15 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
 
         Args:
             bot_id: The bot/account localpart to send AS.
-            target: The Delta chat id (a 1:1 or group chat) or contact id to send TO.
+            target: A Delta chat id (a 1:1 or group chat) OR a contact id. A contact id is
+                resolved to its 1:1 chat (creating it if none exists), so messaging a contact
+                with no existing thread now works. Device/self-talk chats are refused with a
+                clear error — use delta_send_to with the person's address for those.
             text: The message body.
 
-        Returns the relay result, e.g. ``{"status":"sent","msg_id":int,"account_id":int}``.
+        Returns the relay result, e.g. ``{"status":"sent","msg_id":int,"account_id":int}``
+        (or ``{"status":"queued",...}`` when the relay's outbox holds it for a transient
+        transport failure — it will retry rather than drop).
         """
         return await send_tool.send(bot_id=bot_id, target=target, text=text)
 
@@ -301,7 +306,7 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
         return await messages_tool.messages(bot_id=bot_id, chat_id=chat_id, limit=limit)
 
     @mcp.tool(name="delta_create_invite")
-    async def delta_create_invite(bot_id: str) -> dict:
+    async def delta_create_invite(bot_id: str, target_addr: Optional[str] = None) -> dict:
         """Generate a bot's securejoin CONTACT-invite link for a human to tap.
 
         Returns an ``i.delta.chat/#...`` link the person opens in their Delta Chat app to
@@ -311,10 +316,14 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
 
         Args:
             bot_id: The bot/account localpart to generate the invite FOR.
+            target_addr: Optional inviter-expected recipient address (forwarded to the relay
+                for securejoin pre-bind; not embedded in the signed URL itself — the URL's
+                ``a=`` / ``n=`` fields are locked to the bot's self-identity by the OpenPGP
+                signature ``s=``).
 
-        Returns ``{"account_id":int,"invite":"https://i.delta.chat/#..."}``.
+        Returns ``{"account_id":int,"invite":"https://i.delta.chat/#...","target_addr":...}``.
         """
-        return await invite_tool.create_invite(bot_id=bot_id)
+        return await invite_tool.create_invite(bot_id=bot_id, target_addr=target_addr)
 
     @mcp.tool(name="delta_delete_chat")
     async def delta_delete_chat(bot_id: str, chat_id: int) -> dict:

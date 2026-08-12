@@ -43,7 +43,7 @@ def test_send_to_unverified_peer_initiates_securejoin_and_enqueues():
     assert res["queued"] == 1
     assert res["target_addr"] == f"bot-b@{DOMAIN}"
     # securejoin was initiated: sender minted an invite, target accepted it
-    assert backend.invites == [7]
+    assert backend.invites == [(7, None)]
     assert getattr(backend, "securejoined", []) == [(9, "https://i.delta.chat/#FAKEINVITE-acc7")]
     # message NOT yet sent (queued only)
     assert backend.sent_to == []
@@ -56,7 +56,7 @@ def test_second_send_same_pair_does_not_reinitiate_securejoin():
     mesh.send_to_peer("bot-a", "bot-b", "two")
 
     # only ONE securejoin handshake for the pair (idempotent in-flight), both messages queued
-    assert backend.invites == [7]
+    assert backend.invites == [(7, None)]
     assert len(getattr(backend, "securejoined", [])) == 1
     assert mesh.pending_count() == 2
     assert backend.sent_to == []

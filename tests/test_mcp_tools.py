@@ -295,6 +295,23 @@ async def test_delta_create_invite_gets_contract_and_returns_result():
     assert result["invite"] == "https://i.delta.chat/#X"
 
 
+async def test_delta_create_invite_with_target_addr_passes_through():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json={
+            "account_id": 1,
+            "invite": "https://i.delta.chat/#X",
+            "target_addr": "bob@example.org",
+        })
+
+    tool = make_tool(handler, DeltaCreateInviteTool)
+    result = await tool.create_invite(bot_id="bot-a", target_addr="bob@example.org")
+    assert "target_addr=bob%40example.org" in captured["url"] or "target_addr=bob@example.org" in captured["url"]
+    assert result["target_addr"] == "bob@example.org"
+
+
 async def test_delta_delete_chat_posts_contract_and_returns_result():
     captured: dict = {}
 
