@@ -1,0 +1,8 @@
+name: probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    uses: intarweb/fork-ci/.github/workflows/echo.yml@main
