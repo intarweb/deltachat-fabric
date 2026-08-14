@@ -1,7 +1,7 @@
 # Canonical intarweb build workflow — the ONLY workflow a repo needs to produce
 # ghcr.io/intarweb/<repo>:latest. No logic here: everything (fork sync, PR
 # folding, fingerprint/no-op, build) lives in the shared workflow it calls.
-# This file is identical in every repo by construction — fork-ci's build step
+# This file is identical in every repo by construction — operations' build step
 # re-asserts this exact copy onto a fork's mirror main after every sync.
 #
 #   FORK:       main is synced to the upstream default branch; every open
