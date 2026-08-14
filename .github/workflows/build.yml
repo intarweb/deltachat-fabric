@@ -8,6 +8,8 @@
 #               intarweb→upstream PR is folded into the built image. Rebuilds
 #               when our PRs update or upstream moves (see schedule).
 #   GREENFIELD: every push to the default branch builds :latest.
+# Shared logic: intarweb/operations/.github/workflows/build.yml (public repo —
+# reusable workflows resolve + unlimited Actions minutes).
 
 name: build
 
@@ -23,5 +25,5 @@ permissions:
 
 jobs:
   publish:
-    uses: intarweb/fork-ci/.github/workflows/build.yml@main
+    uses: intarweb/operations/.github/workflows/build.yml@main
     secrets: inherit
