@@ -1,5 +1,4 @@
 # Delta Chat Fabric — dependencies (baked at BUILD time, never runtime-pip).
-# Exact versions are frozen by the GHCR CI lockfile (maintainer's image lane).
 deltachat2>=1.0
 deltachat-rpc-server>=1.147
 deltachat-rpc-client>=1.147
@@ -8,4 +7,4 @@ uvicorn[standard]>=0.27.0
 httpx>=0.27.0
 pydantic>=2.6.0
 pyyaml>=6.0
-mcp>=1.28   # bifrost-facing MCP server (FastMCP, streamable-HTTP /mcp); CI lockfile pins exact
+mcp>=2.0.0   # bifrost-facing MCP server (MCPServer, streamable-HTTP /mcp) — 2.0 removed mcp.server.fastmcp
