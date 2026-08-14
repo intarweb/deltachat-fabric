@@ -2,7 +2,7 @@
 
 NO live network: the relay HTTP layer is mocked via httpx.MockTransport, injected by
 patching httpx.AsyncClient (which _RelayTool constructs when no client is passed). We
-assert (1) build_mcp registers exactly the 7 tools with the right names + clean schema,
+assert (1) build_mcp registers exactly the 13 tools with the right names + clean schema,
 (2) each tool delegates to the relay contract (right method/path/body), and (3) the app
 exposes /mcp.
 """
@@ -88,7 +88,7 @@ async def test_tools_have_clean_schema_for_tools_list():
     for name, args in expected_args.items():
         t = tools[name]
         assert t.description, f"{name} missing description"
-        props = set(t.inputSchema.get("properties", {}).keys())
+        props = set(t.input_schema.get("properties", {}).keys())
         assert props == args, f"{name} schema props {props} != {args}"
 
 
@@ -96,12 +96,8 @@ async def test_tools_have_clean_schema_for_tools_list():
 
 
 def _result_text(res):
-    # FastMCP.call_tool returns (content_blocks, structured) or a content list depending
-    # on version; normalize to the structured dict.
-    if isinstance(res, tuple):
-        return res[1]
-    # content-block list
-    return json.loads(res[0].text)
+    # mcp>=2.0 call_tool returns CallToolResult; the structured dict is content[0].text.
+    return json.loads(res.content[0].text)
 
 
 async def test_delta_send_delegates_to_relay(relay_recorder):

@@ -12,18 +12,16 @@ that flow straight through to the relay contract. The tool docstrings + type hin
 schema an MCP client's ``tools/list`` discovers.
 
 Transport / endpoint (what an MCP client connects to):
-  - path      ``/mcp``   (FastMCP's default ``streamable_http_path``)
+  - path      ``/mcp``   (``streamable_http_path`` default)
   - transport ``streamable-http`` (stateless_http=True — no per-session server state)
   - auth      NONE at this endpoint — access is Virtual-Key-gated upstream at the MCP gateway.
 
 Usage:
-  ``build_mcp(relay_url)`` -> a configured ``FastMCP`` with the delta tools registered.
-  ``build_mcp_app(relay_url)`` -> the Starlette ASGI app (``streamable_http_app()``), which
-  ALSO wires ``session_manager.run()` into its own lifespan — so it can be served directly
-  by uvicorn with no extra lifespan plumbing. Mount it into another ASGI app via
-  ``Mount("/mcp", app=...)`` only if you additionally run ``mcp.session_manager.run()`` in
-  the host app's lifespan (see FastMCP docs); serving it standalone is simpler and is what
-  ``app.main`` does.
+  ``build_mcp(relay_url)`` -> a configured ``MCPServer`` (mcp>=2.0) with the delta tools
+  registered.
+  ``build_mcp_app(relay_url)`` -> the self-contained Starlette ASGI app
+  (``streamable_http_app(stateless_http=True, transport_security=...)``) — safe to hand
+  straight to uvicorn with no extra lifespan plumbing, which is what ``app.main`` does.
 
 Standalone entrypoint (handy for a dedicated container / Dockerfile):
   ``python -m app.mcp_server`` -> ``mcp.run(transport="streamable-http")`` bound to
@@ -34,7 +32,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .mcp_tools import (
     DeltaAddMemberTool,
@@ -99,16 +97,17 @@ def _transport_security():
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
-    """Build the ``FastMCP`` with the 13 delta tools registered.
+def build_mcp(relay_url: Optional[str] = None) -> MCPServer:
+    """Build the ``MCPServer`` (mcp>=2.0) with the 13 delta tools registered.
 
     ``relay_url`` is injected into every underlying relay client (falls back to the
-    ``RELAY_URL`` env / in-container loopback via ``_RelayTool``). The server is
-    ``stateless_http`` so each request is self-contained (no sticky session), which is what
-    an MCP gateway's connect-and-list-tools flow wants. ``transport_security`` accepts the
-    deployed Host (see ``_transport_security``) so an in-cluster gateway can reach it by name.
+    ``RELAY_URL`` env / in-container loopback via ``_RelayTool``). The server is served
+    ``stateless_http`` (see ``build_mcp_app``) so each request is self-contained (no sticky
+    session), which is what an MCP gateway's connect-and-list-tools flow wants.
+    ``transport_security`` accepts the deployed Host (see ``_transport_security``) so an
+    in-cluster gateway can reach it by name.
     """
-    mcp = FastMCP("deltachat", stateless_http=True, transport_security=_transport_security())
+    mcp = MCPServer("deltachat")
 
     # One relay client per operation, all pointed at the same injected relay_url.
     send_tool = DeltaSendTool(relay_url=relay_url)
@@ -348,10 +347,14 @@ def build_mcp(relay_url: Optional[str] = None) -> FastMCP:
 def build_mcp_app(relay_url: Optional[str] = None):
     """Return the streamable-HTTP Starlette ASGI app (serves ``/mcp``).
 
-    The returned app already wires ``session_manager.run()`` into its own lifespan, so it is
-    safe to hand straight to uvicorn (no extra lifespan plumbing needed).
+    ``stateless_http`` keeps each request self-contained (no sticky session) and
+    ``transport_security`` accepts the deployed Host (see ``_transport_security``) — both
+    moved from the FastMCP constructor to the app call in mcp>=2.0. The returned app is
+    self-contained, so it is safe to hand straight to uvicorn (no extra lifespan plumbing).
     """
-    return build_mcp(relay_url).streamable_http_app()
+    return build_mcp(relay_url).streamable_http_app(
+        stateless_http=True, transport_security=_transport_security()
+    )
 
 
 def main() -> None:  # pragma: no cover - process entry
@@ -361,9 +364,13 @@ def main() -> None:  # pragma: no cover - process entry
     ``DELTA_MCP_PORT`` (default 8000), ``RELAY_URL`` (relay base, via mcp_tools default).
     """
     mcp = build_mcp(os.environ.get("RELAY_URL"))
-    mcp.settings.host = os.environ.get("DELTA_MCP_HOST", "0.0.0.0")
-    mcp.settings.port = int(os.environ.get("DELTA_MCP_PORT", "8000"))
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("DELTA_MCP_HOST", "0.0.0.0"),
+        port=int(os.environ.get("DELTA_MCP_PORT", "8000")),
+        stateless_http=True,
+        transport_security=_transport_security(),
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
