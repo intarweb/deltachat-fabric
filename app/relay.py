@@ -2070,12 +2070,6 @@ class SendRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class SendResponse(BaseModel):
-    status: str
-    msg_id: int
-    account_id: int
-
-
 # The new operations reuse the same bot_id/localpart alias convention as SendRequest.
 _BOT_ALIAS = AliasChoices("bot_id", "localpart")
 
@@ -2181,12 +2175,14 @@ def create_app(relay: Relay):
                 "peer_queued": relay.peer_mesh.pending_count(),
                 "outbox": len(relay.outbox.pending()) if relay.outbox is not None else 0}
 
-    @app.post("/send", response_model=SendResponse)
-    async def send(req: SendRequest) -> SendResponse:
-        # relay.send → sync (blocking) deltachat rpc; run it OFF the event loop.
+    @app.post("/send")
+    async def send(req: SendRequest):
+        # relay.send → sync (blocking) deltachat rpc; run it OFF the event loop. The result is
+        # returned VERBATIM (no response_model): a transient failure legitimately returns
+        # {"status":"queued", "key":...} with NO msg_id, and forcing that through SendResponse
+        # (required msg_id) 502'd the very path that exists to NOT drop the message.
         try:
-            result = await asyncio.to_thread(relay.send, req.bot_id, req.target, req.text)
-            return SendResponse(**result)
+            return await asyncio.to_thread(relay.send, req.bot_id, req.target, req.text)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except Exception as e:  # pragma: no cover - backend send failure

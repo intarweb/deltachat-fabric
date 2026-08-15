@@ -258,6 +258,28 @@ def test_send_http_endpoint_contract(tmp_path):
     assert miss.status_code == 404
 
 
+# A TRANSIENT send failure must surface as status=queued (200, no msg_id — the relay parked it
+# in the durable outbox for retry), NOT a 502. Before the fix /send forced the result through a
+# response_model that required msg_id, so the queued path (which exists to NOT drop a message)
+# 502'd and the caller couldn't tell "parked for retry" from "failed".
+def test_send_endpoint_returns_queued_on_transient_failure(tmp_path):
+    class _Flaky(FakeBackend):
+        def send(self, account_id, chat_id, text):
+            raise RuntimeError("chatmail transport down (transient)")
+
+    backend = _Flaky(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+    client = TestClient(create_app(relay))
+
+    resp = client.post("/send", json={"bot_id": "bot-a", "target": 42, "text": "hi"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert "key" in body and body["account_id"] == 7     # durable outbox handle, no msg_id
+    assert relay.outbox.pending()                        # the message is parked, not dropped
+
+
 def test_send_to_addr_resolves_and_returns_chat_and_msg(tmp_path):
     backend = FakeBackend(accounts={"bot-a": 7})
     relay = make_relay(backend, [], [], tmp_path)
