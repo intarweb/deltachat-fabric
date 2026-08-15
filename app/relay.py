@@ -1711,8 +1711,11 @@ class Relay:
         Returns {"status","msg_id","account_id"} on delivery — or {"status":"queued",...} when a
         transient transport failure parks the message in the durable outbox for retry (never
         dropped). 🔴 QUEUED ≠ DELIVERED: the result carries the outbox ``key`` — poll
-        GET /outbox/<key>: terminal="delivered" = sent, terminal="dropped" = gave up loudly
-        (last_error), no terminal = still retrying. Never report a queued result upstream as sent.
+        GET /outbox/<key> (observable contract: 200 + terminal="delivered" = sent; 200 +
+        terminal="dropped" = gave up loudly, last_error; 200 + no terminal field = still
+        retrying; 404 = never existed or tombstone aged out). Poll within 24h; a bare 404 is
+        indeterminate, never success — never report a queued result upstream as sent unless a
+        poll shows terminal="delivered".
         Raises KeyError if the bot has no account; TypeError for an unsendable device/self-talk
         chat (map to a clear error, not an opaque core string)."""
         accid = self.backend.account_id_for(bot)
@@ -2270,13 +2273,17 @@ def create_app(relay: Relay):
     @app.get("/outbox/{key}")
     async def outbox_status(key: str):
         """Poll a PARKED send by its ``key`` (from a ``{"status":"queued","key":...}`` result).
-        CONCLUSIVE terminal state — never an ambiguous absence:
-          * 200 + ``terminal:"delivered"`` → sent (message is in the peer's chat).
-          * 200 + ``terminal:"dropped"``   → gave up LOUDLY after retries (see ``last_error``).
-          * 200 + no ``terminal``          → still retrying (``attempts`` / ``last_error``).
-          * 404                            → never existed, or the tombstone aged out (rare).
-        🔴 Never report a queued result upstream as sent unless you poll and see
-        terminal:"delivered"."""
+
+        Conclusive in OBSERVABLE terms (status code + field presence) — never an ambiguous
+        absence. A caller reads exactly one of:
+          * 200 + body has ``terminal:"delivered"`` → SENT (message is in the peer's chat).
+          * 200 + body has ``terminal:"dropped"``   → gave up LOUDLY after retries (last_error).
+          * 200 + body has NO ``terminal`` field   → still retrying (attempts / last_error).
+          * 404                                    → never existed, or the tombstone aged out.
+        🔴 A queued result must never be reported upstream as sent unless a poll shows
+        terminal:"delivered". A bare 404 is NOT a success signal — it is indeterminate; poll
+        within the tombstone window (24h) and let absence be absence, never inferred success.
+        """
         if relay.outbox is None:
             # nothing has ever been parked (healthz discipline: don't construct /data on a poll)
             raise HTTPException(status_code=404,
