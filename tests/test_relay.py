@@ -280,6 +280,44 @@ def test_send_endpoint_returns_queued_on_transient_failure(tmp_path):
     assert relay.outbox.pending()                        # the message is parked, not dropped
 
 
+# The queued CONTRACT (Volund's ask): queued ≠ delivered, and a bot must be able to resolve the
+# outbox handle to a terminal outcome. GET /outbox/<key> reports the parked entry (attempts,
+# last_error) while retrying; 404 once TERMINAL — removed on delivery OR dropped loudly after
+# retries. A 404 must never be read as "sent" (that's why the endpoint says so in its detail).
+def test_outbox_status_endpoint_reports_pending_then_terminal(tmp_path):
+    class _Flaky(FakeBackend):
+        def __init__(self, accounts):
+            super().__init__(accounts)
+            self.healthy = False
+
+        def send(self, account_id, chat_id, text):
+            if not self.healthy:
+                raise RuntimeError("chatmail transport down (transient)")
+            return super().send(account_id, chat_id, text)
+
+    backend = _Flaky(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+    client = TestClient(create_app(relay))
+
+    queued = client.post("/send", json={"bot_id": "bot-a", "target": 42, "text": "hi"})
+    assert queued.status_code == 200
+    key = queued.json()["key"]
+
+    # While still retrying: 200 + the parked entry, terminal-outcome NOT yet reached.
+    pending = client.get(f"/outbox/{key}")
+    assert pending.status_code == 200
+    body = pending.json()
+    assert body["key"] == key and body["bot"] == "bot-a" and body["target"] == 42
+    assert body["attempts"] == 0 and body["last_error"]
+
+    # Delivered → entry removed → the same key is now terminal (404, never "sent").
+    backend.healthy = True
+    relay.drain_outbox()
+    assert client.get(f"/outbox/{key}").status_code == 404
+    # A key that never existed is 404 too (and with NO outbox ever constructed, no /data side effect).
+    assert client.get("/outbox/never-a-key").status_code == 404
+
+
 def test_send_to_addr_resolves_and_returns_chat_and_msg(tmp_path):
     backend = FakeBackend(accounts={"bot-a": 7})
     relay = make_relay(backend, [], [], tmp_path)

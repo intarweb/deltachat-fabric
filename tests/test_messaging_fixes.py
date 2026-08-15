@@ -322,6 +322,41 @@ def test_backend_send_to_addr_prefers_verified_key_contact():
     assert chat_id == 33            # resolved via the verified key-contact (13), not the stale one
 
 
+def test_backend_send_to_addr_refuses_ambiguous_unverified_matches():
+    """No verified key-contact + MULTIPLE unverified contacts sharing the address is a
+    wrong-recipient door — refuse-and-say-which, never silently pick 'the last one'."""
+    backend, rpc = _backend_with_rpc()
+    addr = "dupe@chatmail.siliconspirit.net"
+    rpc.contacts.update({5, 6})
+    rpc.address_contacts[addr] = [
+        _BasicContact(5, addr, is_key_contact=False, is_verified=False),
+        _BasicContact(6, addr, is_key_contact=False, is_verified=False),
+    ]
+
+    with pytest.raises(KeyError, match="ambiguous address"):
+        backend.send_to_addr(1, addr, "hi")
+
+    assert rpc.sent == []           # nothing hit the core — no guess between duplicates
+
+
+def test_backend_send_to_addr_sends_single_unverified_match():
+    """A SINGLE unverified match is unambiguous → send (no refusal regression for the normal
+    one-contact-per-address fleet state; only the multi-match ambiguous case refuses)."""
+    backend, rpc = _backend_with_rpc()
+    addr = "solo@chatmail.siliconspirit.net"
+    rpc.contacts.add(5)
+    rpc.address_contacts[addr] = [
+        _BasicContact(5, addr, is_key_contact=False, is_verified=False),
+    ]
+    rpc.contact_chats[5] = 33
+    rpc.chats[33] = _BasicChat(33)
+
+    chat_id, msg_id = backend.send_to_addr(1, addr, "hi")
+
+    assert chat_id == 33 and msg_id > 0
+    assert rpc.sent == [(1, 33, "")]
+
+
 # --------------------------------------------------------------------------- F3: durable outbox
 
 
