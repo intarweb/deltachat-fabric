@@ -49,7 +49,10 @@ class FakeBackend:
     def __init__(self, accounts: dict[str, int], inbound: Optional[list[InboundMessage]] = None,
                  contacts: Optional[dict[int, list[dict]]] = None,
                  channels: Optional[dict[int, list[dict]]] = None,
-                 verified: Optional[set[tuple[int, str]]] = None):
+                 verified: Optional[set[tuple[int, str]]] = None,
+                 known_chats: Optional[dict[int, set[int]]] = None,
+                 device_chats: Optional[set[int]] = None,
+                 contact_ids: Optional[dict[int, set[int]]] = None):
         self._accounts = accounts                 # localpart -> account_id
         self._inbox = list(inbound or [])
         self.sent: list[tuple[int, int, str]] = []
@@ -65,6 +68,13 @@ class FakeBackend:
         self._verified: set[tuple[int, str]] = set(verified or ())
         self.invites: list[int] = []              # account_ids we minted a securejoin invite for
         self.sent_to: list[tuple[int, str, str]] = []  # (account_id, addr, text) via send_to_addr
+        # STRICT send-path namespaces (fleet-messaging #16): when provided, send_chat /
+        # send_contact enforce them (device chat / unknown chat / unknown contact → typed
+        # error, NO cross-namespace reinterpretation). Absent (None) = permissive legacy
+        # behavior, so pre-existing tests that never exercise the strict paths stay green.
+        self._known_chats = known_chats           # account_id -> set of live chat ids
+        self._device_chats = device_chats or set()
+        self._contact_ids = contact_ids           # account_id -> set of contact ids
 
     def account_id_for(self, localpart: str) -> Optional[int]:
         return self._accounts.get(localpart)
@@ -76,6 +86,27 @@ class FakeBackend:
         return None
 
     def send(self, account_id: int, chat_id: int, text: str) -> int:
+        self._next_msg_id += 1
+        self.sent.append((account_id, chat_id, text))
+        return self._next_msg_id
+
+    def send_chat(self, account_id: int, chat_id: int, text: str) -> int:
+        """STRICT chat-only send: a CHAT id, never a contact. Device/self-talk → TypeError;
+        an id not in ``known_chats`` → KeyError (no contact fallback)."""
+        if chat_id in self._device_chats:
+            raise TypeError(f"chat_id {chat_id} is a device/self-talk chat — not sendable")
+        if self._known_chats is not None and chat_id not in self._known_chats.get(account_id, set()):
+            raise KeyError(
+                f"no such chat {chat_id} for this account (chat-only send — not a contact id)")
+        self._next_msg_id += 1
+        self.sent.append((account_id, chat_id, text))
+        return self._next_msg_id
+
+    def send_contact(self, account_id: int, contact_id: int, text: str) -> int:
+        """STRICT contact-only send: a CONTACT id, never a chat. Unknown contact → KeyError."""
+        if self._contact_ids is not None and contact_id not in self._contact_ids.get(account_id, set()):
+            raise KeyError(f"no contact id {contact_id} for this account")
+        chat_id = 1000 + contact_id
         self._next_msg_id += 1
         self.sent.append((account_id, chat_id, text))
         return self._next_msg_id
@@ -258,6 +289,72 @@ def test_send_to_endpoint_contract(tmp_path):
 
     miss = client.post("/send_to", json={"bot_id": "nobody", "addr": "p@example.com", "text": "x"})
     assert miss.status_code == 404
+
+
+def test_send_chat_routes_and_returns_status(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7}, known_chats={7: {42}})
+    relay = make_relay(backend, [], [], tmp_path)
+
+    result = relay.send_chat("bot-a", 42, "hi")
+
+    assert result == {"status": "sent", "msg_id": result["msg_id"], "account_id": 7, "chat_id": 42}
+    assert backend.sent == [(7, 42, "hi")]
+
+
+def test_send_contact_resolves_and_returns_status(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7}, contact_ids={7: {55}})
+    relay = make_relay(backend, [], [], tmp_path)
+
+    result = relay.send_contact("bot-a", 55, "hi")
+
+    assert result["status"] == "sent" and result["account_id"] == 7
+    assert result["contact_id"] == 55 and result["msg_id"] > 0
+
+
+# The (d) silent-ack fix: send_channel must NEVER reinterpret a non-chat channel id as a
+# contact. A stale/foreign channel id raises (KeyError), and a device chat raises (TypeError)
+# — the caller sees a hard error instead of a 'sent' ack with the message in the wrong chat.
+def test_send_channel_refuses_non_chat_id_no_contact_fallback(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7}, known_chats={7: {5}}, device_chats={2})
+    relay = make_relay(backend, [], [], tmp_path)
+
+    with pytest.raises(KeyError, match="no such chat"):
+        relay.send_channel("bot-a", 9, "not a chat")   # 9 is not a live chat id
+    assert backend.sent == []                            # nothing silently sent
+
+    with pytest.raises(TypeError, match="device/self-talk chat"):
+        relay.send_channel("bot-a", 2, "device")
+    assert backend.sent == []
+
+    ok = relay.send_channel("bot-a", 5, "real channel")  # a live channel still works
+    assert ok["status"] == "sent" and backend.sent == [(7, 5, "real channel")]
+
+
+def test_send_chat_http_endpoint_contract(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7}, known_chats={7: {42}}, device_chats={2})
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+
+    ok = client.post("/send_chat", json={"bot_id": "bot-a", "chat_id": 42, "text": "hi"})
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "sent" and ok.json()["chat_id"] == 42
+    assert backend.sent == [(7, 42, "hi")]
+
+    miss = client.post("/send_chat", json={"bot_id": "bot-a", "chat_id": 9, "text": "x"})
+    assert miss.status_code == 404                       # non-chat id → loud, not misdelivered
+
+    device = client.post("/send_chat", json={"bot_id": "bot-a", "chat_id": 2, "text": "x"})
+    assert device.status_code == 502                      # device chat → typed error
+
+
+def test_send_contact_http_endpoint_contract(tmp_path):
+    backend = FakeBackend(accounts={"bot-a": 7}, contact_ids={7: {55}})
+    client = TestClient(create_app(make_relay(backend, [], [], tmp_path)))
+
+    ok = client.post("/send_contact", json={"bot_id": "bot-a", "contact_id": 55, "text": "hi"})
+    assert ok.status_code == 200 and ok.json()["status"] == "sent"
+
+    miss = client.post("/send_contact", json={"bot_id": "bot-a", "contact_id": 99, "text": "x"})
+    assert miss.status_code == 404                        # unknown contact → loud
 
 
 # --------------------------------------------------------------------------- (2) inbound → wake

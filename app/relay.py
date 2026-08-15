@@ -190,6 +190,19 @@ class DeltaBackend(Protocol):
         """Send ``text`` from ``account_id`` into ``chat_id``; return the sent msg id."""
         ...
 
+    def send_chat(self, account_id: int, chat_id: int, text: str) -> int:
+        """STRICT chat-only send: send into CHAT ``chat_id`` — never reinterprets the id as a
+        contact. Refuses device/self-talk chats (TypeError) and a non-live chat id (KeyError).
+        The legacy ``send`` disambiguates chat-vs-contact on a bare numeric, which lets a stale
+        chat id silently resolve to a contact's 1:1 chat; a chat-only caller must fail loud."""
+        ...
+
+    def send_contact(self, account_id: int, contact_id: int, text: str) -> int:
+        """STRICT contact-only send: resolve CONTACT ``contact_id`` to its 1:1 chat (create if
+        none) and send. Never interprets the id as a chat — the mirror of ``send_chat``. Raises
+        KeyError if the contact id does not exist."""
+        ...
+
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:
         """Send ``text`` from ``account_id`` to the person at email ``addr``, resolving their
         1:1 chat (address → contact → chat). Returns ``(chat_id, msg_id)``. Used to message a
@@ -400,6 +413,45 @@ class DeltaChat2Backend:
         if not chat_id:
             chat_id = self.rpc.create_chat_by_contact_id(account_id, target)
         return chat_id
+
+    def send_chat(self, account_id: int, chat_id: int, text: str) -> int:  # pragma: no cover
+        """STRICT chat-only send — the split-tools contract's relay side.
+
+        A CHAT id in → send, refusing device/self-talk chats (TypeError) and any id that is
+        not a live chat (KeyError). Deliberately NO contact fallback: the legacy ``send``
+        treats a non-chat id as a CONTACT id, so a stale/foreign chat id silently resolves to
+        a contact's 1:1 chat and the send acks 'sent' while landing in the wrong place. A
+        chat-only caller must fail loud instead of guessing which namespace an int belongs to.
+        """
+        from deltachat2 import MessageData  # type: ignore
+
+        info = self.rpc.get_basic_chat_info(account_id, chat_id)
+        if getattr(info, "is_device_chat", False) or getattr(info, "is_self_talk", False):
+            raise TypeError(
+                f"chat_id {chat_id} is a device/self-talk chat — not sendable; "
+                f"message the person with delta_send_to by email address instead")
+        if getattr(info, "chat_id", 0) != chat_id:
+            raise KeyError(
+                f"no such chat {chat_id} for this account (chat-only send — not a contact id)")
+        return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+
+    def send_contact(self, account_id: int, contact_id: int, text: str) -> int:  # pragma: no cover
+        """STRICT contact-only send — the mirror of ``send_chat``.
+
+        A CONTACT id in → resolve to its 1:1 chat (create if none) and send. NEVER treats the
+        id as a chat. Raises KeyError if the contact id does not exist. Same namespace
+        discipline as ``send_chat``: the caller states which namespace it means."""
+        from deltachat2 import MessageData  # type: ignore
+
+        try:
+            c = self.rpc.get_contact(account_id, contact_id)
+            _ = (getattr(c, "address", None) or getattr(c, "addr", None) or "")
+        except Exception:
+            raise KeyError(f"no contact id {contact_id} for this account") from None
+        chat_id = self.rpc.get_chat_id_by_contact_id(account_id, contact_id)
+        if not chat_id:
+            chat_id = self.rpc.create_chat_by_contact_id(account_id, contact_id)
+        return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
 
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
         """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
@@ -1596,6 +1648,32 @@ class Relay:
         except Exception as e:
             return self._park(bot, "chat", int(target), text, e, accid)
 
+    def send_chat(self, bot: str, chat_id: int, text: str) -> dict:
+        """STRICT chat-only send: ``chat_id`` is a CHAT, never a contact. KeyError (no such
+        chat) / TypeError (device/self-talk) propagate loud — no namespace reinterpretation."""
+        accid = self._accid(bot)
+        try:
+            msg_id = self.backend.send_chat(accid, int(chat_id), text)
+            return {"status": "sent", "msg_id": msg_id, "account_id": accid,
+                    "chat_id": int(chat_id)}
+        except (KeyError, TypeError):
+            raise
+        except Exception as e:
+            return self._park(bot, "chat", int(chat_id), text, e, accid)
+
+    def send_contact(self, bot: str, contact_id: int, text: str) -> dict:
+        """STRICT contact-only send: ``contact_id`` is a CONTACT, never a chat. KeyError if the
+        contact id does not exist — no disambiguation guessing."""
+        accid = self._accid(bot)
+        try:
+            msg_id = self.backend.send_contact(accid, int(contact_id), text)
+            return {"status": "sent", "msg_id": msg_id, "account_id": accid,
+                    "contact_id": int(contact_id)}
+        except (KeyError, TypeError):
+            raise
+        except Exception as e:
+            return self._park(bot, "contact", int(contact_id), text, e, accid)
+
     def send_to_addr(self, bot: str, addr: str, text: str) -> dict:
         """Send ``text`` from ``bot`` to the HUMAN at email ``addr`` (resolves their 1:1 chat).
 
@@ -1695,9 +1773,14 @@ class Relay:
         return {"account_id": accid, "channels": self.backend.list_channels(accid)}
 
     def send_channel(self, bot: str, channel_id: int, text: str) -> dict:
-        """Send ``text`` from ``bot`` into group chat ``channel_id`` (same path as send)."""
+        """Send ``text`` from ``bot`` into group chat ``channel_id``.
+
+        Uses the STRICT chat-only backend path: ``channel_id`` is a CHAT, never a contact. A
+        stale/foreign channel id raises (KeyError → 404, TypeError → 502) instead of silently
+        reinterpreting the id as a contact and landing the message in a different chat while
+        acking 'sent'."""
         accid = self._accid(bot)
-        msg_id = self.backend.send(accid, int(channel_id), text)
+        msg_id = self.backend.send_chat(accid, int(channel_id), text)
         return {"status": "sent", "msg_id": msg_id, "account_id": accid, "channel_id": int(channel_id)}
 
     def create_channel(self, bot: str, name: str, members: list[str]) -> dict:
@@ -1984,6 +2067,22 @@ class SendChannelRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SendChatRequest(BaseModel):
+    """STRICT chat-only send — ``chat_id`` is a CHAT, never a contact (no disambiguation)."""
+    bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
+    chat_id: int
+    text: str
+    model_config = {"populate_by_name": True}
+
+
+class SendContactRequest(BaseModel):
+    """STRICT contact-only send — ``contact_id`` is a CONTACT, never a chat (no disambiguation)."""
+    bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
+    contact_id: int
+    text: str
+    model_config = {"populate_by_name": True}
+
+
 class CreateChannelRequest(BaseModel):
     """Create a group chat. ``members`` are supplied by the CALLER (generic — never baked)."""
     bot_id: str = Field(..., validation_alias=_BOT_ALIAS)
@@ -2110,6 +2209,16 @@ def create_app(relay: Relay):
     @app.post("/send_channel")
     async def send_channel(req: SendChannelRequest):
         return await _run(lambda: relay.send_channel(req.bot_id, req.channel_id, req.text))
+
+    @app.post("/send_chat")
+    async def send_chat(req: SendChatRequest):
+        """STRICT chat-only send (a CHAT id, never a contact)."""
+        return await _run(lambda: relay.send_chat(req.bot_id, req.chat_id, req.text))
+
+    @app.post("/send_contact")
+    async def send_contact(req: SendContactRequest):
+        """STRICT contact-only send (a CONTACT id, never a chat)."""
+        return await _run(lambda: relay.send_contact(req.bot_id, req.contact_id, req.text))
 
     @app.post("/send_to")
     async def send_to(req: SendToRequest):
