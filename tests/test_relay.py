@@ -258,6 +258,117 @@ def test_send_http_endpoint_contract(tmp_path):
     assert miss.status_code == 404
 
 
+# A TRANSIENT send failure must surface as status=queued (200, no msg_id — the relay parked it
+# in the durable outbox for retry), NOT a 502. Before the fix /send forced the result through a
+# response_model that required msg_id, so the queued path (which exists to NOT drop a message)
+# 502'd and the caller couldn't tell "parked for retry" from "failed".
+def test_send_endpoint_returns_queued_on_transient_failure(tmp_path):
+    class _Flaky(FakeBackend):
+        def send(self, account_id, chat_id, text):
+            raise RuntimeError("chatmail transport down (transient)")
+
+    backend = _Flaky(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+    client = TestClient(create_app(relay))
+
+    resp = client.post("/send", json={"bot_id": "bot-a", "target": 42, "text": "hi"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert "key" in body and body["account_id"] == 7     # durable outbox handle, no msg_id
+    assert relay.outbox.pending()                        # the message is parked, not dropped
+
+
+# The queued CONTRACT (Volund's ask): queued ≠ delivered, and a bot must be able to resolve the
+# outbox handle to a CONCLUSIVE terminal outcome — never an absence that could be read as "sent".
+# GET /outbox/<key> reports terminal="delivered" (sent), terminal="dropped" (gave up loudly after
+# retries, with last_error), no terminal (still retrying), or 404 (never existed / tombstone aged
+# out). The relay keeps a terminal TOMBSTONE precisely so the poll sees the outcome, not a blank.
+def test_outbox_status_endpoint_reports_pending_then_conclusive_delivered(tmp_path):
+    class _Flaky(FakeBackend):
+        def __init__(self, accounts):
+            super().__init__(accounts)
+            self.healthy = False
+
+        def send(self, account_id, chat_id, text):
+            if not self.healthy:
+                raise RuntimeError("chatmail transport down (transient)")
+            return super().send(account_id, chat_id, text)
+
+    backend = _Flaky(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+    client = TestClient(create_app(relay))
+
+    queued = client.post("/send", json={"bot_id": "bot-a", "target": 42, "text": "hi"})
+    assert queued.status_code == 200
+    key = queued.json()["key"]
+
+    # While still retrying: 200 + the parked entry, terminal-outcome NOT yet reached.
+    pending = client.get(f"/outbox/{key}")
+    assert pending.status_code == 200
+    body = pending.json()
+    assert body["key"] == key and body["bot"] == "bot-a" and body["target"] == 42
+    assert body["attempts"] == 0 and body["last_error"]
+    assert "terminal" not in body
+
+    # Delivered → the entry is RETAINED as terminal="delivered": the poll is CONCLUSIVE — a
+    # 404 here would have made "delivered" and "dropped-loudly" indistinguishable (Volund's gap).
+    backend.healthy = True
+    relay.drain_outbox()
+    delivered = client.get(f"/outbox/{key}")
+    assert delivered.status_code == 200
+    assert delivered.json()["terminal"] == "delivered"
+    assert relay.outbox.pending() == []          # tombstone is not retried
+
+    # A key that never existed is 404 (and with NO outbox ever constructed, no /data side effect).
+    assert client.get("/outbox/never-a-key").status_code == 404
+
+
+def test_outbox_poll_conclusive_dropped(tmp_path):
+    """A permanent failure during drain is observable as terminal="dropped" + last_error — NOT an
+    ambiguous 404. The loud drop happens in the relay's logs; the tombstone makes the sending bot
+    see it (the "same failure shape as the original bug in milder form" Volund flagged)."""
+    backend = FakeBackend(accounts={"bot-a": 7}, device_chats={22})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+    client = TestClient(create_app(relay))
+
+    key = relay._get_outbox().enqueue({"kind": "chat", "bot": "bot-a", "target": 22,
+                                       "text": "hi", "key": "kdrop"})
+    relay.drain_outbox()
+
+    poll = client.get(f"/outbox/{key}")
+    assert poll.status_code == 200
+    assert poll.json()["terminal"] == "dropped"
+    assert "device/self-talk" in poll.json()["last_error"]
+    assert relay.outbox.pending() == []
+
+
+def test_drain_retries_contact_via_send_contact_not_legacy_send(tmp_path):
+    """(Sindri A) A parked kind='contact' entry is retried on the STRICT send_contact path — NEVER
+    the legacy disambiguating ``send``, which would re-open the chat↔contact namespace ambiguity
+    on the retry path (the exact defect the strict split eliminates)."""
+    class _Recorder(FakeBackend):
+        def __init__(self, accounts):
+            super().__init__(accounts, contact_ids={7: {42}})
+            self.legacy_calls = 0
+
+        def send(self, account_id, chat_id, text):          # legacy disambiguating path
+            self.legacy_calls += 1
+            return super().send(account_id, chat_id, text)
+
+    backend = _Recorder(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+
+    key = relay._get_outbox().enqueue({"kind": "contact", "bot": "bot-a", "target": 42,
+                                       "text": "hi", "key": "kc1"})
+    relay.drain_outbox()
+
+    assert backend.legacy_calls == 0                          # NEVER the disambiguating send
+    assert (7, 1042, "hi") in backend.sent                    # send_contact → 1:1 chat 1000+42
+    assert relay._get_outbox().get("kc1")["terminal"] == "delivered"
+
+
 def test_send_to_addr_resolves_and_returns_chat_and_msg(tmp_path):
     backend = FakeBackend(accounts={"bot-a": 7})
     relay = make_relay(backend, [], [], tmp_path)
@@ -535,9 +646,30 @@ async def test_wake_metadata_reply_target_dm_is_structured(tmp_path):
     await relay.handle_inbound(msg)
 
     meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
-    assert meta.get("reply_target") == {"kind": "dm", "bot_id": "bot-a", "chat_id": 11}
+    assert meta.get("reply_target") == {"kind": "dm", "bot_id": "bot-a", "chat_id": 11,
+                                        "peer": "terafin"}
     # The human-readable hint is still in the text (backward-compatible) — structured field is additive.
     assert "Reply here on Delta" in wakes[0]["text"]
+
+
+async def test_wake_metadata_reply_target_dm_carries_peer_for_read_time_verification(tmp_path):
+    # ``peer`` names the sender in the reply handle so a bare numeric target that resolves to the
+    # wrong contact is self-evident AT READ TIME (chat ids and contact ids are separate namespaces
+    # with overlapping small integers — volund's misroute cluster). ``from_localpart`` resolves in
+    # _build_inbound; an unresolved sender falls back to "someone".
+    msg = InboundMessage(account_id=7, chat_id=11, msg_id=18, text="ping",
+                         is_group=False, members=[], mentioned=[],
+                         from_localpart="brokkr", rfc724_mid="<rt-peer@chatmail>")
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    wakes: list[dict] = []
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], wakes, tmp_path)
+
+    await relay.handle_inbound(msg)
+
+    meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
+    rt = meta.get("reply_target") or {}
+    assert rt.get("kind") == "dm" and rt.get("chat_id") == 11
+    assert rt.get("peer") == "brokkr"          # the sender is named in the handle
 
 
 async def test_wake_metadata_reply_target_channel_is_structured(tmp_path):
@@ -555,7 +687,7 @@ async def test_wake_metadata_reply_target_channel_is_structured(tmp_path):
     await relay.handle_inbound(msg)
 
     meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
-    assert meta.get("reply_target") == {"kind": "channel", "channel_id": 99}
+    assert meta.get("reply_target") == {"kind": "channel", "channel_id": 99, "peer": "terafin"}
 
 
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):

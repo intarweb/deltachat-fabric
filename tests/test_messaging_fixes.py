@@ -84,11 +84,14 @@ class _BasicChat:
 
 
 class _BasicContact:
-    """Minimal Contact stand-in carrying the address field send_contact reads."""
+    """Minimal Contact stand-in carrying the address/key fields send paths read."""
 
-    def __init__(self, cid: int):
+    def __init__(self, cid: int, address: str = "", is_key_contact: bool = False,
+                 is_verified: bool = False):
         self.id = cid
-        self.address = f"contact{cid}@chatmail.example"
+        self.address = address or f"contact{cid}@chatmail.example"
+        self.is_key_contact = is_key_contact
+        self.is_verified = is_verified
 
 
 class _StubRpc:
@@ -104,6 +107,8 @@ class _StubRpc:
         self.created: list[int] = []
         # contact ids that EXIST (get_contact resolves them; absent = unknown contact)
         self.contacts: set[int] = set()
+        # contacts reachable by get_contacts(query): lowercased address -> [contact,...]
+        self.address_contacts: dict[str, list] = {}
 
     # Account-index surface the backend init calls (_reindex_accounts).
     def get_all_account_ids(self) -> list[int]:
@@ -123,6 +128,19 @@ class _StubRpc:
         if cid not in self.contacts:
             raise KeyError(f"contact {cid} not found")
         return _BasicContact(cid)
+
+    def get_contacts(self, _accid: int, _flags: int, query: str) -> list:
+        """Enumerate contacts matching ``query`` (address substring) — the reliable path."""
+        q = (query or "").strip().lower()
+        if not q:
+            return [self.get_contact(_accid, cid) for cid in sorted(self.contacts)]
+        return [c for c in self.address_contacts.get(q, [])]
+
+    def lookup_contact_id_by_addr(self, _accid: int, addr: str) -> Optional[int]:
+        """Simulate the REAL core's unreliable by-address lookup: deliberately MISSES even a
+        listed contact (deltachat-core: 'do not use to look them up'). A call to send_to_addr
+        that relied on this would 404 despite the contact existing."""
+        return None
 
     def create_chat_by_contact_id(self, _accid: int, cid: int) -> int:
         # mint a 1:1 chat (id = 1000 + cid) and remember it
@@ -257,11 +275,97 @@ def test_backend_send_contact_refuses_unknown_contact():
     assert rpc.sent == []
 
 
+# The (b) fix at the backend level: send_to_addr must resolve by ENUMERATION, not the
+# unreliable lookup_contact_id_by_addr (deltachat-core: "do not use to look them up" — it can
+# miss a listed contact entirely, 404ing a send the enumeration clearly contains). The stub's
+# lookup_contact_id_by_addr is DELIBERATELY a miss, so this test only passes via enumeration.
+def test_backend_send_to_addr_resolves_by_enumeration_when_lookup_misses():
+    backend, rpc = _backend_with_rpc()
+    rpc.contacts.update({13, 7})
+    rpc.address_contacts["brokkr@chatmail.siliconspirit.net"] = [
+        _BasicContact(13, "brokkr@chatmail.siliconspirit.net",
+                      is_key_contact=True, is_verified=True),
+    ]
+    rpc.contact_chats[13] = 33
+    rpc.chats[33] = _BasicChat(33)
+
+    chat_id, msg_id = backend.send_to_addr(1, "brokkr@chatmail.siliconspirit.net", "hi")
+
+    assert chat_id == 33 and msg_id > 0
+    assert rpc.sent == [(1, 33, "")]
+
+
+def test_backend_send_to_addr_refuses_unlisted_address():
+    backend, rpc = _backend_with_rpc()
+    rpc.contacts.add(7)  # only contact 7 exists; nobody@ is absent from the enumeration
+
+    with pytest.raises(KeyError, match="no contact for address"):
+        backend.send_to_addr(1, "nobody@chatmail.siliconspirit.net", "hi")
+
+    assert rpc.sent == []
+
+
+def test_backend_send_to_addr_prefers_verified_key_contact():
+    backend, rpc = _backend_with_rpc()
+    rpc.contacts.update({13, 9})
+    addr = "brokkr@chatmail.siliconspirit.net"
+    # two contacts share the address: an old address-contact and a verified key-contact
+    rpc.address_contacts[addr] = [
+        _BasicContact(9, addr, is_key_contact=False, is_verified=False),
+        _BasicContact(13, addr, is_key_contact=True, is_verified=True),
+    ]
+    rpc.contact_chats[13] = 33
+    rpc.chats[33] = _BasicChat(33)
+
+    chat_id, _ = backend.send_to_addr(1, addr, "hi")
+
+    assert chat_id == 33            # resolved via the verified key-contact (13), not the stale one
+
+
+def test_backend_send_to_addr_refuses_ambiguous_unverified_matches():
+    """No verified key-contact + MULTIPLE unverified contacts sharing the address is a
+    wrong-recipient door — refuse-and-say-which, never silently pick 'the last one'."""
+    backend, rpc = _backend_with_rpc()
+    addr = "dupe@chatmail.siliconspirit.net"
+    rpc.contacts.update({5, 6})
+    rpc.address_contacts[addr] = [
+        _BasicContact(5, addr, is_key_contact=False, is_verified=False),
+        _BasicContact(6, addr, is_key_contact=False, is_verified=False),
+    ]
+
+    with pytest.raises(KeyError, match="ambiguous address"):
+        backend.send_to_addr(1, addr, "hi")
+
+    assert rpc.sent == []           # nothing hit the core — no guess between duplicates
+
+
+def test_backend_send_to_addr_sends_single_unverified_match():
+    """A SINGLE unverified match is unambiguous → send (no refusal regression for the normal
+    one-contact-per-address fleet state; only the multi-match ambiguous case refuses)."""
+    backend, rpc = _backend_with_rpc()
+    addr = "solo@chatmail.siliconspirit.net"
+    rpc.contacts.add(5)
+    rpc.address_contacts[addr] = [
+        _BasicContact(5, addr, is_key_contact=False, is_verified=False),
+    ]
+    rpc.contact_chats[5] = 33
+    rpc.chats[33] = _BasicChat(33)
+
+    chat_id, msg_id = backend.send_to_addr(1, addr, "hi")
+
+    assert chat_id == 33 and msg_id > 0
+    assert rpc.sent == [(1, 33, "")]
+
+
 # --------------------------------------------------------------------------- F3: durable outbox
 
 
 class _FlakyBackend(FakeBackend):
-    """Backend that raises a transient transport error on send until ``healthy``."""
+    """Backend that raises a transient transport error on send until ``healthy``.
+
+    Overrides the STRICT paths (send_chat) too: the drain retries a parked kind='chat' entry
+    on the strict chat path (never the legacy disambiguating ``send``), so the flakiness must
+    live there for the retry test to exercise the real drain behavior."""
 
     def __init__(self, accounts: dict[str, int]):
         super().__init__(accounts)
@@ -273,6 +377,12 @@ class _FlakyBackend(FakeBackend):
         if not self.healthy:
             raise RuntimeError("chatmail transport down (transient)")
         return super().send(account_id, chat_id, text)
+
+    def send_chat(self, account_id: int, chat_id: int, text: str) -> int:
+        self.attempts += 1
+        if not self.healthy:
+            raise RuntimeError("chatmail transport down (transient)")
+        return super().send_chat(account_id, chat_id, text)
 
 
 def test_outbox_persists_then_drains(tmp_path):

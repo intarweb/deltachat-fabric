@@ -96,16 +96,22 @@ def _stable_task_id(bot_id: str, payload: dict) -> str:
     return ""
 
 
-def _reply_target(kind: str, own: str, chat_id: int) -> dict:
+def _reply_target(kind: str, own: str, chat_id: int, peer: str = "") -> dict:
     """The STRUCTURED, machine-readable companion to ``_reply_hint`` — the same reply handle a
     consumer would otherwise have to parse out of the prose. ``kind`` ∈ {'dm','channel'}. Carries
     exactly the identifiers the reply primitive needs to address the reply:
       channel → {"kind":"channel","channel_id":<id>}  → delta_send_channel(channel_id, text=…)
       dm      → {"kind":"dm","bot_id":<own>,"chat_id":<id>} → delta_send(bot_id=own, target=chat_id, text=…)
-    A consumer reads ``metadata.reply_target`` and dispatches on ``kind`` — no text parsing."""
-    if kind == "channel":
-        return {"kind": "channel", "channel_id": chat_id}
-    return {"kind": "dm", "bot_id": own, "chat_id": chat_id}
+    ``peer`` (the sender's localpart) rides alongside so a bare numeric target is self-evident at
+    read time — chat ids and contact ids are different namespaces with overlapping small integers,
+    and a misroute surfaces the moment the name doesn't match who the handle says it reaches. A
+    consumer reads ``metadata.reply_target`` and dispatches on ``kind`` — no text parsing; ``peer``
+    is additive (older consumers ignore it)."""
+    t = {"kind": "channel", "channel_id": chat_id} if kind == "channel" \
+        else {"kind": "dm", "bot_id": own, "chat_id": chat_id}
+    if peer:
+        t["peer"] = peer
+    return t
 
 
 
@@ -446,7 +452,11 @@ class DeltaChat2Backend:
         try:
             c = self.rpc.get_contact(account_id, contact_id)
             _ = (getattr(c, "address", None) or getattr(c, "addr", None) or "")
-        except Exception:
+        except (ValueError, KeyError):
+            # "no such contact" (core ValueError / stub KeyError) is PERMANENT → loud 404. Narrow on
+            # purpose: a TRANSIENT rpc/transport error must NOT be turned into a permanent 404 —
+            # it propagates → the relay parks the send in the outbox and retries (queued), never a
+            # false "no contact id".
             raise KeyError(f"no contact id {contact_id} for this account") from None
         chat_id = self.rpc.get_chat_id_by_contact_id(account_id, contact_id)
         if not chat_id:
@@ -456,15 +466,40 @@ class DeltaChat2Backend:
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
         """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
 
-        lookup_contact_id_by_addr → create_chat_by_contact_id (idempotent: returns the existing
-        verified 1:1 chat if it exists, else creates it) → send_msg. Requires the contact to be
-        a verified key-contact (post-securejoin) for the chat to be encryptable. Returns
-        ``(chat_id, msg_id)``. Verified vs installed deltachat2. Raises KeyError if no contact
-        resolves for ``addr``.
+        🔴 ``lookup_contact_id_by_addr`` is NOT used here: deltachat-core documents it as
+        unreliable ("do not use to look them up" — it returns the most-recently-seen contact,
+        which may be a stale/address-contact, and it can MISS a listed contact entirely, 404ing a
+        send the enumeration clearly contains). Resolve by ENUMERATION instead (the same approach
+        ``_resolve_contact`` documents): match the exact address over ``get_contacts``, prefer a
+        verified key-contact; refuse-and-say-which when MULTIPLE unverified contacts share the
+        address (never guess between duplicates — a wrong-recipient path). Then
+        ``create_chat_by_contact_id`` (idempotent) → ``send_msg``.
+        Returns ``(chat_id, msg_id)``. Raises KeyError if no contact resolves or the address is
+        ambiguous (multiple unverified contacts — securejoin/verify one, then retry).
         """
         from deltachat2 import MessageData  # type: ignore
 
-        cid = self.rpc.lookup_contact_id_by_addr(account_id, addr)
+        want = addr.strip().lower()
+        matches = [c for c in (self.rpc.get_contacts(account_id, 0, want) or [])
+                   if (getattr(c, "address", None) or getattr(c, "addr", None) or "").strip().lower() == want]
+        if not matches:
+            raise KeyError(f"no contact for address {addr}")
+        # Prefer a VERIFIED key-contact (the encryptable, post-securejoin one).
+        for c in matches:
+            if getattr(c, "is_key_contact", False) and getattr(c, "is_verified", False):
+                cid = getattr(c, "id", 0)
+                break
+        else:
+            # No verified key-contact: a SINGLE match is unambiguous → send to it. MULTIPLE
+            # unverified matches sharing the address are a WRONG-RECIPIENT door — refuse-and-say-
+            # which (never silently pick "the last one" between duplicates); the caller must
+            # securejoin/verify a specific contact, then retry.
+            if len(matches) > 1:
+                who = ", ".join(f"#{getattr(c, 'id', '?')} <{getattr(c, 'address', '?')}>"
+                                for c in matches)
+                raise KeyError(f"ambiguous address {addr}: {len(matches)} unverified contacts "
+                               f"({who}) — verify a key-contact for one, then retry")
+            cid = getattr(matches[0], "id", 0)
         if not cid:
             raise KeyError(f"no contact for address {addr}")
         chat_id = self.rpc.create_chat_by_contact_id(account_id, cid)
@@ -1494,11 +1529,15 @@ class Outbox:
     "text", "queued_at", "attempts", "last_error"}.
     """
 
-    def __init__(self, data_dir: str, ttl: float = 3600.0, max_attempts: int = 40):
+    def __init__(self, data_dir: str, ttl: float = 3600.0, max_attempts: int = 40,
+                 terminal_ttl: float = 86400.0):
         self.path = Path(data_dir) / "outbox.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.ttl = ttl                      # wall-clock age-out (drop loudly, don't retry forever)
         self.max_attempts = max_attempts    # ~40×5s ≈ 3.3 min of retries before giving up loudly
+        # Terminal entries (delivered/dropped) are RETAINED as conclusive tombstones so a
+        # GET /outbox/<key> poll reports the OUTCOME, never an absence — pruned after this TTL.
+        self.terminal_ttl = terminal_ttl
         self._items: list[dict] = self._read()
 
     def _read(self) -> list[dict]:
@@ -1533,20 +1572,56 @@ class Outbox:
         self._flush()
 
     def pending(self) -> list[dict]:
-        return list(self._items)
+        """Non-terminal entries only — a delivered/dropped entry is a retained tombstone for
+        polling (GET /outbox/<key>), never retried."""
+        return [i for i in self._items if "terminal" not in i]
+
+    def get(self, key: str) -> dict | None:
+        """Return the parked entry for ``key`` — including its terminal state once set
+        (terminal=delivered/dropped + last_error). None only when never queued or the tombstone
+        aged out. This is the conclusive pollable outcome for a ``queued`` send result."""
+        for i in self._items:
+            if i.get("key") == key:
+                return i
+        return None
+
+    def mark_terminal(self, key: str, outcome: str, error: str | None = None) -> None:
+        """Mark a parked entry TERMINAL: ``outcome`` is "delivered" (sent) or "dropped" (gave up
+        loudly after retries). RETAINED (terminal_ttl) so a /outbox/<key> poll returns a
+        CONCLUSIVE outcome — never an absence that could be misread as "delivered". No-op if the
+        key is already gone (removed / never existed)."""
+        for i in self._items:
+            if i.get("key") == key:
+                i["terminal"] = outcome
+                i["terminal_at"] = time.time()
+                if error is not None:
+                    i["last_error"] = error
+                self._flush()
+                return
 
     def age_out(self, now: float | None = None) -> None:
-        """Drop entries past TTL or max_attempts — LOUDLY (they're the caller's lost messages)."""
+        """Terminalize entries past their retry TTL/max_attempts (a LOUD drop — the caller's
+        message never landed, so the tombstone reports 'dropped') and prune terminal tombstones
+        past terminal_ttl."""
         now = now if now is not None else time.time()
-        kept: list[dict] = []
+        prune: list[str] = []
+        changed = False
         for i in self._items:
-            if now - float(i.get("queued_at", now)) > self.ttl or int(i.get("attempts", 0)) >= self.max_attempts:
+            if "terminal" in i:
+                if now - float(i.get("terminal_at", now)) > self.terminal_ttl:
+                    log.info("outbox: pruning terminal tombstone %s (terminal=%s)",
+                             i.get("key"), i.get("terminal"))
+                    prune.append(i.get("key"))
+                    changed = True
+            elif now - float(i.get("queued_at", now)) > self.ttl or int(i.get("attempts", 0)) >= self.max_attempts:
                 log.error("outbox: DROPPING undelivered message after retries (%s): bot=%s kind=%s target=%r last_error=%r",
                           i.get("key"), i.get("bot"), i.get("kind"), i.get("target"), i.get("last_error"))
-                continue
-            kept.append(i)
-        if len(kept) != len(self._items):
-            self._items = kept
+                i["terminal"] = "dropped"
+                i["terminal_at"] = now
+                changed = True
+        if prune:
+            self._items = [i for i in self._items if i.get("key") not in prune]
+        if changed:
             self._flush()
 
 
@@ -1633,8 +1708,14 @@ class Relay:
     def send(self, bot: str, target: int, text: str) -> dict:
         """Send ``text`` from bot ``bot`` (id or localpart) into chat/contact ``target``.
 
-        Returns {"status","msg_id","account_id"} — or {"status":"queued",...} when a transient
-        transport failure parks the message in the durable outbox for retry (never dropped).
+        Returns {"status","msg_id","account_id"} on delivery — or {"status":"queued",...} when a
+        transient transport failure parks the message in the durable outbox for retry (never
+        dropped). 🔴 QUEUED ≠ DELIVERED: the result carries the outbox ``key`` — poll
+        GET /outbox/<key> (observable contract: 200 + terminal="delivered" = sent; 200 +
+        terminal="dropped" = gave up loudly, last_error; 200 + no terminal field = still
+        retrying; 404 = never existed or tombstone aged out). Poll within 24h; a bare 404 is
+        indeterminate, never success — never report a queued result upstream as sent unless a
+        poll shows terminal="delivered".
         Raises KeyError if the bot has no account; TypeError for an unsendable device/self-talk
         chat (map to a clear error, not an opaque core string)."""
         accid = self.backend.account_id_for(bot)
@@ -1650,7 +1731,9 @@ class Relay:
 
     def send_chat(self, bot: str, chat_id: int, text: str) -> dict:
         """STRICT chat-only send: ``chat_id`` is a CHAT, never a contact. KeyError (no such
-        chat) / TypeError (device/self-talk) propagate loud — no namespace reinterpretation."""
+        chat) / TypeError (device/self-talk) propagate loud — no namespace reinterpretation.
+        Queued results (durable outbox, retried) carry ``key`` — poll GET /outbox/<key>
+        (terminal=delivered/dropped); never report queued as sent."""
         accid = self._accid(bot)
         try:
             msg_id = self.backend.send_chat(accid, int(chat_id), text)
@@ -1663,7 +1746,9 @@ class Relay:
 
     def send_contact(self, bot: str, contact_id: int, text: str) -> dict:
         """STRICT contact-only send: ``contact_id`` is a CONTACT, never a chat. KeyError if the
-        contact id does not exist — no disambiguation guessing."""
+        contact id does not exist — no disambiguation guessing. Queued results (durable outbox,
+        retried) carry ``key`` — poll GET /outbox/<key> (terminal=delivered/dropped); never
+        report queued as sent."""
         accid = self._accid(bot)
         try:
             msg_id = self.backend.send_contact(accid, int(contact_id), text)
@@ -1678,8 +1763,10 @@ class Relay:
         """Send ``text`` from ``bot`` to the HUMAN at email ``addr`` (resolves their 1:1 chat).
 
         Returns {"status","account_id","chat_id","msg_id"} — or {"status":"queued",...} when a
-        transient transport failure parks the message in the durable outbox. Raises KeyError if
-        the bot has no account or no contact resolves for ``addr`` (map to 404 at the endpoint)."""
+        transient transport failure parks the message in the durable outbox (carries ``key``;
+        poll GET /outbox/<key> — terminal=delivered/dropped; never report queued as sent).
+        Raises KeyError if the bot has no account or no contact resolves for ``addr`` (map to
+        404 at the endpoint)."""
         accid = self.backend.account_id_for(bot)
         if accid is None:
             raise KeyError(f"no delta account for bot {bot!r}")
@@ -1709,31 +1796,39 @@ class Relay:
     def drain_outbox(self) -> int:
         """Retry the durable outbox; returns the number of messages still pending.
 
-        Success removes the entry; a permanent error (no account/contact, unsendable target)
-        drops it loudly; a transient error keeps it (attempts++) for the next drain. Backend rpc
-        is blocking — callers run this OFF the event loop (asyncio.to_thread / /drain)."""
+        Success → the entry is marked terminal=delivered (RETAINED as a tombstone so a poll is
+        conclusive). A permanent error (no account/contact, unsendable target) → terminal=dropped
+        + last_error (also retained — the poll must see the LOUD drop, not an absence). A
+        transient error keeps the entry pending (attempts++) for the next drain. Parked kinds are
+        retried on the SAME STRICT path they parked under (kind='contact' → send_contact, kind=
+        'chat' → send_chat) — NEVER the legacy disambiguating ``send``, which would re-open the
+        chat↔contact namespace ambiguity on the retry path. Backend rpc is blocking — callers run
+        this OFF the event loop (asyncio.to_thread / /drain)."""
         outbox = self._get_outbox()
         for item in outbox.pending():
             key = item["key"]
             accid = self.backend.account_id_for(item["bot"])
             if accid is None:
-                log.error("outbox: dropping %s — no account for bot %r (permanent)", key, item["bot"])
-                outbox.remove(key)
+                log.error("outbox: DROPPED %s — no account for bot %r (permanent)", key, item["bot"])
+                outbox.mark_terminal(key, "dropped", f"no account for bot {item['bot']!r}")
                 continue
             try:
                 if item["kind"] == "addr":
                     self.backend.send_to_addr(accid, item["target"], item["text"])
-                else:
-                    self.backend.send(accid, int(item["target"]), item["text"])
+                elif item["kind"] == "contact":
+                    self.backend.send_contact(accid, int(item["target"]), item["text"])
+                else:  # "chat" (legacy /send parks and strict send_chat parks alike)
+                    self.backend.send_chat(accid, int(item["target"]), item["text"])
             except (KeyError, TypeError) as e:
-                log.error("outbox: dropping %s — permanent (%s): %s", key, type(e).__name__, e)
-                outbox.remove(key)
+                log.error("outbox: DROPPED %s — permanent (%s): %s", key, type(e).__name__, e)
+                outbox.mark_terminal(key, "dropped", f"{type(e).__name__}: {e}")
             except Exception as e:
                 item["attempts"] = int(item.get("attempts", 0)) + 1
                 item["last_error"] = str(e)
                 log.warning("outbox: retry %s failed (%s) — stays queued", key, e)
             else:
-                outbox.remove(key)
+                log.info("outbox: delivered %s", key)
+                outbox.mark_terminal(key, "delivered")
         outbox.age_out()
         return len(outbox.pending())
 
@@ -1882,20 +1977,21 @@ class Relay:
                      msg.account_id, msg.chat_id, msg.msg_id, msg.from_id,
                      msg.is_device_chat, msg.is_system)
             return []
-        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
-                   "rfc724_mid": msg.rfc724_mid,
-                   "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id),
-                   "reply_target": _reply_target("channel", "", msg.chat_id)}
-        # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
-        own = self.backend.localpart_for(msg.account_id)
-        if msg.from_localpart and own and msg.from_localpart == own:
-            return []
         # Carry the resolved sender so consumers can label the wake ("who sent this") instead of
         # each rendering its own default for a missing sender. ``wake()`` forwards only
         # ``payload['text']`` into the a2a envelope, so the sender is baked into the text below;
         # ``from`` is kept as a structured mirror. from_localpart is resolved in _build_inbound;
-        # fall back to "someone" when a contact address doesn't resolve.
+        # fall back to "someone" when a contact address doesn't resolve. Computed up-front so the
+        # reply_target can carry the sender as ``peer`` (self-evident read-time target).
         sender = msg.from_localpart or "someone"
+        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
+                   "rfc724_mid": msg.rfc724_mid,
+                   "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id),
+                   "reply_target": _reply_target("channel", "", msg.chat_id, peer=sender)}
+        # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
+        own = self.backend.localpart_for(msg.account_id)
+        if msg.from_localpart and own and msg.from_localpart == own:
+            return []
         payload["from"] = sender
         # sender_kind (human|bot): forwarded in the wake metadata so the hook can prioritize a
         # real person over peer-bot chatter. "bot" iff the resolved sender is a fleet-roster
@@ -1917,8 +2013,9 @@ class Relay:
                 + _reply_hint("dm", own, msg.chat_id)
             )
             # Override the channel-default reply_target with the DM handle now that ``own`` (the
-            # account to reply AS) is known — mirrors the text hint above, parse-free.
-            payload["reply_target"] = _reply_target("dm", own, msg.chat_id)
+            # account to reply AS) is known — mirrors the text hint above, parse-free. ``peer``
+            # names the sender so a misrouted numeric target is self-evident at read time.
+            payload["reply_target"] = _reply_target("dm", own, msg.chat_id, peer=sender)
             if await self._deliver(own, payload):
                 self._wake_commit(msg.rfc724_mid, own)
                 return [own]
@@ -2050,12 +2147,6 @@ class SendRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class SendResponse(BaseModel):
-    status: str
-    msg_id: int
-    account_id: int
-
-
 # The new operations reuse the same bot_id/localpart alias convention as SendRequest.
 _BOT_ALIAS = AliasChoices("bot_id", "localpart")
 
@@ -2161,12 +2252,14 @@ def create_app(relay: Relay):
                 "peer_queued": relay.peer_mesh.pending_count(),
                 "outbox": len(relay.outbox.pending()) if relay.outbox is not None else 0}
 
-    @app.post("/send", response_model=SendResponse)
-    async def send(req: SendRequest) -> SendResponse:
-        # relay.send → sync (blocking) deltachat rpc; run it OFF the event loop.
+    @app.post("/send")
+    async def send(req: SendRequest):
+        # relay.send → sync (blocking) deltachat rpc; run it OFF the event loop. The result is
+        # returned VERBATIM (no response_model): a transient failure legitimately returns
+        # {"status":"queued", "key":...} with NO msg_id, and forcing that through SendResponse
+        # (required msg_id) 502'd the very path that exists to NOT drop the message.
         try:
-            result = await asyncio.to_thread(relay.send, req.bot_id, req.target, req.text)
-            return SendResponse(**result)
+            return await asyncio.to_thread(relay.send, req.bot_id, req.target, req.text)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except Exception as e:  # pragma: no cover - backend send failure
@@ -2176,6 +2269,35 @@ def create_app(relay: Relay):
     async def drain():
         return {"drained": await relay.drain_holds(), "held": len(relay.hold),
                 "outbox": await asyncio.to_thread(relay.drain_outbox)}
+
+    @app.get("/outbox/{key}")
+    async def outbox_status(key: str):
+        """Poll a PARKED send by its ``key`` (from a ``{"status":"queued","key":...}`` result).
+
+        Conclusive in OBSERVABLE terms (status code + field presence) — never an ambiguous
+        absence. A caller reads exactly one of:
+          * 200 + body has ``terminal:"delivered"`` → SENT (message is in the peer's chat).
+          * 200 + body has ``terminal:"dropped"``   → gave up LOUDLY after retries (last_error).
+          * 200 + body has NO ``terminal`` field   → still retrying (attempts / last_error).
+          * 404                                    → never existed, or the tombstone aged out.
+        🔴 A queued result must never be reported upstream as sent unless a poll shows
+        terminal:"delivered". A bare 404 is NOT a success signal — it is indeterminate; poll
+        within the tombstone window (24h) and let absence be absence, never inferred success.
+        """
+        if relay.outbox is None:
+            # nothing has ever been parked (healthz discipline: don't construct /data on a poll)
+            raise HTTPException(status_code=404,
+                                detail="no such outbox entry (nothing has been queued)")
+        entry = relay.outbox.get(key)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="no such outbox entry "
+                                "(never existed, or the terminal tombstone aged out)")
+        out = {"key": key, "kind": entry.get("kind"), "bot": entry.get("bot"),
+               "target": entry.get("target"), "attempts": entry.get("attempts", 0),
+               "last_error": entry.get("last_error")}
+        if "terminal" in entry:   # key-absent while pending, set once delivered/dropped (conclusive)
+            out["terminal"] = entry["terminal"]
+        return out
 
     # -- contacts / channels (mirror /send: 404 on unknown bot, 502 on backend error) --
     async def _run(fn):
