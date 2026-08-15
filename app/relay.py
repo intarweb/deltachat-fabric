@@ -452,7 +452,11 @@ class DeltaChat2Backend:
         try:
             c = self.rpc.get_contact(account_id, contact_id)
             _ = (getattr(c, "address", None) or getattr(c, "addr", None) or "")
-        except Exception:
+        except (ValueError, KeyError):
+            # "no such contact" (core ValueError / stub KeyError) is PERMANENT → loud 404. Narrow on
+            # purpose: a TRANSIENT rpc/transport error must NOT be turned into a permanent 404 —
+            # it propagates → the relay parks the send in the outbox and retries (queued), never a
+            # false "no contact id".
             raise KeyError(f"no contact id {contact_id} for this account") from None
         chat_id = self.rpc.get_chat_id_by_contact_id(account_id, contact_id)
         if not chat_id:
@@ -1525,11 +1529,15 @@ class Outbox:
     "text", "queued_at", "attempts", "last_error"}.
     """
 
-    def __init__(self, data_dir: str, ttl: float = 3600.0, max_attempts: int = 40):
+    def __init__(self, data_dir: str, ttl: float = 3600.0, max_attempts: int = 40,
+                 terminal_ttl: float = 86400.0):
         self.path = Path(data_dir) / "outbox.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.ttl = ttl                      # wall-clock age-out (drop loudly, don't retry forever)
         self.max_attempts = max_attempts    # ~40×5s ≈ 3.3 min of retries before giving up loudly
+        # Terminal entries (delivered/dropped) are RETAINED as conclusive tombstones so a
+        # GET /outbox/<key> poll reports the OUTCOME, never an absence — pruned after this TTL.
+        self.terminal_ttl = terminal_ttl
         self._items: list[dict] = self._read()
 
     def _read(self) -> list[dict]:
@@ -1564,29 +1572,56 @@ class Outbox:
         self._flush()
 
     def pending(self) -> list[dict]:
-        return list(self._items)
+        """Non-terminal entries only — a delivered/dropped entry is a retained tombstone for
+        polling (GET /outbox/<key>), never retried."""
+        return [i for i in self._items if "terminal" not in i]
 
     def get(self, key: str) -> dict | None:
-        """Return the parked entry for ``key`` — or None once TERMINAL (delivered, or dropped
-        loudly after retries/TTL). This is the pollable terminal-outcome handle for a ``queued``
-        send result (GET /outbox/<key>)."""
+        """Return the parked entry for ``key`` — including its terminal state once set
+        (terminal=delivered/dropped + last_error). None only when never queued or the tombstone
+        aged out. This is the conclusive pollable outcome for a ``queued`` send result."""
         for i in self._items:
             if i.get("key") == key:
                 return i
         return None
 
-    def age_out(self, now: float | None = None) -> None:
-        """Drop entries past TTL or max_attempts — LOUDLY (they're the caller's lost messages)."""
-        now = now if now is not None else time.time()
-        kept: list[dict] = []
+    def mark_terminal(self, key: str, outcome: str, error: str | None = None) -> None:
+        """Mark a parked entry TERMINAL: ``outcome`` is "delivered" (sent) or "dropped" (gave up
+        loudly after retries). RETAINED (terminal_ttl) so a /outbox/<key> poll returns a
+        CONCLUSIVE outcome — never an absence that could be misread as "delivered". No-op if the
+        key is already gone (removed / never existed)."""
         for i in self._items:
-            if now - float(i.get("queued_at", now)) > self.ttl or int(i.get("attempts", 0)) >= self.max_attempts:
+            if i.get("key") == key:
+                i["terminal"] = outcome
+                i["terminal_at"] = time.time()
+                if error is not None:
+                    i["last_error"] = error
+                self._flush()
+                return
+
+    def age_out(self, now: float | None = None) -> None:
+        """Terminalize entries past their retry TTL/max_attempts (a LOUD drop — the caller's
+        message never landed, so the tombstone reports 'dropped') and prune terminal tombstones
+        past terminal_ttl."""
+        now = now if now is not None else time.time()
+        prune: list[str] = []
+        changed = False
+        for i in self._items:
+            if "terminal" in i:
+                if now - float(i.get("terminal_at", now)) > self.terminal_ttl:
+                    log.info("outbox: pruning terminal tombstone %s (terminal=%s)",
+                             i.get("key"), i.get("terminal"))
+                    prune.append(i.get("key"))
+                    changed = True
+            elif now - float(i.get("queued_at", now)) > self.ttl or int(i.get("attempts", 0)) >= self.max_attempts:
                 log.error("outbox: DROPPING undelivered message after retries (%s): bot=%s kind=%s target=%r last_error=%r",
                           i.get("key"), i.get("bot"), i.get("kind"), i.get("target"), i.get("last_error"))
-                continue
-            kept.append(i)
-        if len(kept) != len(self._items):
-            self._items = kept
+                i["terminal"] = "dropped"
+                i["terminal_at"] = now
+                changed = True
+        if prune:
+            self._items = [i for i in self._items if i.get("key") not in prune]
+        if changed:
             self._flush()
 
 
@@ -1676,8 +1711,8 @@ class Relay:
         Returns {"status","msg_id","account_id"} on delivery — or {"status":"queued",...} when a
         transient transport failure parks the message in the durable outbox for retry (never
         dropped). 🔴 QUEUED ≠ DELIVERED: the result carries the outbox ``key`` — poll
-        GET /outbox/<key>: entry present = still retrying, gone = delivered-or-dropped-loudly.
-        Never report a queued result upstream as sent.
+        GET /outbox/<key>: terminal="delivered" = sent, terminal="dropped" = gave up loudly
+        (last_error), no terminal = still retrying. Never report a queued result upstream as sent.
         Raises KeyError if the bot has no account; TypeError for an unsendable device/self-talk
         chat (map to a clear error, not an opaque core string)."""
         accid = self.backend.account_id_for(bot)
@@ -1694,8 +1729,8 @@ class Relay:
     def send_chat(self, bot: str, chat_id: int, text: str) -> dict:
         """STRICT chat-only send: ``chat_id`` is a CHAT, never a contact. KeyError (no such
         chat) / TypeError (device/self-talk) propagate loud — no namespace reinterpretation.
-        Queued results (durable outbox, retried) carry ``key`` — poll GET /outbox/<key>; never
-        report queued as sent."""
+        Queued results (durable outbox, retried) carry ``key`` — poll GET /outbox/<key>
+        (terminal=delivered/dropped); never report queued as sent."""
         accid = self._accid(bot)
         try:
             msg_id = self.backend.send_chat(accid, int(chat_id), text)
@@ -1709,7 +1744,8 @@ class Relay:
     def send_contact(self, bot: str, contact_id: int, text: str) -> dict:
         """STRICT contact-only send: ``contact_id`` is a CONTACT, never a chat. KeyError if the
         contact id does not exist — no disambiguation guessing. Queued results (durable outbox,
-        retried) carry ``key`` — poll GET /outbox/<key>; never report queued as sent."""
+        retried) carry ``key`` — poll GET /outbox/<key> (terminal=delivered/dropped); never
+        report queued as sent."""
         accid = self._accid(bot)
         try:
             msg_id = self.backend.send_contact(accid, int(contact_id), text)
@@ -1725,8 +1761,9 @@ class Relay:
 
         Returns {"status","account_id","chat_id","msg_id"} — or {"status":"queued",...} when a
         transient transport failure parks the message in the durable outbox (carries ``key``;
-        poll GET /outbox/<key> — never report queued as sent). Raises KeyError if the bot has no
-        account or no contact resolves for ``addr`` (map to 404 at the endpoint)."""
+        poll GET /outbox/<key> — terminal=delivered/dropped; never report queued as sent).
+        Raises KeyError if the bot has no account or no contact resolves for ``addr`` (map to
+        404 at the endpoint)."""
         accid = self.backend.account_id_for(bot)
         if accid is None:
             raise KeyError(f"no delta account for bot {bot!r}")
@@ -1756,31 +1793,39 @@ class Relay:
     def drain_outbox(self) -> int:
         """Retry the durable outbox; returns the number of messages still pending.
 
-        Success removes the entry; a permanent error (no account/contact, unsendable target)
-        drops it loudly; a transient error keeps it (attempts++) for the next drain. Backend rpc
-        is blocking — callers run this OFF the event loop (asyncio.to_thread / /drain)."""
+        Success → the entry is marked terminal=delivered (RETAINED as a tombstone so a poll is
+        conclusive). A permanent error (no account/contact, unsendable target) → terminal=dropped
+        + last_error (also retained — the poll must see the LOUD drop, not an absence). A
+        transient error keeps the entry pending (attempts++) for the next drain. Parked kinds are
+        retried on the SAME STRICT path they parked under (kind='contact' → send_contact, kind=
+        'chat' → send_chat) — NEVER the legacy disambiguating ``send``, which would re-open the
+        chat↔contact namespace ambiguity on the retry path. Backend rpc is blocking — callers run
+        this OFF the event loop (asyncio.to_thread / /drain)."""
         outbox = self._get_outbox()
         for item in outbox.pending():
             key = item["key"]
             accid = self.backend.account_id_for(item["bot"])
             if accid is None:
-                log.error("outbox: dropping %s — no account for bot %r (permanent)", key, item["bot"])
-                outbox.remove(key)
+                log.error("outbox: DROPPED %s — no account for bot %r (permanent)", key, item["bot"])
+                outbox.mark_terminal(key, "dropped", f"no account for bot {item['bot']!r}")
                 continue
             try:
                 if item["kind"] == "addr":
                     self.backend.send_to_addr(accid, item["target"], item["text"])
-                else:
-                    self.backend.send(accid, int(item["target"]), item["text"])
+                elif item["kind"] == "contact":
+                    self.backend.send_contact(accid, int(item["target"]), item["text"])
+                else:  # "chat" (legacy /send parks and strict send_chat parks alike)
+                    self.backend.send_chat(accid, int(item["target"]), item["text"])
             except (KeyError, TypeError) as e:
-                log.error("outbox: dropping %s — permanent (%s): %s", key, type(e).__name__, e)
-                outbox.remove(key)
+                log.error("outbox: DROPPED %s — permanent (%s): %s", key, type(e).__name__, e)
+                outbox.mark_terminal(key, "dropped", f"{type(e).__name__}: {e}")
             except Exception as e:
                 item["attempts"] = int(item.get("attempts", 0)) + 1
                 item["last_error"] = str(e)
                 log.warning("outbox: retry %s failed (%s) — stays queued", key, e)
             else:
-                outbox.remove(key)
+                log.info("outbox: delivered %s", key)
+                outbox.mark_terminal(key, "delivered")
         outbox.age_out()
         return len(outbox.pending())
 
@@ -2225,11 +2270,13 @@ def create_app(relay: Relay):
     @app.get("/outbox/{key}")
     async def outbox_status(key: str):
         """Poll a PARKED send by its ``key`` (from a ``{"status":"queued","key":...}`` result).
-
-        200 + the entry (attempts, last_error) while the relay is still retrying; 404 once
-        TERMINAL — the entry was removed on DELIVERY or dropped LOUDLY (permanent failure /
-        TTL age-out, log.error). 🔴 A ``queued`` result must NEVER be reported upstream as
-        delivered: entry present = still pending; 404 = delivered-or-dropped, never "sent"."""
+        CONCLUSIVE terminal state — never an ambiguous absence:
+          * 200 + ``terminal:"delivered"`` → sent (message is in the peer's chat).
+          * 200 + ``terminal:"dropped"``   → gave up LOUDLY after retries (see ``last_error``).
+          * 200 + no ``terminal``          → still retrying (``attempts`` / ``last_error``).
+          * 404                            → never existed, or the tombstone aged out (rare).
+        🔴 Never report a queued result upstream as sent unless you poll and see
+        terminal:"delivered"."""
         if relay.outbox is None:
             # nothing has ever been parked (healthz discipline: don't construct /data on a poll)
             raise HTTPException(status_code=404,
@@ -2237,10 +2284,13 @@ def create_app(relay: Relay):
         entry = relay.outbox.get(key)
         if entry is None:
             raise HTTPException(status_code=404, detail="no such outbox entry "
-                                "(delivered, dropped after retries, or never existed)")
-        return {"key": key, "kind": entry.get("kind"), "bot": entry.get("bot"),
-                "target": entry.get("target"), "attempts": entry.get("attempts", 0),
-                "last_error": entry.get("last_error")}
+                                "(never existed, or the terminal tombstone aged out)")
+        out = {"key": key, "kind": entry.get("kind"), "bot": entry.get("bot"),
+               "target": entry.get("target"), "attempts": entry.get("attempts", 0),
+               "last_error": entry.get("last_error")}
+        if "terminal" in entry:   # key-absent while pending, set once delivered/dropped (conclusive)
+            out["terminal"] = entry["terminal"]
+        return out
 
     # -- contacts / channels (mirror /send: 404 on unknown bot, 502 on backend error) --
     async def _run(fn):

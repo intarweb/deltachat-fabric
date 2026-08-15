@@ -361,7 +361,11 @@ def test_backend_send_to_addr_sends_single_unverified_match():
 
 
 class _FlakyBackend(FakeBackend):
-    """Backend that raises a transient transport error on send until ``healthy``."""
+    """Backend that raises a transient transport error on send until ``healthy``.
+
+    Overrides the STRICT paths (send_chat) too: the drain retries a parked kind='chat' entry
+    on the strict chat path (never the legacy disambiguating ``send``), so the flakiness must
+    live there for the retry test to exercise the real drain behavior."""
 
     def __init__(self, accounts: dict[str, int]):
         super().__init__(accounts)
@@ -373,6 +377,12 @@ class _FlakyBackend(FakeBackend):
         if not self.healthy:
             raise RuntimeError("chatmail transport down (transient)")
         return super().send(account_id, chat_id, text)
+
+    def send_chat(self, account_id: int, chat_id: int, text: str) -> int:
+        self.attempts += 1
+        if not self.healthy:
+            raise RuntimeError("chatmail transport down (transient)")
+        return super().send_chat(account_id, chat_id, text)
 
 
 def test_outbox_persists_then_drains(tmp_path):

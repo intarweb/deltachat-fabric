@@ -281,10 +281,11 @@ def test_send_endpoint_returns_queued_on_transient_failure(tmp_path):
 
 
 # The queued CONTRACT (Volund's ask): queued ≠ delivered, and a bot must be able to resolve the
-# outbox handle to a terminal outcome. GET /outbox/<key> reports the parked entry (attempts,
-# last_error) while retrying; 404 once TERMINAL — removed on delivery OR dropped loudly after
-# retries. A 404 must never be read as "sent" (that's why the endpoint says so in its detail).
-def test_outbox_status_endpoint_reports_pending_then_terminal(tmp_path):
+# outbox handle to a CONCLUSIVE terminal outcome — never an absence that could be read as "sent".
+# GET /outbox/<key> reports terminal="delivered" (sent), terminal="dropped" (gave up loudly after
+# retries, with last_error), no terminal (still retrying), or 404 (never existed / tombstone aged
+# out). The relay keeps a terminal TOMBSTONE precisely so the poll sees the outcome, not a blank.
+def test_outbox_status_endpoint_reports_pending_then_conclusive_delivered(tmp_path):
     class _Flaky(FakeBackend):
         def __init__(self, accounts):
             super().__init__(accounts)
@@ -309,13 +310,63 @@ def test_outbox_status_endpoint_reports_pending_then_terminal(tmp_path):
     body = pending.json()
     assert body["key"] == key and body["bot"] == "bot-a" and body["target"] == 42
     assert body["attempts"] == 0 and body["last_error"]
+    assert "terminal" not in body
 
-    # Delivered → entry removed → the same key is now terminal (404, never "sent").
+    # Delivered → the entry is RETAINED as terminal="delivered": the poll is CONCLUSIVE — a
+    # 404 here would have made "delivered" and "dropped-loudly" indistinguishable (Volund's gap).
     backend.healthy = True
     relay.drain_outbox()
-    assert client.get(f"/outbox/{key}").status_code == 404
-    # A key that never existed is 404 too (and with NO outbox ever constructed, no /data side effect).
+    delivered = client.get(f"/outbox/{key}")
+    assert delivered.status_code == 200
+    assert delivered.json()["terminal"] == "delivered"
+    assert relay.outbox.pending() == []          # tombstone is not retried
+
+    # A key that never existed is 404 (and with NO outbox ever constructed, no /data side effect).
     assert client.get("/outbox/never-a-key").status_code == 404
+
+
+def test_outbox_poll_conclusive_dropped(tmp_path):
+    """A permanent failure during drain is observable as terminal="dropped" + last_error — NOT an
+    ambiguous 404. The loud drop happens in the relay's logs; the tombstone makes the sending bot
+    see it (the "same failure shape as the original bug in milder form" Volund flagged)."""
+    backend = FakeBackend(accounts={"bot-a": 7}, device_chats={22})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+    client = TestClient(create_app(relay))
+
+    key = relay._get_outbox().enqueue({"kind": "chat", "bot": "bot-a", "target": 22,
+                                       "text": "hi", "key": "kdrop"})
+    relay.drain_outbox()
+
+    poll = client.get(f"/outbox/{key}")
+    assert poll.status_code == 200
+    assert poll.json()["terminal"] == "dropped"
+    assert "device/self-talk" in poll.json()["last_error"]
+    assert relay.outbox.pending() == []
+
+
+def test_drain_retries_contact_via_send_contact_not_legacy_send(tmp_path):
+    """(Sindri A) A parked kind='contact' entry is retried on the STRICT send_contact path — NEVER
+    the legacy disambiguating ``send``, which would re-open the chat↔contact namespace ambiguity
+    on the retry path (the exact defect the strict split eliminates)."""
+    class _Recorder(FakeBackend):
+        def __init__(self, accounts):
+            super().__init__(accounts, contact_ids={7: {42}})
+            self.legacy_calls = 0
+
+        def send(self, account_id, chat_id, text):          # legacy disambiguating path
+            self.legacy_calls += 1
+            return super().send(account_id, chat_id, text)
+
+    backend = _Recorder(accounts={"bot-a": 7})
+    relay = make_relay(backend, [], [], tmp_path, outbox=Outbox(str(tmp_path)))
+
+    key = relay._get_outbox().enqueue({"kind": "contact", "bot": "bot-a", "target": 42,
+                                       "text": "hi", "key": "kc1"})
+    relay.drain_outbox()
+
+    assert backend.legacy_calls == 0                          # NEVER the disambiguating send
+    assert (7, 1042, "hi") in backend.sent                    # send_contact → 1:1 chat 1000+42
+    assert relay._get_outbox().get("kc1")["terminal"] == "delivered"
 
 
 def test_send_to_addr_resolves_and_returns_chat_and_msg(tmp_path):
