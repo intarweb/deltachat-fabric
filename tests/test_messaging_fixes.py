@@ -83,6 +83,14 @@ class _BasicChat:
         self.is_self_talk = is_self_talk
 
 
+class _BasicContact:
+    """Minimal Contact stand-in carrying the address field send_contact reads."""
+
+    def __init__(self, cid: int):
+        self.id = cid
+        self.address = f"contact{cid}@chatmail.example"
+
+
 class _StubRpc:
     """In-memory rpc stand-in: get_basic_chat_info / get_chat_id_by_contact_id /
     create_chat_by_contact_id / send_msg, with a fake chats/contacts namespace."""
@@ -94,6 +102,8 @@ class _StubRpc:
         # contact_id -> existing 1:1 chat_id (absent = none)
         self.contact_chats: dict[int, int] = {}
         self.created: list[int] = []
+        # contact ids that EXIST (get_contact resolves them; absent = unknown contact)
+        self.contacts: set[int] = set()
 
     # Account-index surface the backend init calls (_reindex_accounts).
     def get_all_account_ids(self) -> list[int]:
@@ -107,6 +117,12 @@ class _StubRpc:
 
     def get_chat_id_by_contact_id(self, _accid: int, cid: int) -> Optional[int]:
         return self.contact_chats.get(cid)
+
+    def get_contact(self, _accid: int, cid: int):
+        """Resolve a contact id; raises on an unknown id (mirrors the real core)."""
+        if cid not in self.contacts:
+            raise KeyError(f"contact {cid} not found")
+        return _BasicContact(cid)
 
     def create_chat_by_contact_id(self, _accid: int, cid: int) -> int:
         # mint a 1:1 chat (id = 1000 + cid) and remember it
@@ -165,6 +181,80 @@ def test_backend_send_resolves_contact_id_creating_chat():
 
     assert 55 in rpc.created
     assert rpc.sent == [(1, 1055, "")]
+
+
+# --------------------------------------------------------------------------- F2b: STRICT send paths
+# (fleet-messaging #16 split-tools contract) — a numeric id must never silently cross the
+# chat↔contact namespace boundary. send_chat = chat-only, send_contact = contact-only, and
+# send_channel uses the strict chat path (no disambiguation fallback).
+
+
+def test_backend_send_chat_uses_live_chat_directly():
+    backend, rpc = _backend_with_rpc()
+    rpc.chats[77] = _BasicChat(77)
+
+    backend.send_chat(1, 77, "hi")
+
+    assert rpc.sent == [(1, 77, "")]
+    assert rpc.created == []   # no contact resolution happened
+
+
+def test_backend_send_chat_refuses_device_chat_with_typed_error():
+    backend, rpc = _backend_with_rpc()
+    rpc.chats[22] = _BasicChat(22, is_device_chat=True)
+
+    with pytest.raises(TypeError, match="device/self-talk chat"):
+        backend.send_chat(1, 22, "hi")
+
+    assert rpc.sent == []      # nothing hit the core
+
+
+# The (a)/(d) fix at the backend level: send_chat to an id that is NOT a live chat must
+# fail loud — it must NOT fall back to the contact path (which is how a stale channel id
+# silently re-resolved to a contact's 1:1 chat and acked 'sent' into the wrong chat).
+def test_backend_send_chat_does_not_resolve_contact_id():
+    backend, rpc = _backend_with_rpc()
+    # 55 is a CONTACT (its 1:1 chat is 33) but NOT a chat id on this account
+    rpc.contact_chats[55] = 33
+    rpc.chats[33] = _BasicChat(33)
+
+    with pytest.raises(KeyError, match="no such chat"):
+        backend.send_chat(1, 55, "hi")
+
+    assert rpc.sent == []      # the legacy send() WOULD have sent to chat 33 here
+
+
+def test_backend_send_contact_resolves_to_chat():
+    backend, rpc = _backend_with_rpc()
+    rpc.contacts.add(55)
+    rpc.contact_chats[55] = 33   # existing 1:1 chat
+    rpc.chats[33] = _BasicChat(33)
+
+    backend.send_contact(1, 55, "hi")
+
+    assert rpc.sent == [(1, 33, "")]
+    assert rpc.created == []
+
+
+def test_backend_send_contact_creates_chat_when_none():
+    backend, rpc = _backend_with_rpc()
+    rpc.contacts.add(55)         # contact exists, no 1:1 chat yet
+
+    backend.send_contact(1, 55, "hi")
+
+    assert 55 in rpc.created
+    assert rpc.sent == [(1, 1055, "")]
+
+
+def test_backend_send_contact_refuses_unknown_contact():
+    backend, rpc = _backend_with_rpc()
+    # 55 does NOT exist as a contact (not in rpc.contacts) — and it IS not a chat either
+    rpc.chats[33] = _BasicChat(33)
+
+    with pytest.raises(KeyError, match="no contact id"):
+        backend.send_contact(1, 55, "hi")
+
+    assert rpc.sent == []
 
 
 # --------------------------------------------------------------------------- F3: durable outbox
