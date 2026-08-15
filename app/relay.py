@@ -467,22 +467,35 @@ class DeltaChat2Backend:
         which may be a stale/address-contact, and it can MISS a listed contact entirely, 404ing a
         send the enumeration clearly contains). Resolve by ENUMERATION instead (the same approach
         ``_resolve_contact`` documents): match the exact address over ``get_contacts``, prefer a
-        verified key-contact. Then ``create_chat_by_contact_id`` (idempotent) → ``send_msg``.
-        Requires the contact to be a verified key-contact (post-securejoin) for the chat to be
-        encryptable. Returns ``(chat_id, msg_id)``. Raises KeyError if no contact resolves.
+        verified key-contact; refuse-and-say-which when MULTIPLE unverified contacts share the
+        address (never guess between duplicates — a wrong-recipient path). Then
+        ``create_chat_by_contact_id`` (idempotent) → ``send_msg``.
+        Returns ``(chat_id, msg_id)``. Raises KeyError if no contact resolves or the address is
+        ambiguous (multiple unverified contacts — securejoin/verify one, then retry).
         """
         from deltachat2 import MessageData  # type: ignore
 
         want = addr.strip().lower()
-        cid = 0
-        for c in (self.rpc.get_contacts(account_id, 0, want) or []):
-            got = (getattr(c, "address", None) or getattr(c, "addr", None) or "").strip().lower()
-            if got != want:
-                continue
-            cid = getattr(c, "id", 0) or cid
-            # prefer a VERIFIED key-contact (the encryptable one); keep the first match as fallback
+        matches = [c for c in (self.rpc.get_contacts(account_id, 0, want) or [])
+                   if (getattr(c, "address", None) or getattr(c, "addr", None) or "").strip().lower() == want]
+        if not matches:
+            raise KeyError(f"no contact for address {addr}")
+        # Prefer a VERIFIED key-contact (the encryptable, post-securejoin one).
+        for c in matches:
             if getattr(c, "is_key_contact", False) and getattr(c, "is_verified", False):
+                cid = getattr(c, "id", 0)
                 break
+        else:
+            # No verified key-contact: a SINGLE match is unambiguous → send to it. MULTIPLE
+            # unverified matches sharing the address are a WRONG-RECIPIENT door — refuse-and-say-
+            # which (never silently pick "the last one" between duplicates); the caller must
+            # securejoin/verify a specific contact, then retry.
+            if len(matches) > 1:
+                who = ", ".join(f"#{getattr(c, 'id', '?')} <{getattr(c, 'address', '?')}>"
+                                for c in matches)
+                raise KeyError(f"ambiguous address {addr}: {len(matches)} unverified contacts "
+                               f"({who}) — verify a key-contact for one, then retry")
+            cid = getattr(matches[0], "id", 0)
         if not cid:
             raise KeyError(f"no contact for address {addr}")
         chat_id = self.rpc.create_chat_by_contact_id(account_id, cid)
@@ -1553,6 +1566,15 @@ class Outbox:
     def pending(self) -> list[dict]:
         return list(self._items)
 
+    def get(self, key: str) -> dict | None:
+        """Return the parked entry for ``key`` — or None once TERMINAL (delivered, or dropped
+        loudly after retries/TTL). This is the pollable terminal-outcome handle for a ``queued``
+        send result (GET /outbox/<key>)."""
+        for i in self._items:
+            if i.get("key") == key:
+                return i
+        return None
+
     def age_out(self, now: float | None = None) -> None:
         """Drop entries past TTL or max_attempts — LOUDLY (they're the caller's lost messages)."""
         now = now if now is not None else time.time()
@@ -1651,8 +1673,11 @@ class Relay:
     def send(self, bot: str, target: int, text: str) -> dict:
         """Send ``text`` from bot ``bot`` (id or localpart) into chat/contact ``target``.
 
-        Returns {"status","msg_id","account_id"} — or {"status":"queued",...} when a transient
-        transport failure parks the message in the durable outbox for retry (never dropped).
+        Returns {"status","msg_id","account_id"} on delivery — or {"status":"queued",...} when a
+        transient transport failure parks the message in the durable outbox for retry (never
+        dropped). 🔴 QUEUED ≠ DELIVERED: the result carries the outbox ``key`` — poll
+        GET /outbox/<key>: entry present = still retrying, gone = delivered-or-dropped-loudly.
+        Never report a queued result upstream as sent.
         Raises KeyError if the bot has no account; TypeError for an unsendable device/self-talk
         chat (map to a clear error, not an opaque core string)."""
         accid = self.backend.account_id_for(bot)
@@ -1668,7 +1693,9 @@ class Relay:
 
     def send_chat(self, bot: str, chat_id: int, text: str) -> dict:
         """STRICT chat-only send: ``chat_id`` is a CHAT, never a contact. KeyError (no such
-        chat) / TypeError (device/self-talk) propagate loud — no namespace reinterpretation."""
+        chat) / TypeError (device/self-talk) propagate loud — no namespace reinterpretation.
+        Queued results (durable outbox, retried) carry ``key`` — poll GET /outbox/<key>; never
+        report queued as sent."""
         accid = self._accid(bot)
         try:
             msg_id = self.backend.send_chat(accid, int(chat_id), text)
@@ -1681,7 +1708,8 @@ class Relay:
 
     def send_contact(self, bot: str, contact_id: int, text: str) -> dict:
         """STRICT contact-only send: ``contact_id`` is a CONTACT, never a chat. KeyError if the
-        contact id does not exist — no disambiguation guessing."""
+        contact id does not exist — no disambiguation guessing. Queued results (durable outbox,
+        retried) carry ``key`` — poll GET /outbox/<key>; never report queued as sent."""
         accid = self._accid(bot)
         try:
             msg_id = self.backend.send_contact(accid, int(contact_id), text)
@@ -1696,8 +1724,9 @@ class Relay:
         """Send ``text`` from ``bot`` to the HUMAN at email ``addr`` (resolves their 1:1 chat).
 
         Returns {"status","account_id","chat_id","msg_id"} — or {"status":"queued",...} when a
-        transient transport failure parks the message in the durable outbox. Raises KeyError if
-        the bot has no account or no contact resolves for ``addr`` (map to 404 at the endpoint)."""
+        transient transport failure parks the message in the durable outbox (carries ``key``;
+        poll GET /outbox/<key> — never report queued as sent). Raises KeyError if the bot has no
+        account or no contact resolves for ``addr`` (map to 404 at the endpoint)."""
         accid = self.backend.account_id_for(bot)
         if accid is None:
             raise KeyError(f"no delta account for bot {bot!r}")
@@ -2192,6 +2221,26 @@ def create_app(relay: Relay):
     async def drain():
         return {"drained": await relay.drain_holds(), "held": len(relay.hold),
                 "outbox": await asyncio.to_thread(relay.drain_outbox)}
+
+    @app.get("/outbox/{key}")
+    async def outbox_status(key: str):
+        """Poll a PARKED send by its ``key`` (from a ``{"status":"queued","key":...}`` result).
+
+        200 + the entry (attempts, last_error) while the relay is still retrying; 404 once
+        TERMINAL — the entry was removed on DELIVERY or dropped LOUDLY (permanent failure /
+        TTL age-out, log.error). 🔴 A ``queued`` result must NEVER be reported upstream as
+        delivered: entry present = still pending; 404 = delivered-or-dropped, never "sent"."""
+        if relay.outbox is None:
+            # nothing has ever been parked (healthz discipline: don't construct /data on a poll)
+            raise HTTPException(status_code=404,
+                                detail="no such outbox entry (nothing has been queued)")
+        entry = relay.outbox.get(key)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="no such outbox entry "
+                                "(delivered, dropped after retries, or never existed)")
+        return {"key": key, "kind": entry.get("kind"), "bot": entry.get("bot"),
+                "target": entry.get("target"), "attempts": entry.get("attempts", 0),
+                "last_error": entry.get("last_error")}
 
     # -- contacts / channels (mirror /send: 404 on unknown bot, 502 on backend error) --
     async def _run(fn):
