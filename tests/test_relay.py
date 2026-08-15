@@ -535,9 +535,30 @@ async def test_wake_metadata_reply_target_dm_is_structured(tmp_path):
     await relay.handle_inbound(msg)
 
     meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
-    assert meta.get("reply_target") == {"kind": "dm", "bot_id": "bot-a", "chat_id": 11}
+    assert meta.get("reply_target") == {"kind": "dm", "bot_id": "bot-a", "chat_id": 11,
+                                        "peer": "terafin"}
     # The human-readable hint is still in the text (backward-compatible) — structured field is additive.
     assert "Reply here on Delta" in wakes[0]["text"]
+
+
+async def test_wake_metadata_reply_target_dm_carries_peer_for_read_time_verification(tmp_path):
+    # ``peer`` names the sender in the reply handle so a bare numeric target that resolves to the
+    # wrong contact is self-evident AT READ TIME (chat ids and contact ids are separate namespaces
+    # with overlapping small integers — volund's misroute cluster). ``from_localpart`` resolves in
+    # _build_inbound; an unresolved sender falls back to "someone".
+    msg = InboundMessage(account_id=7, chat_id=11, msg_id=18, text="ping",
+                         is_group=False, members=[], mentioned=[],
+                         from_localpart="brokkr", rfc724_mid="<rt-peer@chatmail>")
+    backend = FakeBackend(accounts={"bot-a": 7}, inbound=[msg])
+    wakes: list[dict] = []
+    relay = make_relay(backend, [{"name": "bot-a", "url": "http://bot-a.live:8020"}], wakes, tmp_path)
+
+    await relay.handle_inbound(msg)
+
+    meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
+    rt = meta.get("reply_target") or {}
+    assert rt.get("kind") == "dm" and rt.get("chat_id") == 11
+    assert rt.get("peer") == "brokkr"          # the sender is named in the handle
 
 
 async def test_wake_metadata_reply_target_channel_is_structured(tmp_path):
@@ -555,7 +576,7 @@ async def test_wake_metadata_reply_target_channel_is_structured(tmp_path):
     await relay.handle_inbound(msg)
 
     meta = wakes[0]["body"]["params"]["message"].get("metadata") or {}
-    assert meta.get("reply_target") == {"kind": "channel", "channel_id": 99}
+    assert meta.get("reply_target") == {"kind": "channel", "channel_id": 99, "peer": "terafin"}
 
 
 async def test_inbound_direct_1to1_unknown_account_noop(tmp_path):

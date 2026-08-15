@@ -96,16 +96,22 @@ def _stable_task_id(bot_id: str, payload: dict) -> str:
     return ""
 
 
-def _reply_target(kind: str, own: str, chat_id: int) -> dict:
+def _reply_target(kind: str, own: str, chat_id: int, peer: str = "") -> dict:
     """The STRUCTURED, machine-readable companion to ``_reply_hint`` — the same reply handle a
     consumer would otherwise have to parse out of the prose. ``kind`` ∈ {'dm','channel'}. Carries
     exactly the identifiers the reply primitive needs to address the reply:
       channel → {"kind":"channel","channel_id":<id>}  → delta_send_channel(channel_id, text=…)
       dm      → {"kind":"dm","bot_id":<own>,"chat_id":<id>} → delta_send(bot_id=own, target=chat_id, text=…)
-    A consumer reads ``metadata.reply_target`` and dispatches on ``kind`` — no text parsing."""
-    if kind == "channel":
-        return {"kind": "channel", "channel_id": chat_id}
-    return {"kind": "dm", "bot_id": own, "chat_id": chat_id}
+    ``peer`` (the sender's localpart) rides alongside so a bare numeric target is self-evident at
+    read time — chat ids and contact ids are different namespaces with overlapping small integers,
+    and a misroute surfaces the moment the name doesn't match who the handle says it reaches. A
+    consumer reads ``metadata.reply_target`` and dispatches on ``kind`` — no text parsing; ``peer``
+    is additive (older consumers ignore it)."""
+    t = {"kind": "channel", "channel_id": chat_id} if kind == "channel" \
+        else {"kind": "dm", "bot_id": own, "chat_id": chat_id}
+    if peer:
+        t["peer"] = peer
+    return t
 
 
 
@@ -456,15 +462,27 @@ class DeltaChat2Backend:
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
         """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
 
-        lookup_contact_id_by_addr → create_chat_by_contact_id (idempotent: returns the existing
-        verified 1:1 chat if it exists, else creates it) → send_msg. Requires the contact to be
-        a verified key-contact (post-securejoin) for the chat to be encryptable. Returns
-        ``(chat_id, msg_id)``. Verified vs installed deltachat2. Raises KeyError if no contact
-        resolves for ``addr``.
+        🔴 ``lookup_contact_id_by_addr`` is NOT used here: deltachat-core documents it as
+        unreliable ("do not use to look them up" — it returns the most-recently-seen contact,
+        which may be a stale/address-contact, and it can MISS a listed contact entirely, 404ing a
+        send the enumeration clearly contains). Resolve by ENUMERATION instead (the same approach
+        ``_resolve_contact`` documents): match the exact address over ``get_contacts``, prefer a
+        verified key-contact. Then ``create_chat_by_contact_id`` (idempotent) → ``send_msg``.
+        Requires the contact to be a verified key-contact (post-securejoin) for the chat to be
+        encryptable. Returns ``(chat_id, msg_id)``. Raises KeyError if no contact resolves.
         """
         from deltachat2 import MessageData  # type: ignore
 
-        cid = self.rpc.lookup_contact_id_by_addr(account_id, addr)
+        want = addr.strip().lower()
+        cid = 0
+        for c in (self.rpc.get_contacts(account_id, 0, want) or []):
+            got = (getattr(c, "address", None) or getattr(c, "addr", None) or "").strip().lower()
+            if got != want:
+                continue
+            cid = getattr(c, "id", 0) or cid
+            # prefer a VERIFIED key-contact (the encryptable one); keep the first match as fallback
+            if getattr(c, "is_key_contact", False) and getattr(c, "is_verified", False):
+                break
         if not cid:
             raise KeyError(f"no contact for address {addr}")
         chat_id = self.rpc.create_chat_by_contact_id(account_id, cid)
@@ -1882,20 +1900,21 @@ class Relay:
                      msg.account_id, msg.chat_id, msg.msg_id, msg.from_id,
                      msg.is_device_chat, msg.is_system)
             return []
-        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
-                   "rfc724_mid": msg.rfc724_mid,
-                   "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id),
-                   "reply_target": _reply_target("channel", "", msg.chat_id)}
-        # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
-        own = self.backend.localpart_for(msg.account_id)
-        if msg.from_localpart and own and msg.from_localpart == own:
-            return []
         # Carry the resolved sender so consumers can label the wake ("who sent this") instead of
         # each rendering its own default for a missing sender. ``wake()`` forwards only
         # ``payload['text']`` into the a2a envelope, so the sender is baked into the text below;
         # ``from`` is kept as a structured mirror. from_localpart is resolved in _build_inbound;
-        # fall back to "someone" when a contact address doesn't resolve.
+        # fall back to "someone" when a contact address doesn't resolve. Computed up-front so the
+        # reply_target can carry the sender as ``peer`` (self-evident read-time target).
         sender = msg.from_localpart or "someone"
+        payload = {"chat_id": msg.chat_id, "msg_id": msg.msg_id,
+                   "rfc724_mid": msg.rfc724_mid,
+                   "text": f"[Delta Chat] {msg.text}\n" + _reply_hint("channel", "", msg.chat_id),
+                   "reply_target": _reply_target("channel", "", msg.chat_id, peer=sender)}
+        # Self-skip: a bot's own message echoed back to its own account never wakes anyone.
+        own = self.backend.localpart_for(msg.account_id)
+        if msg.from_localpart and own and msg.from_localpart == own:
+            return []
         payload["from"] = sender
         # sender_kind (human|bot): forwarded in the wake metadata so the hook can prioritize a
         # real person over peer-bot chatter. "bot" iff the resolved sender is a fleet-roster
@@ -1917,8 +1936,9 @@ class Relay:
                 + _reply_hint("dm", own, msg.chat_id)
             )
             # Override the channel-default reply_target with the DM handle now that ``own`` (the
-            # account to reply AS) is known — mirrors the text hint above, parse-free.
-            payload["reply_target"] = _reply_target("dm", own, msg.chat_id)
+            # account to reply AS) is known — mirrors the text hint above, parse-free. ``peer``
+            # names the sender so a misrouted numeric target is self-evident at read time.
+            payload["reply_target"] = _reply_target("dm", own, msg.chat_id, peer=sender)
             if await self._deliver(own, payload):
                 self._wake_commit(msg.rfc724_mid, own)
                 return [own]
