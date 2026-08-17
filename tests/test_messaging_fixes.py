@@ -75,10 +75,13 @@ async def test_handle_inbound_still_wakes_human_dm(tmp_path):
 
 
 class _BasicChat:
-    """Minimal BasicChat stand-in carrying exactly the fields _resolve_chat_id reads."""
+    """Minimal BasicChat stand-in carrying exactly the fields _resolve_chat_id reads.
+
+    Mirrors the REAL deltachat2 ``BasicChat`` schema: the chat id field is ``id``, not
+    ``chat_id`` (a mismatch here caused every real strict send to reject with 'no such chat')."""
 
     def __init__(self, chat_id: int, is_device_chat: bool = False, is_self_talk: bool = False):
-        self.chat_id = chat_id
+        self.id = chat_id
         self.is_device_chat = is_device_chat
         self.is_self_talk = is_self_talk
 
