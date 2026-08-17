@@ -63,11 +63,11 @@ def _reply_hint(kind: str, own: str, chat_id: int) -> str:
         return (f"[↳ To REPLY into this channel use the delta_send_channel "
                 f"tool (channel_id={chat_id}, text=<your reply>) — "
                 f"a2a_complete_task does NOT reach the channel.]")
-    call = f'delta_send(bot_id="{own}", target={chat_id}, text=<your reply>)'
+    call = f'delta_send(bot_id="{own}", chat_id={chat_id}, text=<your reply>)'
     if TERMINALIZED:
         return f"[↳ Reply here on Delta: {call}]"
     return (f'[↳ To REPLY on Delta use the delta_send tool (bot_id="{own}", '
-            f"target={chat_id}, text=<your reply>) — a2a_complete_task "
+            f"chat_id={chat_id}, text=<your reply>) — a2a_complete_task "
             f"does NOT reach them on Delta.]")
 
 
@@ -101,7 +101,7 @@ def _reply_target(kind: str, own: str, chat_id: int, peer: str = "") -> dict:
     consumer would otherwise have to parse out of the prose. ``kind`` ∈ {'dm','channel'}. Carries
     exactly the identifiers the reply primitive needs to address the reply:
       channel → {"kind":"channel","channel_id":<id>}  → delta_send_channel(channel_id, text=…)
-      dm      → {"kind":"dm","bot_id":<own>,"chat_id":<id>} → delta_send(bot_id=own, target=chat_id, text=…)
+      dm      → {"kind":"dm","bot_id":<own>,"chat_id":<id>} → delta_send(bot_id=own, chat_id=chat_id, text=…)
     ``peer`` (the sender's localpart) rides alongside so a bare numeric target is self-evident at
     read time — chat ids and contact ids are different namespaces with overlapping small integers,
     and a misroute surfaces the moment the name doesn't match who the handle says it reaches. A

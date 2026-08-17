@@ -4,8 +4,10 @@ Generic: the relay base URL is injected (env ``RELAY_URL``, default the in-conta
 loopback). No fleet identity here. Every tool POSTs/GETs a relay contract (see
 app.relay for the request/response models):
 
-    delta_send          POST {relay}/send            {bot_id,target,text}
-      -> {"status":"sent","msg_id":int,"account_id":int}
+    delta_send          POST {relay}/send_chat       {bot_id,chat_id,text}   (STRICT chat-only)
+      -> {"status":"sent","msg_id":int,"account_id":int,"chat_id":int}
+    delta_send_contact  POST {relay}/send_contact    {bot_id,contact_id,text} (STRICT contact-only)
+      -> {"status":"sent","msg_id":int,"account_id":int,"contact_id":int}
     delta_list_contacts GET  {relay}/contacts?bot_id=
       -> {"account_id":int,"contacts":[{id,address,display_name}, ...]}
     delta_list_channels GET  {relay}/channels?bot_id=
@@ -52,17 +54,44 @@ class _RelayTool:
 
 
 class DeltaSendTool(_RelayTool):
-    """``delta_send`` — send a message as a bot's Delta account via the relay."""
+    """``delta_send`` — send a message as a bot's Delta account via the relay.
+
+    STRICT chat-only: ``chat_id`` is a CHAT (1:1 or group), never a contact. To message a
+    contact by its contact id, use ``delta_send_contact`` — the relay never reinterprets the
+    id between namespaces.
+    """
 
     name = "delta_send"
 
-    async def send(self, bot_id: str, target: int, text: str) -> dict:
-        """Call the relay /send. Returns the relay's JSON on success.
+    async def send(self, bot_id: str, chat_id: int, text: str) -> dict:
+        """Call the relay /send_chat. Returns the relay's JSON on success.
 
         Raises RuntimeError on a non-2xx (e.g. 404 unknown bot), surfacing the relay detail.
         """
         return await self._post(
-            "/send", {"bot_id": bot_id, "target": int(target), "text": text}, self.name
+            "/send_chat", {"bot_id": bot_id, "chat_id": int(chat_id), "text": text}, self.name
+        )
+
+
+class DeltaSendContactTool(_RelayTool):
+    """``delta_send_contact`` — message a CONTACT's 1:1 chat by contact id.
+
+    STRICT contact-only: ``contact_id`` is a CONTACT, never a chat. The relay resolves it to
+    the contact's 1:1 chat (creating it if none exists) — it never reinterprets the id as a
+    chat. The mirror of ``delta_send`` (chat-only).
+    """
+
+    name = "delta_send_contact"
+
+    async def send_contact(self, bot_id: str, contact_id: int, text: str) -> dict:
+        """Call the relay /send_contact. Returns the relay's JSON on success.
+
+        Raises RuntimeError on a non-2xx (e.g. 404 unknown bot or contact), surfacing the relay detail.
+        """
+        return await self._post(
+            "/send_contact",
+            {"bot_id": bot_id, "contact_id": int(contact_id), "text": text},
+            self.name,
         )
 
 

@@ -574,7 +574,7 @@ async def test_inbound_dm_wake_text_carries_delta_send_reply_instruction(tmp_pat
     assert woken == ["bot-a"]
     t = wakes[0]["text"]
     assert "delta_send" in t                 # names the reply tool
-    assert "target=11" in t                  # carries the chat_id to reply into
+    assert "chat_id=11" in t                 # carries the chat_id to reply into
     assert 'bot_id="bot-a"' in t             # which account to send AS
     assert "ping" in t and "terafin" in t    # original DM + sender still present
     # Terminalize is live fleet-wide (default TERMINALIZED on) → crisp hint, NO a2a-negation
