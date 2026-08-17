@@ -17,6 +17,7 @@ from app.mcp_tools import (
     DeltaReactTool,
     DeltaSecureJoinTool,
     DeltaSendChannelTool,
+    DeltaSendContactTool,
     DeltaSendTool,
     DeltaSendToTool,
 )
@@ -27,20 +28,37 @@ def make_tool(handler, cls=DeltaSendTool):
     return cls(relay_url="http://relay.test:8080", client=client)
 
 
-async def test_delta_send_posts_send_contract_and_returns_result():
+async def test_delta_send_posts_send_chat_contract_and_returns_result():
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
         captured["body"] = json.loads(request.content.decode())
-        return httpx.Response(200, json={"status": "sent", "msg_id": 1001, "account_id": 7})
+        return httpx.Response(200, json={"status": "sent", "msg_id": 1001, "account_id": 7, "chat_id": 42})
 
     tool = make_tool(handler)
-    result = await tool.send(bot_id="bot-a", target=42, text="hi")
+    result = await tool.send(bot_id="bot-a", chat_id=42, text="hi")
 
-    assert captured["url"] == "http://relay.test:8080/send"
-    assert captured["body"] == {"bot_id": "bot-a", "target": 42, "text": "hi"}
-    assert result == {"status": "sent", "msg_id": 1001, "account_id": 7}
+    assert captured["url"] == "http://relay.test:8080/send_chat"
+    assert captured["body"] == {"bot_id": "bot-a", "chat_id": 42, "text": "hi"}
+    assert result == {"status": "sent", "msg_id": 1001, "account_id": 7, "chat_id": 42}
+
+
+async def test_delta_send_contact_posts_send_contact_contract_and_returns_result():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={
+            "status": "sent", "msg_id": 1001, "account_id": 7, "contact_id": 42})
+
+    tool = make_tool(handler, DeltaSendContactTool)
+    result = await tool.send_contact(bot_id="bot-a", contact_id=42, text="hi")
+
+    assert captured["url"] == "http://relay.test:8080/send_contact"
+    assert captured["body"] == {"bot_id": "bot-a", "contact_id": 42, "text": "hi"}
+    assert result == {"status": "sent", "msg_id": 1001, "account_id": 7, "contact_id": 42}
 
 
 async def test_delta_send_to_posts_contract_and_returns_result():
@@ -65,7 +83,7 @@ async def test_delta_send_raises_on_unknown_bot():
 
     tool = make_tool(handler)
     with pytest.raises(RuntimeError) as ei:
-        await tool.send(bot_id="bot-c", target=1, text="x")
+        await tool.send(bot_id="bot-c", chat_id=1, text="x")
     assert "404" in str(ei.value)
     assert "bot-c" in str(ei.value)
 

@@ -45,6 +45,7 @@ from .mcp_tools import (
     DeltaReactTool,
     DeltaSecureJoinTool,
     DeltaSendChannelTool,
+    DeltaSendContactTool,
     DeltaSendTool,
     DeltaSendToPeerTool,
     DeltaSendToTool,
@@ -53,6 +54,7 @@ from .mcp_tools import (
 # The tool names exactly as they appear in an MCP client's tools/list.
 TOOL_NAMES = (
     "delta_send",
+    "delta_send_contact",
     "delta_send_to",
     "delta_send_to_peer",
     "delta_list_contacts",
@@ -98,7 +100,7 @@ def _transport_security():
 
 
 def build_mcp(relay_url: Optional[str] = None) -> MCPServer:
-    """Build the ``MCPServer`` (mcp>=2.0) with the 13 delta tools registered.
+    """Build the ``MCPServer`` (mcp>=2.0) with the 14 delta tools registered.
 
     ``relay_url`` is injected into every underlying relay client (falls back to the
     ``RELAY_URL`` env / in-container loopback via ``_RelayTool``). The server is served
@@ -111,6 +113,7 @@ def build_mcp(relay_url: Optional[str] = None) -> MCPServer:
 
     # One relay client per operation, all pointed at the same injected relay_url.
     send_tool = DeltaSendTool(relay_url=relay_url)
+    send_contact_tool = DeltaSendContactTool(relay_url=relay_url)
     send_to_tool = DeltaSendToTool(relay_url=relay_url)
     send_to_peer_tool = DeltaSendToPeerTool(relay_url=relay_url)
     contacts_tool = DeltaListContactsTool(relay_url=relay_url)
@@ -125,22 +128,44 @@ def build_mcp(relay_url: Optional[str] = None) -> MCPServer:
     delete_chat_tool = DeltaDeleteChatTool(relay_url=relay_url)
 
     @mcp.tool(name="delta_send")
-    async def delta_send(bot_id: str, target: int, text: str) -> dict:
-        """Send a direct message as a bot's Delta Chat account.
+    async def delta_send(bot_id: str, chat_id: int, text: str) -> dict:
+        """Send a direct message as a bot's Delta Chat account (STRICT chat-only).
+
+        `chat_id` is a CHAT (a 1:1 or group chat) — never a contact id. Device/self-talk
+        chats are refused with a clear error. To message a contact by its CONTACT id (resolving
+        to the 1:1 chat, creating it if none exists), use delta_send_contact. To reach a person
+        by email address, use delta_send_to.
 
         Args:
             bot_id: The bot/account localpart to send AS.
-            target: A Delta chat id (a 1:1 or group chat) OR a contact id. A contact id is
-                resolved to its 1:1 chat (creating it if none exists), so messaging a contact
-                with no existing thread now works. Device/self-talk chats are refused with a
-                clear error — use delta_send_to with the person's address for those.
+            chat_id: The Delta chat (1:1 or group) id to send into.
             text: The message body.
 
         Returns the relay result, e.g. ``{"status":"sent","msg_id":int,"account_id":int}``
         (or ``{"status":"queued",...}`` when the relay's outbox holds it for a transient
         transport failure — it will retry rather than drop).
         """
-        return await send_tool.send(bot_id=bot_id, target=target, text=text)
+        return await send_tool.send(bot_id=bot_id, chat_id=chat_id, text=text)
+
+    @mcp.tool(name="delta_send_contact")
+    async def delta_send_contact(bot_id: str, contact_id: int, text: str) -> dict:
+        """Message a CONTACT's 1:1 chat by its contact id (STRICT contact-only).
+
+        `contact_id` is a CONTACT — never a chat id. The relay resolves it to the contact's
+        1:1 chat (creating it if none exists), so messaging a contact with no existing thread
+        works. This is the contact-namespace counterpart of delta_send (chat-only); the relay
+        never reinterprets an id between namespaces.
+
+        Args:
+            bot_id: The bot/account localpart to send AS.
+            contact_id: The Delta contact id whose 1:1 chat to send into.
+            text: The message body.
+
+        Returns the relay result, e.g. ``{"status":"sent","msg_id":int,"account_id":int,"contact_id":int}``
+        (or ``{"status":"queued",...}`` when the relay's outbox holds it for a transient
+        transport failure — it will retry rather than drop).
+        """
+        return await send_contact_tool.send_contact(bot_id=bot_id, contact_id=contact_id, text=text)
 
     @mcp.tool(name="delta_send_to")
     async def delta_send_to(bot_id: str, addr: str, text: str) -> dict:

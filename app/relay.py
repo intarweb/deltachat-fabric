@@ -63,11 +63,11 @@ def _reply_hint(kind: str, own: str, chat_id: int) -> str:
         return (f"[↳ To REPLY into this channel use the delta_send_channel "
                 f"tool (channel_id={chat_id}, text=<your reply>) — "
                 f"a2a_complete_task does NOT reach the channel.]")
-    call = f'delta_send(bot_id="{own}", target={chat_id}, text=<your reply>)'
+    call = f'delta_send(bot_id="{own}", chat_id={chat_id}, text=<your reply>)'
     if TERMINALIZED:
         return f"[↳ Reply here on Delta: {call}]"
     return (f'[↳ To REPLY on Delta use the delta_send tool (bot_id="{own}", '
-            f"target={chat_id}, text=<your reply>) — a2a_complete_task "
+            f"chat_id={chat_id}, text=<your reply>) — a2a_complete_task "
             f"does NOT reach them on Delta.]")
 
 
@@ -101,7 +101,7 @@ def _reply_target(kind: str, own: str, chat_id: int, peer: str = "") -> dict:
     consumer would otherwise have to parse out of the prose. ``kind`` ∈ {'dm','channel'}. Carries
     exactly the identifiers the reply primitive needs to address the reply:
       channel → {"kind":"channel","channel_id":<id>}  → delta_send_channel(channel_id, text=…)
-      dm      → {"kind":"dm","bot_id":<own>,"chat_id":<id>} → delta_send(bot_id=own, target=chat_id, text=…)
+      dm      → {"kind":"dm","bot_id":<own>,"chat_id":<id>} → delta_send(bot_id=own, chat_id=chat_id, text=…)
     ``peer`` (the sender's localpart) rides alongside so a bare numeric target is self-evident at
     read time — chat ids and contact ids are different namespaces with overlapping small integers,
     and a misroute surfaces the moment the name doesn't match who the handle says it reaches. A
@@ -298,6 +298,20 @@ class DeltaBackend(Protocol):
         ...
 
 
+def _core_missing_reason(err: Exception) -> str | None:
+    """Classify a deltachat core error as a PERMANENT missing-chat/contact.
+
+    The strict sends must fail LOUD (KeyError → 404) for a nonexistent id, never park it in
+    the outbox to retry forever. The core reports a missing chat/contact as a JsonRpcError
+    whose message names the missing thing; match those strings. Any other error (transient
+    core/transport) returns None → the caller re-raises so the relay parks and retries.
+    """
+    msg = str(err)
+    if any(k in msg for k in ("not found", "no rows", "does not exist", "no chat", "no contact")):
+        return msg
+    return None
+
+
 class DeltaChat2Backend:
     """Default backend over deltachat2 (account-manager + rpc-server on a LOCAL dir).
 
@@ -405,7 +419,7 @@ class DeltaChat2Backend:
                 raise TypeError(
                     f"target {target} is a device/self-talk chat — not sendable; "
                     f"message the person with delta_send_to by email address instead")
-            if getattr(info, "chat_id", 0) == target:
+            if getattr(info, "id", 0) == target:
                 return target
         except TypeError:
             raise
@@ -430,13 +444,20 @@ class DeltaChat2Backend:
         chat-only caller must fail loud instead of guessing which namespace an int belongs to.
         """
         from deltachat2 import MessageData  # type: ignore
+        from deltachat2.transport import JsonRpcError  # type: ignore
 
-        info = self.rpc.get_basic_chat_info(account_id, chat_id)
+        try:
+            info = self.rpc.get_basic_chat_info(account_id, chat_id)
+        except JsonRpcError as e:
+            if _core_missing_reason(e):
+                raise KeyError(
+                    f"no such chat {chat_id} for this account (chat-only send — not a contact id)") from None
+            raise
         if getattr(info, "is_device_chat", False) or getattr(info, "is_self_talk", False):
             raise TypeError(
                 f"chat_id {chat_id} is a device/self-talk chat — not sendable; "
                 f"message the person with delta_send_to by email address instead")
-        if getattr(info, "chat_id", 0) != chat_id:
+        if getattr(info, "id", 0) != chat_id:
             raise KeyError(
                 f"no such chat {chat_id} for this account (chat-only send — not a contact id)")
         return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
@@ -448,6 +469,7 @@ class DeltaChat2Backend:
         id as a chat. Raises KeyError if the contact id does not exist. Same namespace
         discipline as ``send_chat``: the caller states which namespace it means."""
         from deltachat2 import MessageData  # type: ignore
+        from deltachat2.transport import JsonRpcError  # type: ignore
 
         try:
             c = self.rpc.get_contact(account_id, contact_id)
@@ -458,6 +480,13 @@ class DeltaChat2Backend:
             # it propagates → the relay parks the send in the outbox and retries (queued), never a
             # false "no contact id".
             raise KeyError(f"no contact id {contact_id} for this account") from None
+        except JsonRpcError as e:
+            # The core reports a nonexistent contact as a JsonRpcError ("contact Contact#N not
+            # found") — ALSO permanent → loud 404. Any other core error (transient) re-raises so
+            # the relay parks and retries, never a false "no contact id".
+            if _core_missing_reason(e):
+                raise KeyError(f"no contact id {contact_id} for this account") from None
+            raise
         chat_id = self.rpc.get_chat_id_by_contact_id(account_id, contact_id)
         if not chat_id:
             chat_id = self.rpc.create_chat_by_contact_id(account_id, contact_id)

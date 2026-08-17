@@ -38,7 +38,8 @@ def relay_recorder(monkeypatch):
     """Patch httpx.AsyncClient so every relay client in build_mcp uses one MockTransport."""
     recorder = _RecordingTransport(
         {
-            ("POST", "/send"): {"status": "sent", "msg_id": 1, "account_id": 7},
+            ("POST", "/send_chat"): {"status": "sent", "msg_id": 1, "account_id": 7, "chat_id": 42},
+            ("POST", "/send_contact"): {"status": "sent", "msg_id": 1, "account_id": 7, "contact_id": 42},
             ("GET", "/contacts"): {"account_id": 7, "contacts": []},
             ("GET", "/channels"): {"account_id": 7, "channels": []},
             ("POST", "/send_channel"): {"status": "sent", "msg_id": 2, "account_id": 7, "channel_id": 5},
@@ -61,14 +62,15 @@ def relay_recorder(monkeypatch):
 # --------------------------------------------------------------------------- registration
 
 
-async def test_build_mcp_registers_exactly_thirteen_tools_with_right_names():
+async def test_build_mcp_registers_exactly_fourteen_tools_with_right_names():
     mcp = build_mcp(relay_url="http://relay.test:8080")
     tools = await mcp.list_tools()
     names = sorted(t.name for t in tools)
     assert names == sorted(TOOL_NAMES)
-    assert len(tools) == 13
+    assert len(tools) == 14
     assert {"delta_secure_join", "delta_messages", "delta_delete_chat", "delta_send_to"} <= set(names)
     assert {"delta_secure_join", "delta_messages", "delta_create_invite", "delta_send_to_peer"} <= set(names)
+    assert "delta_send_contact" in set(names)
 
 
 async def test_tools_have_clean_schema_for_tools_list():
@@ -77,7 +79,8 @@ async def test_tools_have_clean_schema_for_tools_list():
     tools = {t.name: t for t in await mcp.list_tools()}
 
     expected_args = {
-        "delta_send": {"bot_id", "target", "text"},
+        "delta_send": {"bot_id", "chat_id", "text"},
+        "delta_send_contact": {"bot_id", "contact_id", "text"},
         "delta_list_contacts": {"bot_id"},
         "delta_list_channels": {"bot_id"},
         "delta_send_channel": {"bot_id", "channel_id", "text"},
@@ -102,12 +105,25 @@ def _result_text(res):
 
 async def test_delta_send_delegates_to_relay(relay_recorder):
     mcp = build_mcp(relay_url="http://relay.test:8080")
-    res = await mcp.call_tool("delta_send", {"bot_id": "bot-a", "target": 42, "text": "hi"})
+    res = await mcp.call_tool("delta_send", {"bot_id": "bot-a", "chat_id": 42, "text": "hi"})
     req = relay_recorder.requests[-1]
     assert req.method == "POST"
-    assert req.url.path == "/send"
-    assert json.loads(req.content.decode()) == {"bot_id": "bot-a", "target": 42, "text": "hi"}
+    assert req.url.path == "/send_chat"
+    assert json.loads(req.content.decode()) == {"bot_id": "bot-a", "chat_id": 42, "text": "hi"}
     assert _result_text(res)["status"] == "sent"
+
+
+async def test_delta_send_contact_delegates_to_relay(relay_recorder):
+    mcp = build_mcp(relay_url="http://relay.test:8080")
+    res = await mcp.call_tool(
+        "delta_send_contact", {"bot_id": "bot-a", "contact_id": 42, "text": "hi"}
+    )
+    req = relay_recorder.requests[-1]
+    assert req.method == "POST"
+    assert req.url.path == "/send_contact"
+    assert json.loads(req.content.decode()) == {
+        "bot_id": "bot-a", "contact_id": 42, "text": "hi"}
+    assert _result_text(res)["contact_id"] == 42
 
 
 async def test_delta_list_contacts_delegates_to_relay(relay_recorder):
