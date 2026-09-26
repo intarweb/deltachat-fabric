@@ -13,7 +13,7 @@ import pytest
 
 from app.relay import (
     AgentDirectory,
-    DeltaChat2Backend,
+    DeltaChatBackend,
     HoldQueue,
     InboundMessage,
     Outbox,
@@ -77,7 +77,7 @@ async def test_handle_inbound_still_wakes_human_dm(tmp_path):
 class _BasicChat:
     """Minimal BasicChat stand-in carrying exactly the fields _resolve_chat_id reads.
 
-    Mirrors the REAL deltachat2 ``BasicChat`` schema: the chat id field is ``id``, not
+    Mirrors the real ``BasicChat`` schema: the chat id field is ``id``, not
     ``chat_id`` (a mismatch here caused every real strict send to reject with 'no such chat')."""
 
     def __init__(self, chat_id: int, is_device_chat: bool = False, is_self_talk: bool = False):
@@ -160,9 +160,9 @@ class _StubRpc:
         return len(self.sent) + 500
 
 
-def _backend_with_rpc() -> tuple[DeltaChat2Backend, _StubRpc]:
+def _backend_with_rpc() -> tuple[DeltaChatBackend, _StubRpc]:
     rpc = _StubRpc()
-    backend = DeltaChat2Backend(make_config(), "/tmp/df-fix-test", _rpc=rpc)
+    backend = DeltaChatBackend(make_config(), "/tmp/df-fix-test", _rpc=rpc)
     return backend, rpc
 
 

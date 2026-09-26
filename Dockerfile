@@ -14,7 +14,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Bake pinned deps at BUILD (never runtime-pip). requirements.txt includes
-# deltachat-rpc-server (the Rust binary wheel) + deltachat2 + the HTTP stack.
+# deltachat-rpc-server (the Rust binary wheel) + deltachat-rpc-client + the HTTP stack.
 # (Hash-locking is applied by CI's frozen lockfile — see requirements.txt.)
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

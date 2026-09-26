@@ -3,7 +3,7 @@
 Contract (per the chatmail (Dovecot) server model): a Delta account is provisioned by a
 successful IMAP LOGIN (create-on-login via Dovecot passdb) — idempotent. The actual
 onboarding (add_account + add_or_update_transport, which performs that login AND configures
-the deltachat core) lives in the backend (``relay.DeltaChat2Backend.ensure_account``); this
+the deltachat core) lives in the backend (``relay.DeltaChatBackend.ensure_account``); this
 module holds only the pure, unit-testable pieces: the desired-vs-existing diff, per-bot
 password generation, and username validation. Prune is server-side (operator-owned) — we
 only compute the diff.

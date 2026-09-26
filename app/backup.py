@@ -43,7 +43,7 @@ class BackupBackend(Protocol):
 
 
 class DeltaChat2BackupBackend:
-    """Real backend: reuses a relay ``DeltaChat2Backend``'s account index + its live rpc.
+    """Real backend: reuses a relay ``DeltaChatBackend``'s account index + its live rpc.
 
     ``export_backup`` calls the verified deltachat JSON-RPC ``rpc.export_backup(accid,
     folder, passphrase)`` (imex backup export; passphrase None = unencrypted portable

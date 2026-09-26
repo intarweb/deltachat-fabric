@@ -783,17 +783,17 @@ async def test_inbound_self_echo_skipped(tmp_path):
 def test_core_diagnostic_maps_surfaceable_events():
     """core_diagnostic maps Error/Warning/Securejoin*Progress → (level, text), else None —
     so the decrypt/SMTP/securejoin core events are surfaced to the relay log. Verified vs the
-    installed deltachat2 types."""
-    from deltachat2 import (EventTypeError, EventTypeWarning, EventTypeInfo,
-                            EventTypeSecurejoinInviterProgress)
-    from app.relay import DeltaChat2Backend
-    cd = DeltaChat2Backend.core_diagnostic
-    assert cd(EventTypeError(msg="boom")) == ("error", "boom")
-    lvl, txt = cd(EventTypeWarning(msg="Could not find symmetric secret"))
+    client's event kinds."""
+    from deltachat_rpc_client import AttrDict
+    from app.relay import DeltaChatBackend
+    cd = DeltaChatBackend.core_diagnostic
+    assert cd(AttrDict({"kind": "Error", "msg": "boom"})) == ("error", "boom")
+    lvl, txt = cd(AttrDict({"kind": "Warning", "msg": "Could not find symmetric secret"}))
     assert lvl == "warning" and "symmetric secret" in txt
-    lvl, txt = cd(EventTypeSecurejoinInviterProgress(chat_id=5, chat_type=120, contact_id=9, progress=400))
+    lvl, txt = cd(AttrDict({"kind": "SecurejoinInviterProgress", "chatId": 5,
+                            "chatType": 120, "contactId": 9, "progress": 400}))
     assert lvl == "info" and "progress=400" in txt and "contact=9" in txt
-    assert cd(EventTypeInfo(msg="chatty")) is None      # Info intentionally not surfaced
+    assert cd(AttrDict({"kind": "Info", "msg": "chatty"})) is None  # Info intentionally not surfaced
     assert cd(object()) is None
 
 
@@ -1136,69 +1136,77 @@ def test_react_endpoint(tmp_path):
     assert miss.status_code == 404
 
 
-# --------------------------------------------------------------------------- (7) integration seams: real deltachat2 types + core onboarding
+# --------------------------------------------------------------------------- (7) integration seams: real event shapes + core onboarding
 
 
-def test_incoming_ids_selects_by_type_not_kind_string():
-    """🔴 Regression: deltachat2's ``EventTypeIncomingMsg`` has NO ``.kind`` attribute — it
-    is distinguished by TYPE. The old ``getattr(ev,"kind") == "IncomingMsg"`` check therefore
-    silently dropped EVERY incoming message (would bind + onboard but receive nothing).
-    Verified against the installed deltachat2 (Event.fields = context_id,event;
-    EventTypeIncomingMsg.fields = chat_id,msg_id, no kind)."""
-    from deltachat2 import EventTypeIncomingMsg
+def test_incoming_ids_selects_by_kind():
+    """🔴 The core event carries its type as the ``kind`` STRING, with the payload alongside
+    it — the official client hands this back as an AttrDict (camelCase keys converted to
+    snake_case, reachable by dot access). Selecting on ``kind`` is what makes an incoming
+    message reach routing at all; matching nothing here means a bot binds and onboards but
+    receives nothing."""
+    from deltachat_rpc_client import AttrDict
 
-    from app.relay import DeltaChat2Backend
+    from app.relay import DeltaChatBackend
 
     # a real incoming-message event → (chat_id, msg_id)
-    assert DeltaChat2Backend.incoming_ids(EventTypeIncomingMsg(chat_id=7, msg_id=42)) == (7, 42)
-    # a non-incoming, typed event (no chat_id/msg_id) → ignored
-    assert DeltaChat2Backend.incoming_ids(object()) == (None, None)
-    # defensive dict-shaped fallback still works
-    assert DeltaChat2Backend.incoming_ids(
+    ev = AttrDict({"kind": "IncomingMsg", "chatId": 7, "msgId": 42})
+    assert (ev.chat_id, ev.msg_id) == (7, 42)           # camelCase → snake_case attrs
+    assert DeltaChatBackend.incoming_ids(ev) == (7, 42)
+    # a different event kind → ignored
+    assert DeltaChatBackend.incoming_ids(AttrDict({"kind": "Warning", "msg": "x"})) == (None, None)
+    # raw snake_case dicts behave identically (fakes / tests)
+    assert DeltaChatBackend.incoming_ids(
         {"kind": "IncomingMsg", "chat_id": 1, "msg_id": 2}) == (1, 2)
+    assert DeltaChatBackend.incoming_ids(object()) == (None, None)
 
 
 def test_reaction_ids_selects_incoming_reaction_and_skips_removals():
-    """Reactions arrive as EventTypeIncomingReaction on the core event stream (chat_id,
-    contact_id, msg_id, reaction). A non-empty reaction → the 4-tuple; an EMPTY reaction =
-    the reactor removed it → None (nothing to forward). Verified vs installed deltachat2."""
-    from deltachat2 import EventTypeIncomingReaction
+    """Reactions arrive as an ``IncomingReaction`` core event (chat_id, contact_id, msg_id,
+    reaction) — not in message bodies, so the IMAP/text path never sees them. A non-empty
+    reaction → the 4-tuple; an EMPTY reaction = the reactor removed it → None (nothing to
+    forward)."""
+    from deltachat_rpc_client import AttrDict
 
-    from app.relay import DeltaChat2Backend
+    from app.relay import DeltaChatBackend
 
-    ev = EventTypeIncomingReaction(chat_id=11, contact_id=12, msg_id=17, reaction="👍")
-    assert DeltaChat2Backend.reaction_ids(ev) == (11, 12, 17, "👍")
+    ev = AttrDict({"kind": "IncomingReaction", "chatId": 11, "contactId": 12,
+                   "msgId": 17, "reaction": "👍"})
+    assert DeltaChatBackend.reaction_ids(ev) == (11, 12, 17, "👍")
     # removal (empty reaction) → skipped
-    assert DeltaChat2Backend.reaction_ids(
-        EventTypeIncomingReaction(chat_id=11, contact_id=12, msg_id=17, reaction="")) is None
-    # a non-reaction typed event → None
-    assert DeltaChat2Backend.reaction_ids(object()) is None
+    assert DeltaChatBackend.reaction_ids(
+        AttrDict({"kind": "IncomingReaction", "chatId": 11, "contactId": 12,
+                  "msgId": 17, "reaction": ""})) is None
+    # a different event kind → None
+    assert DeltaChatBackend.reaction_ids(object()) is None
 
 
 def test_securejoin_ids_selects_completed_inviter_progress():
-    """A securejoin completes for the INVITER (realm lead) as EventTypeSecurejoinInviterProgress
+    """A securejoin completes for the INVITER (realm lead) as ``SecurejoinInviterProgress``
     with progress==1000 (deltachat's done sentinel). securejoin_ids returns the joiner's
-    contact_id on completion, None for in-progress or the wrong event type. Verified vs installed
-    deltachat2 (EventTypeSecurejoinInviterProgress.fields = chat_id,chat_type,contact_id,progress)."""
-    from deltachat2 import EventTypeSecurejoinInviterProgress, EventTypeSecurejoinJoinerProgress
+    contact_id on completion, None for in-progress or the wrong event kind. This event drives
+    channel provisioning — no wait, no poll."""
+    from deltachat_rpc_client import AttrDict
 
-    from app.relay import DeltaChat2Backend
+    from app.relay import DeltaChatBackend
 
-    done = EventTypeSecurejoinInviterProgress(chat_id=5, chat_type=120, contact_id=42, progress=1000)
-    assert DeltaChat2Backend.securejoin_ids(done) == 42
+    done = AttrDict({"kind": "SecurejoinInviterProgress", "chatId": 5, "chatType": 120,
+                     "contactId": 42, "progress": 1000})
+    assert DeltaChatBackend.securejoin_ids(done) == 42
     # in-progress (< 1000) → not yet verified → None
-    assert DeltaChat2Backend.securejoin_ids(
-        EventTypeSecurejoinInviterProgress(chat_id=5, chat_type=120, contact_id=42, progress=400)) is None
+    assert DeltaChatBackend.securejoin_ids(
+        AttrDict({"kind": "SecurejoinInviterProgress", "chatId": 5, "chatType": 120,
+                  "contactId": 42, "progress": 400})) is None
     # the JOINER-side progress event is not what drives lead provisioning → None
-    assert DeltaChat2Backend.securejoin_ids(
-        EventTypeSecurejoinJoinerProgress(contact_id=42, progress=1000)) is None
-    # a non-securejoin typed event → None
-    assert DeltaChat2Backend.securejoin_ids(object()) is None
+    assert DeltaChatBackend.securejoin_ids(
+        AttrDict({"kind": "SecurejoinJoinerProgress", "contactId": 42, "progress": 1000})) is None
+    # a different event kind → None
+    assert DeltaChatBackend.securejoin_ids(object()) is None
 
 
 class _FakeRpc:
     """Records core onboarding calls so ensure_account is unit-tested with no live rpc-server.
-    Mirrors the deltachat2 Rpc surface ensure_account uses (verified against the package)."""
+    Mirrors the RPC surface ensure_account uses."""
 
     def __init__(self):
         self.accounts: dict[int, str | None] = {}   # accid -> configured addr
@@ -1223,8 +1231,9 @@ class _FakeRpc:
             self.accounts[accid] = val
 
     def add_or_update_transport(self, accid, param):
+        # `param` is the camelCase dict the core's JSON-RPC API takes.
         self.transports.append((accid, param))
-        self.accounts[accid] = param.addr           # core now knows the configured addr
+        self.accounts[accid] = param["addr"]        # core now knows the configured addr
         self.configured.add(accid)
 
     def is_configured(self, accid):
@@ -1240,12 +1249,12 @@ class _FakeRpc:
 def test_ensure_account_onboards_into_the_core_not_just_imap(tmp_path):
     """🔴 Bug 2 regression: onboarding must add+configure the account IN THE DELTACHAT CORE
     (add_account + add_or_update_transport), not merely IMAP-login — that's why /data/accounts
-    had 0 .db files. Uses the REAL deltachat2 EnteredLoginParam/Socket via a fake rpc."""
-    from app.relay import DeltaChat2Backend
+    had 0 .db files. The transport param is the camelCase dict the core's JSON-RPC accepts."""
+    from app.relay import DeltaChatBackend
 
     rpc = _FakeRpc()
     cfg = make_config()  # mail_domain = deltachat.example.net
-    be = DeltaChat2Backend(cfg, str(tmp_path / "accounts"), _rpc=rpc)
+    be = DeltaChatBackend(cfg, str(tmp_path / "accounts"), _rpc=rpc)
 
     ok = be.ensure_account("bot-a", "pw123456789",
                            imap_host="mail.example.net", imap_port=993,
@@ -1255,10 +1264,11 @@ def test_ensure_account_onboards_into_the_core_not_just_imap(tmp_path):
     # onboarded INTO THE CORE: exactly one transport configured, with the right addr + ports.
     assert len(rpc.transports) == 1
     accid, param = rpc.transports[0]
-    assert param.addr == "bot-a@deltachat.example.net"
-    assert (param.imap_server, param.imap_port) == ("mail.example.net", 993)
-    assert (param.smtp_server, param.smtp_port) == ("mail.example.net", 587)
-    assert str(param.imap_security) == "ssl" and str(param.smtp_security) == "starttls"
+    assert param["addr"] == "bot-a@deltachat.example.net"
+    assert (param["imapServer"], param["imapPort"]) == ("mail.example.net", 993)
+    assert (param["smtpServer"], param["smtpPort"]) == ("mail.example.net", 587)
+    # Socket is serde camelCase: the core accepts only these lowercase spellings.
+    assert param["imapSecurity"] == "ssl" and param["smtpSecurity"] == "starttls"
     assert rpc.is_configured(accid)
     assert accid in rpc.started                      # start_io called → begins receiving
     # the backend now indexes the account by localpart (so /send can resolve it)
@@ -1267,10 +1277,10 @@ def test_ensure_account_onboards_into_the_core_not_just_imap(tmp_path):
 
 def test_ensure_account_is_idempotent_skips_already_configured(tmp_path):
     """A second reconcile pass for an already-configured account is a no-op (no re-add)."""
-    from app.relay import DeltaChat2Backend
+    from app.relay import DeltaChatBackend
 
     rpc = _FakeRpc()
-    be = DeltaChat2Backend(make_config(), str(tmp_path / "accounts"), _rpc=rpc)
+    be = DeltaChatBackend(make_config(), str(tmp_path / "accounts"), _rpc=rpc)
     kw = dict(imap_host="mail.example.net", imap_port=993,
               smtp_host="mail.example.net", smtp_port=587)
 
@@ -1279,18 +1289,18 @@ def test_ensure_account_is_idempotent_skips_already_configured(tmp_path):
     assert len(rpc.transports) == 1                                  # NOT re-onboarded
 
 
-def test_contact_to_dict_normalizes_deltachat2_contact_object():
-    """🔴 Regression: deltachat2 get_contacts() returns Contact OBJECTS (.id/.address/
+def test_contact_to_dict_normalizes_a_contact_record():
+    """🔴 Regression: get_contacts() returns contact RECORDS (.id/.address/
     .display_name), NOT ids — list_contacts must build from the object, not re-fetch by id.
     Verified vs the installed package."""
-    from app.relay import DeltaChat2Backend
+    from app.relay import DeltaChatBackend
 
-    class Contact:            # mimics deltachat2.types.Contact
+    class Contact:            # mimics an attribute-accessible client record
         id = 12
         address = "bot-a@deltachat.example.net"
         display_name = "bot-a"
 
-    assert DeltaChat2Backend._contact_to_dict(Contact()) == {
+    assert DeltaChatBackend._contact_to_dict(Contact()) == {
         "id": 12, "address": "bot-a@deltachat.example.net", "display_name": "bot-a"}
 
     class Legacy:             # tolerate addr/name fallbacks
@@ -1298,7 +1308,7 @@ def test_contact_to_dict_normalizes_deltachat2_contact_object():
         addr = "x@y.net"
         name = "x"
 
-    d = DeltaChat2Backend._contact_to_dict(Legacy())
+    d = DeltaChatBackend._contact_to_dict(Legacy())
     assert d["address"] == "x@y.net" and d["display_name"] == "x"
 
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.relay import DeltaChat2Backend
+from app.relay import DeltaChatBackend
 
 
 class _FakeRpc:
@@ -42,10 +42,10 @@ class _FakeRpc:
         return None
 
 
-def _backend(rpc) -> DeltaChat2Backend:
+def _backend(rpc) -> DeltaChatBackend:
     from app.config import Config
 
-    return DeltaChat2Backend(
+    return DeltaChatBackend(
         Config(mail_domain="deltachat.example.net", imap_host="mail.example.net"),
         "/tmp/unused",
         _rpc=rpc,
