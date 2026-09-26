@@ -247,6 +247,23 @@ class InboundVerified:
     addr: str = ""
 
 
+def contact_is_key_contact(c) -> bool:
+    """True iff contact ``c`` is a VERIFIED key-contact — the state a completed securejoin
+    leaves behind (the encryptable, post-securejoin contact).
+
+    🔴 Do NOT also require an ``is_verified`` field. The core's Contact object has no such
+    field — ``deltachat-rpc-server --openrpc`` defines it as ``address, authName, color,
+    displayName, e2eeAvail, freshness, id, isBlocked, isBot, isKeyContact, lastSeen, name,
+    profileImage, status`` — and ``isKeyContact`` is the verified-key-contact signal
+    (deltachat-desktop#5430). ``getattr(c, "is_verified", False)`` therefore reads False for
+    every contact, so every pair looks unverified and every peer-mesh send queues as
+    "securejoin-pending" until the TTL or a restart drops it.
+
+    Only asserts POSITIVELY — an unknown/absent field is simply not a key-contact.
+    """
+    return bool(getattr(c, "is_key_contact", False))
+
+
 class DeltaBackend(Protocol):
     """Thin injectable seam over the deltachat account-manager + rpc-server.
 
@@ -579,7 +596,7 @@ class DeltaChatBackend:
             raise KeyError(f"no contact for address {addr}")
         # Prefer a VERIFIED key-contact (the encryptable, post-securejoin one).
         for c in matches:
-            if getattr(c, "is_key_contact", False) and getattr(c, "is_verified", False):
+            if contact_is_key_contact(c):
                 cid = getattr(c, "id", 0)
                 break
         else:
@@ -621,11 +638,15 @@ class DeltaChatBackend:
         try:
             matches = self.rpc.get_contacts(account_id, 0, addr) or []
         except Exception:
+            # LOUD, not silent: a raising lookup and a genuinely unverified pair are otherwise
+            # indistinguishable to the caller, so a broken rpc call would quietly park every
+            # send on a queue-until-verified that can never drain.
+            log.exception("is_verified_key_contact: get_contacts failed for acct=%s addr=%s — "
+                          "treating as UNVERIFIED (send will queue)", account_id, addr)
             return False
         want = addr.strip().lower()
         for c in matches:
-            if (getattr(c, "is_key_contact", False)
-                    and getattr(c, "is_verified", False)
+            if (contact_is_key_contact(c)
                     and (getattr(c, "address", "") or "").strip().lower() == want):
                 return True
         return False
@@ -900,8 +921,8 @@ class DeltaChatBackend:
         it to an encrypted chat ("Only key-contacts can be added to encrypted chats"). And
         lookup_contact_id_by_addr returns the most-recently-seen contact (may be the
         address-contact) per deltachat-core api.rs ("do not use to look them up"). So enumerate
-        contacts matching the address and return the key-contact (prefer a verified one). Raise
-        if none — the member must securejoin first.
+        contacts matching the address and return the key-contact. Raise if none — the member must
+        securejoin first.
         """
         matches = self.rpc.get_contacts(account_id, 0, contact) or []
         addr = contact.strip().lower()
@@ -912,7 +933,9 @@ class DeltaChatBackend:
             raise KeyError(
                 f"no key-contact for {contact} — securejoin required before adding to an "
                 f"encrypted group (create_contact would make an unaddable address-contact)")
-        keyc.sort(key=lambda c: 0 if getattr(c, "is_verified", False) else 1)
+        # Every entry is already a key-contact, so order by id for a DETERMINISTIC pick when the
+        # address has duplicates (a bare "first match" would inherit the rpc's ordering).
+        keyc.sort(key=lambda c: getattr(c, "id", 0))
         return keyc[0].id
 
     def create_channel(self, account_id: int, name: str, members: list[str]) -> int:  # pragma: no cover
@@ -1568,6 +1591,27 @@ class PeerMesh:
         self._inflight.discard(key)
         return self._flush_queue(sender_accid, key, time.monotonic())
 
+    def flush_verified_reverse(self, account_id: int, addr: str) -> int:
+        """Flush the OTHER direction of a verified pair: (peer-at-``addr`` → ``account_id``'s
+        address). Returns the count delivered; 0 when the peer has no account here.
+
+        ``flush_verified`` drains (account_id→addr). The reverse pair is keyed on the PEER as
+        sender, so it is only drained by a verified event on the peer's own account — which the
+        core does not necessarily emit, because a mutual securejoin fires once, on whichever side
+        completed. Since the pair op has the TARGET join the SENDER's invite, the completion
+        event normally lands on the target and the sender-keyed queue would otherwise sit until
+        the TTL drops it. Never raises (composes with the on_verified handler)."""
+        peer_lp = (addr or "").split("@", 1)[0].strip()
+        if not peer_lp:
+            return 0
+        peer_accid = self.backend.account_id_for(peer_lp)
+        if peer_accid is None:
+            return 0
+        self_lp = self.backend.localpart_for(account_id)
+        if self_lp is None:
+            return 0
+        return self.flush_verified(peer_accid, f"{self_lp}@{self.config.mail_domain}")
+
     def pending_count(self) -> int:
         """Total queued (un-verified) messages across all pairs — for /healthz visibility."""
         return sum(len(q) for q in self._queues.values())
@@ -1922,10 +1966,20 @@ class Relay:
         return self.peer_mesh.send_to_peer(sender_bot, target_bot, text)
 
     def flush_verified_pair(self, account_id: int, addr: str) -> int:
-        """On a securejoin-VERIFIED event, flush any peer-mesh messages queued for the
-        (account_id→addr) pair — in order, exactly-once. Returns the count delivered.
-        Composed alongside provision_verified_member (does not replace it)."""
-        return self.peer_mesh.flush_verified(account_id, addr)
+        """On a securejoin-VERIFIED event, flush any peer-mesh messages queued for BOTH
+        directions of the (account_id↔addr) pair — in order, exactly-once. Returns the count
+        delivered. Composed alongside provision_verified_member (does not replace it).
+
+        A securejoin is a MUTUAL state, but the core emits ONE verified event, on whichever
+        account reached progress=1000. The peer-mesh queue is keyed by SENDER, so draining only
+        (account_id→addr) covers just the pairs whose sender happens to be the completing
+        account. The pair op has the TARGET join the SENDER's invite, so completion normally
+        lands on the TARGET — i.e. on the direction that holds no queue. Both directions are
+        drained here so the pair delivers regardless of which side finished; a no-op direction
+        costs nothing (flush returns 0 for an empty pair)."""
+        delivered = self.peer_mesh.flush_verified(account_id, addr)
+        delivered += self.peer_mesh.flush_verified_reverse(account_id, addr)
+        return delivered
 
     def _accid(self, bot: str) -> int:
         """Resolve a bot id/localpart to its Delta account id. KeyError if none."""

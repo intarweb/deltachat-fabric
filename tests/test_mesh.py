@@ -257,6 +257,46 @@ def test_relay_flush_verified_pair_delegates_to_mesh(tmp_path):
     assert backend.sent_to == [(7, addr, "one")]
 
 
+def test_verified_event_on_target_flushes_the_sender_queue(tmp_path):
+    """REGRESSION: the pair op has the TARGET join the SENDER's invite, so progress=1000
+    normally fires on the TARGET's account — but the queue is keyed by SENDER. Draining only
+    (event_account→addr) therefore misses the queued pair entirely and the message sits until
+    the TTL drops it. The flush must cover the reverse direction too."""
+    backend = FakeBackend(accounts={"bot-a": 7, "bot-b": 9})
+    relay = _make_relay(backend, tmp_path)
+    relay.send_to_peer("bot-a", "bot-b", "from-a")
+
+    # completion lands on the TARGET (bot-b, acct 9) naming the SENDER's address
+    ev_addr = f"bot-a@{DOMAIN}"
+    backend.mark_verified(9, ev_addr)
+    assert relay.flush_verified_pair(9, ev_addr) == 1
+    # delivered from bot-a's account (7) to bot-b's address — the queued direction
+    assert backend.sent_to == [(7, f"bot-b@{DOMAIN}", "from-a")]
+    assert relay.peer_mesh.pending_count() == 0
+
+
+def test_verified_event_flushes_both_directions(tmp_path):
+    """One verified event for a pair drains BOTH queues (each direction is keyed separately)."""
+    backend = FakeBackend(accounts={"bot-a": 7, "bot-b": 9})
+    relay = _make_relay(backend, tmp_path)
+    relay.send_to_peer("bot-a", "bot-b", "a-to-b")
+    relay.send_to_peer("bot-b", "bot-a", "b-to-a")
+
+    backend.mark_verified(9, f"bot-a@{DOMAIN}")
+    assert relay.flush_verified_pair(9, f"bot-a@{DOMAIN}") == 2
+    assert (7, f"bot-b@{DOMAIN}", "a-to-b") in backend.sent_to
+    assert (9, f"bot-a@{DOMAIN}", "b-to-a") in backend.sent_to
+    assert relay.peer_mesh.pending_count() == 0
+
+
+def test_flush_verified_reverse_is_noop_for_unknown_peer():
+    """A peer with no account here (or a malformed addr) is a silent no-op, never a raise."""
+    mesh, backend = make_mesh({"bot-a": 7})
+    assert mesh.flush_verified_reverse(7, f"ghost@{DOMAIN}") == 0
+    assert mesh.flush_verified_reverse(7, "") == 0
+    assert backend.sent_to == []
+
+
 def test_send_to_peer_endpoint(tmp_path):
     from fastapi.testclient import TestClient
     from app.relay import create_app
