@@ -11,8 +11,8 @@ deploy from env / a mounted roster). This module is publishable as a generic ima
 Everything that touches the outside world is behind a thin, INJECTABLE interface so the
 whole engine is unit-testable with no live rpc-server and no live network:
 
-  * ``DeltaBackend``   — wraps the deltachat2 account-manager + rpc-server (the ONLY
-                         place deltachat2 is imported). Default = ``DeltaChat2Backend``
+  * ``DeltaBackend``   — wraps the Delta Chat client + rpc-server (the ONLY place the
+                         client is imported). Default = ``DeltaChatBackend``
                          (constructed lazily). Tests inject a fake.
   * ``AgentDirectory`` — resolves a bot's LIVE a2a URL from the a2abridge directory and
                          POSTs the wake. Uses an injectable ``httpx.AsyncClient`` so tests
@@ -116,13 +116,79 @@ def _reply_target(kind: str, own: str, chat_id: int, peer: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Delta backend — the ONLY place deltachat2 is touched. Injectable + swappable.
+# Delta backend — the ONLY place the Delta Chat client is touched. Injectable + swappable.
 # ---------------------------------------------------------------------------
+
+
+def _attr(obj):
+    """Expose a client reply as the official client's ``AttrDict``.
+
+    The official client returns the core's own JSON (plain dicts). ``AttrDict`` — the
+    client's own type — converts camelCase keys to snake_case and allows dot access, which
+    is the shape this backend's readers are written against.
+
+    This is a pure REPRESENTATION change, and deliberately so: it adds no fields,
+    substitutes no values and drops nothing, so what the backend reads is exactly what the
+    core sent. (Contrast a version-reconciliation shim that invents values for fields a
+    newer core stopped sending — that fabricates data and misleads the caller.)
+    """
+    from deltachat_rpc_client import AttrDict  # type: ignore
+
+    if isinstance(obj, dict):
+        return AttrDict(obj)
+    if isinstance(obj, list):
+        return [_attr(item) for item in obj]
+    return obj
+
+
+class _AttrRpc:
+    """``Rpc`` whose replies are unwrapped into ``AttrDict``.
+
+    Wrapping at the boundary rather than at each of the ~18 call sites makes it impossible
+    to miss one — a missed site would read attributes off a plain dict and silently yield
+    empties instead of raising.
+    """
+
+    def __init__(self, rpc) -> None:
+        self._rpc = rpc
+
+    def __getattr__(self, name):
+        attr = getattr(self._rpc, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            return _attr(attr(*args, **kwargs))
+
+        return call
+
+
+def _kind(ev) -> str:
+    """The event-type discriminator from a core event.
+
+    ``deltachat_rpc_client`` hands back each event as an ``AttrDict`` whose ``kind`` is the
+    event name (``"IncomingMsg"``, ``"IncomingReaction"``, …). Falls back to the raw dict
+    key so a plain ``dict`` from a fake or an older shape behaves identically.
+    """
+    if ev is None:
+        return ""
+    if isinstance(ev, dict):
+        return str(ev.get("kind") or "")
+    return str(getattr(ev, "kind", "") or "")
+
+
+def _field(ev, name, default=None):
+    """Read one payload field from a core event, whichever shape it arrived in."""
+    if ev is None:
+        return default
+    if isinstance(ev, dict):
+        return ev.get(name, default)
+    return getattr(ev, name, default)
 
 
 @dataclass
 class InboundMessage:
-    """Normalized inbound message, backend-agnostic (so routing never sees deltachat2).
+    """Normalized inbound message, backend-agnostic (so routing never sees the client).
 
     ``account_id`` is the receiving bot's Delta account id; ``chat_id`` the group/contact
     chat; ``members`` the localparts of the chat's other bot members (resolved by the
@@ -152,7 +218,7 @@ class InboundReaction:
 
     ``account_id`` is the bot whose message was reacted to; ``msg_id`` the reacted message;
     ``from_addr`` the reactor's email (resolved by the backend, so routing never sees
-    deltachat2); ``emoji`` the reaction (never empty — an empty reaction = removal, dropped
+    the client); ``emoji`` the reaction (never empty — an empty reaction = removal, dropped
     upstream in the backend).
     """
     account_id: int
@@ -172,7 +238,7 @@ class InboundVerified:
     realm lead (the core emitted inviter-progress == complete on the lead's account).
 
     ``account_id`` is the LEAD's account (the securejoin inviter); ``addr`` the member's email
-    (resolved by the backend, so provisioning never sees deltachat2). This is the event that
+    (resolved by the backend, so provisioning never sees the client). This is the event that
     drives channel provisioning — when it fires, the member can be added to the realm's
     encrypted channel — replacing the old reconcile-time wait/poll for verification.
     """
@@ -184,7 +250,7 @@ class InboundVerified:
 class DeltaBackend(Protocol):
     """Thin injectable seam over the deltachat account-manager + rpc-server.
 
-    Kept deliberately small so a fake in tests is trivial and the real deltachat2
+    Kept deliberately small so a fake in tests is trivial and the real client
     binding is swappable without touching relay logic.
     """
 
@@ -312,38 +378,35 @@ def _core_missing_reason(err: Exception) -> str | None:
     return None
 
 
-class DeltaChat2Backend:
-    """Default backend over deltachat2 (account-manager + rpc-server on a LOCAL dir).
+class DeltaChatBackend:
+    """Default backend over the OFFICIAL Delta Chat client + rpc-server on a LOCAL dir.
 
-    deltachat2 / deltachat-rpc-client are imported LAZILY inside ``__init__`` so importing
+    ``deltachat-rpc-client`` is imported LAZILY inside ``__init__`` so importing
     ``app.relay`` (and unit-testing it with a fake backend) needs neither the package nor a
     live rpc-server. Account DBs live under ``accounts_dir`` — MUST be a local volume
     (SQLCipher over NFS corrupts).
 
-    deltachat2 API surface used (verified via deltachat-bot/deltabot-cli-py autodocs,
-    context7 /deltachat-bot/deltabot-cli-py):
-      * ``Rpc(IOTransport(accounts_dir=...))``      — account manager + rpc-server handle
+    The official client proxies JSON-RPC method names generically (``Rpc.__getattr__``
+    returns an ``RpcMethod``) and returns the core's own JSON, so there is no generated
+    schema to fall out of step with the core. Replies are unwrapped into the client's
+    ``AttrDict`` (camelCase → snake_case, dot access) by ``_AttrRpc``.
+
+    JSON-RPC surface used:
+      * ``Rpc(accounts_dir=...)``                     — spawns + owns the rpc-server
       * ``rpc.get_all_account_ids() -> list[int]``
-      * ``rpc.get_config(accid, "addr") -> str``    — configured address of an account
-      * ``rpc.send_msg(accid, chatid, MsgData(text=...)) -> int``   — returns sent msg id
-      * ``rpc.get_next_event() -> RawEvent``         — event stream
+      * ``rpc.get_config(accid, "addr") -> str``      — configured address of an account
+      * ``rpc.send_msg(accid, chatid, {"text": ...}) -> int``       — returns sent msg id
+      * ``rpc.get_next_event() -> dict``              — event stream (blocks until one arrives)
       * ``rpc.get_message(accid, msgid)`` / ``rpc.get_basic_chat_info`` /
         ``rpc.get_chat_contacts(accid, chatid) -> list[int]`` / ``rpc.get_contact(accid, cid)``
-      * ``rpc.create_group_chat(accid, name, protect=False) -> int``  — new group (verified)
-
-    ⚠ deltachat2 API used but NOT verifiable from the autodocs I could reach (context7
-    /deltachat-bot/deltabot-cli-py returned no signature). These are the documented
-    deltachat JSON-RPC names; the calls are isolated HERE behind ``DeltaBackend`` +
-    ``# pragma: no cover`` with defensive getattr, so an API drift can be fixed in one
-    place without touching relay logic. VERIFY against the deployed core before prod:
-      * ``rpc.get_contacts(accid, listflags, query) -> list[int]``   — enumerate contacts
-      * ``rpc.create_contact(accid, addr, name) -> int``             — addr → contact id
-      * ``rpc.add_contact_to_chat(accid, chatid, contact_id)``       — add member
-      * ``rpc.send_reaction(accid, msgid, [emoji]) -> int``          — react to a message
-      * ``rpc.get_chatlist_entries`` / ``rpc.get_basic_chat_info``   — enumerate group chats
-    Exact event-enum + message-snapshot field names differ across core versions; the
-    normalization below is defensive (getattr/dict fallbacks). Anything version-fragile is
-    isolated HERE, behind the ``DeltaBackend`` seam — never in relay logic.
+      * ``rpc.get_contacts(accid, listflags, query)`` — enumerate contacts
+      * ``rpc.create_contact(accid, addr, name) -> int``            — addr → contact id
+      * ``rpc.add_contact_to_chat(accid, chatid, contact_id)``      — add member
+      * ``rpc.send_reaction(accid, msgid, [emoji]) -> int``         — react to a message
+      * ``rpc.get_chatlist_entries`` / ``rpc.get_basic_chat_info``  — enumerate group chats
+      * ``rpc.create_group_chat(accid, name, protect=False) -> int`` — new group
+    Calls are isolated HERE behind ``DeltaBackend`` + ``# pragma: no cover`` with defensive
+    getattr, so an API drift is fixed in one place without touching relay logic.
     """
 
     def __init__(self, config: Config, accounts_dir: str, *, _rpc: Any = None,
@@ -354,14 +417,21 @@ class DeltaChat2Backend:
         self._localpart_to_accid: dict[str, int] = {}
         if _rpc is not None:
             self.rpc = _rpc
-        else:  # pragma: no cover - requires the deltachat2 package + rpc-server binary
-            from deltachat2 import IOTransport, Rpc  # type: ignore
+        else:  # pragma: no cover - requires the deltachat-rpc-client + rpc-server binary
+            from deltachat_rpc_client import Rpc  # type: ignore
 
             Path(accounts_dir).mkdir(parents=True, exist_ok=True)
-            trans = _io_transport or IOTransport(accounts_dir=accounts_dir)
-            trans.start()
-            self.rpc = Rpc(trans)
-            self.rpc.start_io_for_all_accounts()
+            # The OFFICIAL client, shipped from the same repo as the core and versioned in
+            # lockstep with it. It proxies every JSON-RPC method generically and hands back
+            # the core's own JSON — no generated dataclasses, so there is no schema for the
+            # core to drift out from under. (A third-party binding that deserializes into
+            # typed dataclasses breaks on every core API change: it demands fields the core
+            # has removed, and every reply touching the changed type fails to parse.)
+            rpc = Rpc(accounts_dir=accounts_dir)
+            rpc.start()
+            for accid in rpc.get_all_account_ids():
+                rpc.start_io(accid)
+            self.rpc = _AttrRpc(rpc)
         self._reindex_accounts()
 
     # -- account index -----------------------------------------------------
@@ -395,13 +465,11 @@ class DeltaChat2Backend:
         returned no rows" are opaque at the MCP layer); otherwise the id is treated as a
         CONTACT id and resolved to (or creates) the 1:1 chat — the same resolution
         ``send_to_addr`` uses, which is why delta_send_to works where delta_send to a contact
-        id with no existing thread fails. deltachat2's message-data type is MessageData (NOT
+        id with no existing thread fails. The message body is the core's MessageData shape,
         MsgData — verified vs the installed package; send_msg(accid, chat_id, MessageData) -> int).
         """
-        from deltachat2 import MessageData  # type: ignore
-
         chat_id = self._resolve_chat_id(account_id, target)
-        return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+        return self.rpc.send_msg(account_id, chat_id, {"text": text})
 
     def _resolve_chat_id(self, account_id: int, target: int) -> int:  # pragma: no cover
         """Resolve a send ``target`` to a sendable chat id (chat id OR contact id in → chat out).
@@ -427,7 +495,7 @@ class DeltaChat2Backend:
             pass  # not a live chat → contact path below
 
         # Not a chat → contact id. get_chat_id_by_contact_id returns None when no 1:1 chat
-        # exists (verified vs installed deltachat2); create_chat_by_contact_id is idempotent
+        # exists; create_chat_by_contact_id is idempotent
         # (returns the existing or newly-created 1:1 chat — the send_to_addr precedent).
         chat_id = self.rpc.get_chat_id_by_contact_id(account_id, target)
         if not chat_id:
@@ -443,8 +511,7 @@ class DeltaChat2Backend:
         a contact's 1:1 chat and the send acks 'sent' while landing in the wrong place. A
         chat-only caller must fail loud instead of guessing which namespace an int belongs to.
         """
-        from deltachat2 import MessageData  # type: ignore
-        from deltachat2.transport import JsonRpcError  # type: ignore
+        from deltachat_rpc_client import JsonRpcError  # type: ignore
 
         try:
             info = self.rpc.get_basic_chat_info(account_id, chat_id)
@@ -460,7 +527,7 @@ class DeltaChat2Backend:
         if getattr(info, "id", 0) != chat_id:
             raise KeyError(
                 f"no such chat {chat_id} for this account (chat-only send — not a contact id)")
-        return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+        return self.rpc.send_msg(account_id, chat_id, {"text": text})
 
     def send_contact(self, account_id: int, contact_id: int, text: str) -> int:  # pragma: no cover
         """STRICT contact-only send — the mirror of ``send_chat``.
@@ -468,8 +535,7 @@ class DeltaChat2Backend:
         A CONTACT id in → resolve to its 1:1 chat (create if none) and send. NEVER treats the
         id as a chat. Raises KeyError if the contact id does not exist. Same namespace
         discipline as ``send_chat``: the caller states which namespace it means."""
-        from deltachat2 import MessageData  # type: ignore
-        from deltachat2.transport import JsonRpcError  # type: ignore
+        from deltachat_rpc_client import JsonRpcError  # type: ignore
 
         try:
             c = self.rpc.get_contact(account_id, contact_id)
@@ -490,7 +556,7 @@ class DeltaChat2Backend:
         chat_id = self.rpc.get_chat_id_by_contact_id(account_id, contact_id)
         if not chat_id:
             chat_id = self.rpc.create_chat_by_contact_id(account_id, contact_id)
-        return self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+        return self.rpc.send_msg(account_id, chat_id, {"text": text})
 
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
         """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
@@ -506,8 +572,6 @@ class DeltaChat2Backend:
         Returns ``(chat_id, msg_id)``. Raises KeyError if no contact resolves or the address is
         ambiguous (multiple unverified contacts — securejoin/verify one, then retry).
         """
-        from deltachat2 import MessageData  # type: ignore
-
         want = addr.strip().lower()
         matches = [c for c in (self.rpc.get_contacts(account_id, 0, want) or [])
                    if (getattr(c, "address", None) or getattr(c, "addr", None) or "").strip().lower() == want]
@@ -532,7 +596,7 @@ class DeltaChat2Backend:
         if not cid:
             raise KeyError(f"no contact for address {addr}")
         chat_id = self.rpc.create_chat_by_contact_id(account_id, cid)
-        msg_id = self.rpc.send_msg(account_id, chat_id, MessageData(text=text))
+        msg_id = self.rpc.send_msg(account_id, chat_id, {"text": text})
         return chat_id, msg_id
 
     # -- securejoin (accept a verified invite → inviter becomes a key-contact) ----
@@ -541,7 +605,7 @@ class DeltaChat2Backend:
 
         This IS the key-exchange: on success the inviter becomes a VERIFIED KEY-CONTACT of
         this account (so they can then be added to an encrypted chat). Returns the resulting
-        chat id. Verified vs the installed deltachat2 (``secure_join(account_id, qr) -> int``).
+        chat id (``rpc.secure_join(account_id, qr) -> int``).
         Blocking (network handshake) — callers run it off the loop.
         """
         return self.rpc.secure_join(account_id, invite)
@@ -569,7 +633,7 @@ class DeltaChat2Backend:
     def delete_chat(self, account_id: int, chat_id: int) -> None:  # pragma: no cover - real rpc
         """Delete ``chat_id`` from ``account_id``. Clears the chat and any in-progress
         securejoin half-handshake it carries, so a single clean securejoin can complete.
-        Verified vs installed deltachat2 (``delete_chat(account_id, chat_id) -> None``).
+        ``rpc.delete_chat(account_id, chat_id) -> None``.
         """
         self.rpc.delete_chat(account_id, int(chat_id))
 
@@ -578,24 +642,13 @@ class DeltaChat2Backend:
     def incoming_ids(ev) -> tuple[Optional[int], Optional[int]]:
         """(chat_id, msg_id) if ``ev`` is an incoming-message event, else (None, None).
 
-        🔴 deltachat2 deserializes each event to a TYPED dataclass — ``EventTypeIncomingMsg``
-        carries ``chat_id`` + ``msg_id`` and has **NO ``kind`` attribute** (the type IS the
-        discriminator). So we must select by ``isinstance``, NOT a ``kind`` string — a
-        ``getattr(ev,"kind")`` check silently drops EVERY incoming message. Kept as a pure
-        staticmethod so it's unit-tested against the real deltachat2 types (no rpc/network).
-        Verified against the installed deltachat2 (Event.fields = context_id,event;
-        EventTypeIncomingMsg.fields = chat_id,msg_id)."""
-        try:
-            from deltachat2 import EventTypeIncomingMsg  # type: ignore
-            if isinstance(ev, EventTypeIncomingMsg):
-                return ev.chat_id, ev.msg_id
-        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
-            pass
-        # defensive fallbacks: raw dict-shaped events, or a like-named type from another core
-        if isinstance(ev, dict) and ev.get("kind") == "IncomingMsg":
-            return ev.get("chat_id"), ev.get("msg_id")
-        if type(ev).__name__ == "EventTypeIncomingMsg":
-            return getattr(ev, "chat_id", None), getattr(ev, "msg_id", None)
+        🔴 The official client (``deltachat_rpc_client``) yields each core event as an
+        ``AttrDict`` — a plain dict with camelCase keys converted to snake_case and exposed
+        via dot access. The event type is the ``kind`` STRING, so select on ``kind`` and
+        read the payload fields as attributes. Kept as a pure staticmethod so it's unit-
+        tested against the real event shape (no rpc/network)."""
+        if _kind(ev) == "IncomingMsg":
+            return _field(ev, "chat_id"), _field(ev, "msg_id")
         return None, None
 
     @staticmethod
@@ -603,22 +656,16 @@ class DeltaChat2Backend:
         """(chat_id, contact_id, msg_id, emoji) if ``ev`` is an incoming-REACTION event with a
         non-empty reaction, else None.
 
-        🔴 Reactions arrive on the deltachat CORE event stream as ``EventTypeIncomingReaction``
+        🔴 Reactions arrive on the deltachat CORE event stream as ``IncomingReaction``
         (fields chat_id/contact_id/msg_id/reaction) — NOT in message bodies, so the IMAP/text
         path never sees them. An EMPTY ``reaction`` string = the reactor REMOVED their reaction
-        → return None (nothing to forward). Select by isinstance (the type is the discriminator),
-        mirroring incoming_ids. Verified vs installed deltachat2."""
-        try:
-            from deltachat2 import EventTypeIncomingReaction  # type: ignore
-            if isinstance(ev, EventTypeIncomingReaction):
-                return (ev.chat_id, ev.contact_id, ev.msg_id, ev.reaction) if ev.reaction else None
-        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
-            pass
-        if type(ev).__name__ == "EventTypeIncomingReaction":
-            emoji = getattr(ev, "reaction", "") or ""
+        → return None (nothing to forward). Selected on ``kind``, mirroring incoming_ids."""
+        if _kind(ev) == "IncomingReaction":
+            emoji = _field(ev, "reaction") or ""
             if not emoji:
                 return None
-            return getattr(ev, "chat_id", None), getattr(ev, "contact_id", None), getattr(ev, "msg_id", None), emoji
+            return (_field(ev, "chat_id"), _field(ev, "contact_id"),
+                    _field(ev, "msg_id"), emoji)
         return None
 
     @staticmethod
@@ -627,23 +674,13 @@ class DeltaChat2Backend:
         became a verified key-contact of this inviter), else None.
 
         🔴 The realm lead is the securejoin INVITER (it creates the invite; members join), so
-        completion surfaces as ``EventTypeSecurejoinInviterProgress`` with ``progress == 1000``
-        (deltachat-core's "securejoin done" sentinel) on the LEAD's account. Select by isinstance
-        (the type is the discriminator), mirroring incoming_ids/reaction_ids. This is the event
-        that drives EVENT-DRIVEN channel provisioning — no wait, no poll. Verified vs the
-        installed deltachat2 (EventTypeSecurejoinInviterProgress.fields =
-        chat_id,chat_type,contact_id,progress)."""
-        try:
-            from deltachat2 import EventTypeSecurejoinInviterProgress  # type: ignore
-            if isinstance(ev, EventTypeSecurejoinInviterProgress):
-                if int(getattr(ev, "progress", 0) or 0) >= 1000:
-                    return getattr(ev, "contact_id", None)
-                return None
-        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
-            pass
-        if (type(ev).__name__ == "EventTypeSecurejoinInviterProgress"
-                and int(getattr(ev, "progress", 0) or 0) >= 1000):
-            return getattr(ev, "contact_id", None)
+        completion surfaces as ``SecurejoinInviterProgress`` with ``progress == 1000``
+        (deltachat-core's "securejoin done" sentinel) on the LEAD's account. Selected on
+        ``kind``, mirroring incoming_ids/reaction_ids. This is the event that drives
+        EVENT-DRIVEN channel provisioning — no wait, no poll."""
+        if _kind(ev) == "SecurejoinInviterProgress":
+            if int(_field(ev, "progress") or 0) >= 1000:
+                return _field(ev, "contact_id")
         return None
 
     @staticmethod
@@ -654,38 +691,30 @@ class DeltaChat2Backend:
         human→bot securejoin that can't decrypt emits core Warnings ("Could not find symmetric
         secret" → "Fetched unencrypted message, ignoring"). Mapped to a log level (select by
         isinstance, mirroring incoming_ids/reaction_ids/securejoin_ids; verified vs installed
-        deltachat2):
+        the client):
           Error → error · Warning → warning (covers decrypt/SMTP/IMAP-connect failures) ·
           Securejoin{Inviter,Joiner}Progress → info (shows a handshake advancing / stuck / silent).
         EventTypeInfo is intentionally NOT surfaced (too chatty). Returns None for everything else.
         """
-        try:
-            from deltachat2 import (EventTypeError, EventTypeWarning,  # type: ignore
-                                    EventTypeSecurejoinInviterProgress,
-                                    EventTypeSecurejoinJoinerProgress)
-            if isinstance(ev, EventTypeError):
-                return ("error", getattr(ev, "msg", "") or "")
-            if isinstance(ev, EventTypeWarning):
-                return ("warning", getattr(ev, "msg", "") or "")
-            if isinstance(ev, EventTypeSecurejoinInviterProgress):
-                return ("info", f"securejoin inviter: contact={getattr(ev, 'contact_id', None)} "
-                                f"progress={getattr(ev, 'progress', None)}")
-            if isinstance(ev, EventTypeSecurejoinJoinerProgress):
-                return ("info", f"securejoin joiner: contact={getattr(ev, 'contact_id', None)} "
-                                f"progress={getattr(ev, 'progress', None)}")
-        except Exception:  # pragma: no cover - deltachat2 always present in the image/tests
-            pass
+        kind = _kind(ev)
+        if kind == "Error":
+            return ("error", _field(ev, "msg") or "")
+        if kind == "Warning":
+            return ("warning", _field(ev, "msg") or "")
+        if kind in ("SecurejoinInviterProgress", "SecurejoinJoinerProgress"):
+            who = "inviter" if kind == "SecurejoinInviterProgress" else "joiner"
+            return ("info", f"securejoin {who}: contact={_field(ev, 'contact_id')} "
+                            f"progress={_field(ev, 'progress')}")
         return None
 
     def next_inbound(self):  # pragma: no cover - real rpc entry
         raw = self.rpc.get_next_event()
         if raw is None:
             return None
-        # deltachat2 Event: the account id is ``context_id`` (verified vs installed package);
-        # older bindings used ``account_id``/``accid``.
-        accid = (getattr(raw, "context_id", None) or getattr(raw, "account_id", None)
-                 or getattr(raw, "accid", None) or 0)
-        ev = getattr(raw, "event", raw)
+        # The core's event envelope carries the account id as ``context_id``.
+        accid = (_field(raw, "context_id") or _field(raw, "account_id")
+                 or _field(raw, "accid") or 0)
+        ev = _field(raw, "event") or raw
         # Surface diagnostically-useful core events to the relay log (never invisible again).
         diag = self.core_diagnostic(ev)
         if diag is not None:
@@ -725,7 +754,7 @@ class DeltaChat2Backend:
         own_message = False
         rfc724_mid = ""
         try:
-            from deltachat2 import SpecialContactId  # type: ignore
+            from deltachat_rpc_client import SpecialContactId  # type: ignore
             m = self.rpc.get_message(accid, msg_id)
             own_message = int(getattr(m, "from_id", 0) or 0) == int(SpecialContactId.SELF)
         except Exception:
@@ -769,7 +798,7 @@ class DeltaChat2Backend:
         # then a get_contact(from_id) lookup — chatmail key-contacts (securejoin/PGP) can populate
         # .address on only one of the two. Warn-log if still unresolved so a real relayed DM that
         # fails leaves from_id/sender in the log to finish the diagnosis (verified vs installed
-        # deltachat2: Message has .from_id + .sender, Contact has .address).
+        # AttrDict: Message has .from_id + .sender, Contact has .address).
         def _localpart(c) -> str:
             if c is None:
                 return ""
@@ -808,12 +837,12 @@ class DeltaChat2Backend:
         )
 
     # -- contacts / channels ----------------------------------------------
-    # deltachat2 signatures below verified against the installed package: get_contacts ->
+    # Client reply shapes: get_contacts ->
     # list[Contact] (OBJECTS with .id/.address/.display_name, NOT ids); get_chatlist_entries
     # -> list[int]; get_chat_contacts -> list[int]; ChatType is a str-enum ("Group"/"Single").
     @staticmethod
     def _contact_to_dict(contact) -> dict:
-        """Normalize a deltachat2 Contact object → {id,address,display_name}. Pure (no rpc),
+        """Normalize a Contact (AttrDict) → {id,address,display_name}. Pure (no rpc),
         so it's unit-testable; the field fallbacks tolerate minor cross-version drift."""
         return {
             "id": getattr(contact, "id", None),
@@ -826,14 +855,14 @@ class DeltaChat2Backend:
         return self._contact_to_dict(self.rpc.get_contact(accid, cid))
 
     def list_contacts(self, account_id: int) -> list[dict]:  # pragma: no cover
-        # 🔴 get_contacts returns list[Contact] OBJECTS (verified vs installed deltachat2), not
+        # 🔴 get_contacts returns contact records (AttrDicts), not
         # ids — build the dicts directly. Fall back to id-fetch for a legacy binding that
         # returns ints.
         items = self.rpc.get_contacts(account_id, 0, None)
         out: list[dict] = []
         for item in (items or []):
             if hasattr(item, "address") or hasattr(item, "id"):
-                out.append(self._contact_to_dict(item))       # Contact object (deltachat2)
+                out.append(self._contact_to_dict(item))       # Contact (AttrDict)
             else:
                 out.append(self._contact_dict(account_id, item))  # int id (legacy)
         return out
@@ -899,19 +928,38 @@ class DeltaChat2Backend:
         self.rpc.send_reaction(account_id, msg_id, [emoji])
 
     def list_messages(self, account_id: int, chat_id: int, limit: int = 20) -> list[dict]:  # pragma: no cover
-        # get_message_ids(accid, chatid, info_only, add_daymarker) -> list[int] (verified);
-        # read the newest `limit` via get_message. Defensive per-message so one bad id doesn't
-        # abort the read.
+        # get_message_ids(accid, chatid, info_only, add_daymarker) -> list[int];
+        # read the newest `limit` via get_message. Per-message failure must not abort the
+        # read (one bad id shouldn't blank a chat) — but it must not be SILENT either.
+        #
+        # 🔴 A bare `except Exception: continue` here makes every failure indistinguishable
+        # from an empty chat: a read path that errors on every message returns `[]`, and the
+        # caller is told "no messages" by a service that is in fact broken. So this logs the
+        # failure, and when NONE of the requested messages could be read it raises rather
+        # than reporting an empty chat.
         ids = self.rpc.get_message_ids(account_id, int(chat_id), False, False) or []
         out: list[dict] = []
+        failed: list[tuple[int, Exception]] = []
         for mid in ids[-int(limit):]:
             try:
                 m = self.rpc.get_message(account_id, mid)
                 out.append({"id": mid, "text": getattr(m, "text", "") or "",
                             "from_id": getattr(m, "from_id", 0) or 0,
                             "reactions": self._reactions_for(account_id, mid)})
-            except Exception:
+            except Exception as e:
+                failed.append((mid, e))
                 continue
+        if failed:
+            log.warning(
+                "list_messages: %d/%d messages unreadable in chat %s (account %s); first error: %r",
+                len(failed), len(failed) + len(out), chat_id, account_id, failed[0][1],
+            )
+        if failed and not out:
+            # Every message we tried to read failed — that is a broken read path, not an
+            # empty chat. Surface it rather than returning a misleading [].
+            raise RuntimeError(
+                f"could not read any of {len(failed)} messages in chat {chat_id}: {failed[0][1]}"
+            ) from failed[0][1]
         return out
 
     def _reactions_for(self, account_id: int, msg_id: int) -> list[dict]:  # pragma: no cover - real rpc
@@ -930,7 +978,7 @@ class DeltaChat2Backend:
     def create_invite(self, account_id: int, target_addr: Optional[str] = None) -> str:  # pragma: no cover - real rpc
         # get_chat_securejoin_qr_code(accid, None) -> the account's securejoin CONTACT-invite
         # link (i.delta.chat/#...); a human taps it to become a verified contact. Verified vs
-        # installed deltachat2. ``target_addr`` is passed through to the FIRMWARE's
+        # client. ``target_addr`` is passed through to the FIRMWARE's
         # securejoin-pre-bind registry (relay-side) for MITM-binding; it does NOT alter the
         # signed URL (the OpenPGP signature s= locks a=/n= to the bot's self-identity).
         if target_addr:
@@ -954,13 +1002,12 @@ class DeltaChat2Backend:
         on every pass, including already-onboarded accounts. BLOCKING — callers must run it off
         the event loop (main._make_onboard uses asyncio.to_thread).
 
-        Verified against adbenitez/deltachat2: ``add_or_update_transport`` supersedes the
+        ``add_or_update_transport`` supersedes the
         deprecated (2025-02) ``configure``; ``EnteredLoginParam``/``Socket`` field names +
         ``is_configured``/``start_io`` signatures. Isolated here behind DeltaBackend so an API
         drift is a one-place fix. Returns True iff the account is configured after the call.
         """
-        from deltachat2 import EnteredLoginParam, Socket  # type: ignore
-
+        
         desired_addr = f"{localpart}@{self.config.mail_domain}"
         existing = self._localpart_to_accid.get(localpart)
         if existing is not None:
@@ -983,12 +1030,14 @@ class DeltaChat2Backend:
         except Exception:
             pass
         self._set_displayname(accid, display_name)  # name humans see (best-effort)
-        param = EnteredLoginParam(
-            addr=desired_addr,
-            password=password,
-            imap_server=imap_host, imap_port=int(imap_port), imap_security=Socket.SSL,
-            smtp_server=smtp_host, smtp_port=int(smtp_port), smtp_security=Socket.STARTTLS,
-        )
+        # The core's EnteredLoginParam, as the camelCase dict the JSON-RPC API accepts.
+        # The Socket enum is serde-rename_all camelCase, so the wire values are lowercase.
+        param = {
+            "addr": desired_addr,
+            "password": password,
+            "imapServer": imap_host, "imapPort": int(imap_port), "imapSecurity": "ssl",
+            "smtpServer": smtp_host, "smtpPort": int(smtp_port), "smtpSecurity": "starttls",
+        }
         self.rpc.add_or_update_transport(accid, param)  # blocks until configuration finishes
         try:
             ok = bool(self.rpc.is_configured(accid))
@@ -2412,7 +2461,7 @@ def build_default(config: Optional[Config] = None) -> Relay:  # pragma: no cover
     config = config or Config.load()
     accounts_dir = os.environ.get("ACCOUNTS_DIR", "/data/accounts")
     data_dir = os.environ.get("DATA_DIR", "/data")
-    backend = DeltaChat2Backend(config, accounts_dir)
+    backend = DeltaChatBackend(config, accounts_dir)
     client = httpx.AsyncClient(timeout=10.0)
     directory = AgentDirectory(config, client)
     hold = HoldQueue(data_dir)

@@ -474,14 +474,12 @@ async def reconciler_loop(config: Config, secrets: SecretsStore,
 # ---------------------------------------------------------------------------
 # Inbound event pump — runs the BLOCKING deltachat event stream OFF the loop.
 #
-# 🔴 This is the fix for the startup-freeze bug: deltachat2's get_next_event()
-# long-polls (blocks the calling thread until a core event). Running it on the
-# asyncio event loop froze both uvicorns at "Waiting for application startup"
-# (they could never finish lifespan startup → never bound). The canonical
-# deltachat-rpc-client integration is a dedicated thread that blocks on the event
-# stream and bridges each incoming message onto the asyncio loop via
-# asyncio.run_coroutine_threadsafe. (Verified: adbenitez/deltachat2 +
-# deltachat-bot/deltabot-cli-py both use the thread model.)
+# 🔴 This is the fix for the startup-freeze bug: ``get_next_event()`` long-polls (it
+# blocks the calling thread until a core event). Running it on the asyncio event loop
+# froze both uvicorns at "Waiting for application startup" (they could never finish
+# lifespan startup → never bound). The client's own integration model is a dedicated
+# thread that blocks on the event stream and bridges each incoming message onto the
+# asyncio loop via asyncio.run_coroutine_threadsafe.
 # ---------------------------------------------------------------------------
 
 

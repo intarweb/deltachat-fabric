@@ -35,13 +35,13 @@ core / chatmail server**, so we know the deploy-time live-verify is load-bearing
   - `test_incoming_ids_selects_by_type_not_kind_string` — guards the message-drop bug:
     `EventTypeIncomingMsg` is selected by **type**, not a (non-existent) `.kind` string.
   - `test_ensure_account_onboards_into_the_core_not_just_imap` + idempotency — onboarding
-    calls `add_account` + `add_or_update_transport` (real deltachat2 `EnteredLoginParam`/
+    calls `add_account` + `add_or_update_transport` (the real `EnteredLoginParam` dict/
     `Socket` types via a fake rpc), not merely an IMAP login.
   - **Host-header / DNS-rebinding** — the boot test POSTs a real `initialize` to `/mcp` with a
     non-localhost `Host: mcp-deltachat:8000` and asserts it is **not 421-rejected** (the bug
     that blocked an in-cluster gateway); `test_transport_security_*` guard the setting.
 
-deltachat2 API usage is verified against the **installed package** (not just docs):
+Client API usage is verified against the **installed package** (not just docs):
 `EnteredLoginParam`/`Socket` fields, `Rpc.{add_account,add_or_update_transport,is_configured,
 start_io,get_next_event,...}` signatures, and `Event.context_id` / `EventTypeIncomingMsg`
 shape.

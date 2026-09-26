@@ -1,5 +1,17 @@
 # Delta Chat Fabric — dependencies (baked at BUILD time, never runtime-pip).
-deltachat2>=1.0
+#
+# Both Delta Chat packages come from the core's own repo (deltachat-core-rust) and ship in
+# lockstep with it. `deltachat-rpc-server` is the core binary; `deltachat-rpc-client` is the
+# OFFICIAL Python client, which proxies JSON-RPC method names generically and returns the
+# core's own JSON. Neither carries a generated schema, so any core release parses.
+#
+# 🔴 Do NOT reintroduce `deltachat2`. It is a third-party binding that deserializes replies
+# into generated dataclasses via dacite, so it demands the exact field set of the one core
+# release it was generated against. The core adds and removes JSON-RPC fields freely, so any
+# reply carrying a changed type fails to deserialize under it — a missing field raises
+# MissingValueError, which the relay surfaces as a 502 (e.g. /contacts failing for every bot
+# once the core dropped `is_verified` from the contact object). That failure is silent at
+# build time and appears only at runtime, on the request path.
 deltachat-rpc-server>=1.147
 deltachat-rpc-client>=1.147
 fastapi>=0.110.0
