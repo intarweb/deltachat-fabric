@@ -899,19 +899,38 @@ class DeltaChat2Backend:
         self.rpc.send_reaction(account_id, msg_id, [emoji])
 
     def list_messages(self, account_id: int, chat_id: int, limit: int = 20) -> list[dict]:  # pragma: no cover
-        # get_message_ids(accid, chatid, info_only, add_daymarker) -> list[int] (verified);
-        # read the newest `limit` via get_message. Defensive per-message so one bad id doesn't
-        # abort the read.
+        # get_message_ids(accid, chatid, info_only, add_daymarker) -> list[int];
+        # read the newest `limit` via get_message. Per-message failure must not abort the
+        # read (one bad id shouldn't blank a chat) — but it must not be SILENT either.
+        #
+        # 🔴 A bare `except Exception: continue` here makes every failure indistinguishable
+        # from an empty chat: a read path that errors on every message returns `[]`, and the
+        # caller is told "no messages" by a service that is in fact broken. So this logs the
+        # failure, and when NONE of the requested messages could be read it raises rather
+        # than reporting an empty chat.
         ids = self.rpc.get_message_ids(account_id, int(chat_id), False, False) or []
         out: list[dict] = []
+        failed: list[tuple[int, Exception]] = []
         for mid in ids[-int(limit):]:
             try:
                 m = self.rpc.get_message(account_id, mid)
                 out.append({"id": mid, "text": getattr(m, "text", "") or "",
                             "from_id": getattr(m, "from_id", 0) or 0,
                             "reactions": self._reactions_for(account_id, mid)})
-            except Exception:
+            except Exception as e:
+                failed.append((mid, e))
                 continue
+        if failed:
+            log.warning(
+                "list_messages: %d/%d messages unreadable in chat %s (account %s); first error: %r",
+                len(failed), len(failed) + len(out), chat_id, account_id, failed[0][1],
+            )
+        if failed and not out:
+            # Every message we tried to read failed — that is a broken read path, not an
+            # empty chat. Surface it rather than returning a misleading [].
+            raise RuntimeError(
+                f"could not read any of {len(failed)} messages in chat {chat_id}: {failed[0][1]}"
+            ) from failed[0][1]
         return out
 
     def _reactions_for(self, account_id: int, msg_id: int) -> list[dict]:  # pragma: no cover - real rpc
