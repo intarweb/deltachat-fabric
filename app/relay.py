@@ -357,10 +357,16 @@ class DeltaChat2Backend:
         else:  # pragma: no cover - requires the deltachat2 package + rpc-server binary
             from deltachat2 import IOTransport, Rpc  # type: ignore
 
+            from .transport_compat import ContactCompatTransport
+
             Path(accounts_dir).mkdir(parents=True, exist_ok=True)
+            # The transport is wrapped so replies stay parseable when the runner's core is
+            # newer than the binding's generated schema — the binding is generated against
+            # one core release and the image tracks the core forward, so they are
+            # reconciled here rather than pinned to each other.
             trans = _io_transport or IOTransport(accounts_dir=accounts_dir)
             trans.start()
-            self.rpc = Rpc(trans)
+            self.rpc = Rpc(ContactCompatTransport(trans))
             self.rpc.start_io_for_all_accounts()
         self._reindex_accounts()
 

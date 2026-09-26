@@ -1,36 +1,7 @@
 # Delta Chat Fabric — dependencies (baked at BUILD time, never runtime-pip).
-#
-# 🔴 The three deltachat packages are a VERSION-LOCKED TRIO — pin all three to the
-# SAME version, and never let an unbounded range resolve them independently.
-# `deltachat2` is a third-party binding (github.com/adbenitez/deltachat2) that
-# deserializes core's JSON-RPC replies into typed dataclasses via dacite, and it
-# tracks ONE core release at a time (its own `full` extra pins the core to the exact
-# same version). Core, by contrast, ships breaking API changes freely — removing a
-# field is a `feat!` commit. So an unbounded trio silently pairs an OLD binder with a
-# NEW core, and every RPC reply touching the changed type fails to deserialize.
-#
-# The failure mode is silent and total: an unbounded trio resolved to binding 2.58.0
-# against core 2.61.0, whose commit d8912a98 ("feat!: stop tracking contact
-# verification") removed `is_verified` from the contact object. The 2.58.0 `Contact`
-# dataclass still requires it, so dacite raises
-# `MissingValueError: missing value for field "is_verified"`, which the relay surfaces
-# as a 502 on /contacts — taking out delta_list_contacts for every bot, and (via
-# `Message.sender: Contact`) emptying /messages as a silent `[]`. Nothing fails at
-# BUILD time, because core can publish a breaking release at any moment and the next
-# image build picks it up.
-#
-# 2.58.0 is the newest version deltachat2 supports (it is the binding's current
-# release, and upstream has published nothing since pinning the core to it).
-# The DB schema is unchanged across this range — core declares DBVERSION 68 at
-# BOTH 2.58.0 and 2.61.0 — so moving the core back down runs no migration and
-# touches no account data.
-#
-# When bumping: bump all three TOGETHER to a version deltachat2 actually supports,
-# and re-run the suite — the build-time guard in tests/test_dependency_pins.py exists
-# to catch exactly the mismatch this comment describes.
-deltachat2==2.58.0
-deltachat-rpc-server==2.58.0
-deltachat-rpc-client==2.58.0
+deltachat2>=1.0
+deltachat-rpc-server>=1.147
+deltachat-rpc-client>=1.147
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 httpx>=0.27.0
