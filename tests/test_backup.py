@@ -111,3 +111,60 @@ def test_list_backup_files_only_ours(tmp_path):
     (tmp_path / "notes.md").write_text("x")
     files = backup.list_backup_files(str(tmp_path))
     assert [f.rsplit("/", 1)[-1] for f in files] == ["bot-a-20260101T000000Z.tar"]
+
+
+async def test_run_forever_does_not_block_the_event_loop(tmp_path):
+    """Regression: run_forever called the BLOCKING run_backup (a synchronous imex export rpc
+    per account) directly on the asyncio loop. The first pass fires at boot, so both uvicorns
+    froze at "Waiting for application startup." — unbound — until every account had exported
+    (~40s for the production roster). The loop must keep running while an export is in flight."""
+    import asyncio
+    import threading
+
+    release = threading.Event()
+    exporting = threading.Event()
+    exported = threading.Event()
+
+    class SlowBackend(FakeBackupBackend):
+        def export_backup(self, account_id, folder):
+            exporting.set()
+            release.wait(5.0)  # a long blocking rpc, like the real imex export
+            super().export_backup(account_id, folder)
+            exported.set()
+
+    passes = []
+    task = asyncio.create_task(backup.run_forever(
+        _cfg("bot-a"), SlowBackend({"bot-a": 1}), str(tmp_path), interval=3600,
+        _should_stop=lambda: bool(passes) or passes.append(1)))
+    try:
+        # export is in flight in a worker thread …
+        assert await asyncio.to_thread(exporting.wait, 2.0)
+        # … and the loop is still free to run other coroutines (uvicorn startup, drain, …)
+        assert await asyncio.wait_for(asyncio.sleep(0.01, result="alive"), timeout=1.0) == "alive"
+        # (on the loop, the export would have had to FINISH before this coroutine could run)
+        assert not exported.is_set()
+    finally:
+        release.set()
+        task.cancel()
+
+
+async def test_run_forever_logs_backup_failures(tmp_path, caplog):
+    """A failing pass is logged (it used to be swallowed by a bare ``except: pass``)."""
+    import asyncio
+    import logging
+
+    class Broken(FakeBackupBackend):
+        def account_id_for(self, localpart):
+            raise RuntimeError("rpc down")
+
+    passes = []
+    with caplog.at_level(logging.WARNING, logger="dcf"):
+        task = asyncio.create_task(backup.run_forever(
+            _cfg("bot-a"), Broken({}), str(tmp_path), interval=3600,
+            _should_stop=lambda: bool(passes) or passes.append(1)))
+        for _ in range(100):
+            if any("backup pass failed" in r.getMessage() for r in caplog.records):
+                break
+            await asyncio.sleep(0.02)
+        task.cancel()
+    assert any("backup pass failed" in r.getMessage() for r in caplog.records)

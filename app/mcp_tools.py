@@ -112,7 +112,8 @@ class DeltaSendToTool(_RelayTool):
 class DeltaSendToPeerTool(_RelayTool):
     """``delta_send_to_peer`` — send to a ROSTER peer bot over the LAZY securejoin mesh.
 
-    ``target`` is the peer's bot id/localpart (not a raw address). The relay establishes the
+    ``target`` is the peer's bot id/localpart, or its full address on this relay's own domain
+    (other domains are rejected). The relay establishes the
     per-pair verified 1:1 on first use: if the pair is already verified it sends immediately;
     otherwise it initiates the securejoin and QUEUES the message until verification lands
     (returns ``status: queued``). This is the bot↔bot cutover path that fixes the "no contact

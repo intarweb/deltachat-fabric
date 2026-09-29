@@ -27,6 +27,15 @@ class BotSpec:
 
 
 @dataclass
+class ExternalMember:
+    """A fleet bot that owns its Delta account elsewhere (see ``Config.external``)."""
+    id: str
+    realm: str
+    address: str
+    invite: str = ""
+
+
+@dataclass
 class Config:
     mail_domain: str                          # e.g. deltachat.example.net (injected)
     imap_host: str
@@ -39,6 +48,22 @@ class Config:
     username_max_length: int = 64
     roster: list[BotSpec] = field(default_factory=list)
     realm_leads: dict[str, str] = field(default_factory=dict)  # realm -> "main" bot id
+    # Fleet bots with their OWN Delta Chat account (not hosted on this relay), e.g. a Hermes
+    # Agent bot running the deltachat-platform plugin. They receive natively, so the relay
+    # never wakes or onboards them; it only brings them into their realm's group: the realm
+    # lead securejoins the member's invite link (lead = joiner) and, once verified, adds them.
+    # The roster's top-level ``external:`` list (a separate key so older images still load):
+    #   external:
+    #     - {id: <bot id>, realm: <realm>, address: <addr>, invite: <securejoin invite link>}
+    external: list[ExternalMember] = field(default_factory=list)
+
+    def external_for(self, token: str) -> "Optional[ExternalMember]":
+        """The external member whose id or address is ``token`` (case-insensitive), or None."""
+        t = (token or "").strip().lower()
+        for m in self.external:
+            if t in (m.id.lower(), m.address.lower()):
+                return m
+        return None
 
     @classmethod
     def load(cls, roster_path: str | None = None) -> "Config":
@@ -46,13 +71,15 @@ class Config:
         roster_path = roster_path or os.environ.get("DELTA_ROSTER_PATH", "/config/roster.yaml")
         domain = os.environ.get("DELTA_MAIL_DOMAIN", "")
         imap_host = os.environ.get("DELTA_IMAP_HOST", domain)
-        roster, leads = [], {}
+        roster, leads, external = [], {}, []
         p = Path(roster_path)
         if p.exists():
             data = yaml.safe_load(p.read_text()) or {}
             roster = [BotSpec(**b) if isinstance(b, dict) else BotSpec(id=b)
                       for b in data.get("bots", [])]
             leads = data.get("realm_leads", {}) or {}
+            external = [ExternalMember(**{**m, "address": str(m["address"]).strip().lower()})
+                        for m in (data.get("external") or [])]
         return cls(
             mail_domain=domain,
             imap_host=imap_host,
@@ -65,6 +92,7 @@ class Config:
             username_max_length=int(os.environ.get("DELTA_USERNAME_MAX_LENGTH", "64")),
             roster=roster,
             realm_leads=leads,
+            external=external,
         )
 
     @staticmethod

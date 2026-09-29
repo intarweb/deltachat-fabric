@@ -27,7 +27,9 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -381,6 +383,19 @@ class DeltaBackend(Protocol):
         ...
 
 
+class UnencryptableRecipient(TypeError):
+    """The core refused a send because it cannot end-to-end encrypt to the recipient — the
+    target is an ADDRESS-contact (no key) on a server that requires encryption (chatmail).
+    PERMANENT for that target: retrying can never succeed, so it is never parked in the outbox
+    (it is a TypeError, the relay's existing "unsendable target, fail loud" class). The fix is
+    on the caller's side: use the recipient's key-contact (delta_list_contacts) or securejoin."""
+
+
+def _is_unencryptable(err: Exception) -> bool:
+    """True iff ``err`` is the core's "cannot encrypt to this recipient" send failure."""
+    return "e2e encryption unavailable" in str(err)
+
+
 def _core_missing_reason(err: Exception) -> str | None:
     """Classify a deltachat core error as a PERMANENT missing-chat/contact.
 
@@ -413,7 +428,9 @@ class DeltaChatBackend:
       * ``rpc.get_all_account_ids() -> list[int]``
       * ``rpc.get_config(accid, "addr") -> str``      — configured address of an account
       * ``rpc.send_msg(accid, chatid, {"text": ...}) -> int``       — returns sent msg id
-      * ``rpc.get_next_event() -> dict``              — event stream (blocks until one arrives)
+      * ``rpc.wait_for_event(accid) -> dict``         — per-account event stream (blocks). NOT
+        ``get_next_event``: the client's own events thread already consumes the core's
+        single event channel, so a second consumer steals events from it (see next_inbound)
       * ``rpc.get_message(accid, msgid)`` / ``rpc.get_basic_chat_info`` /
         ``rpc.get_chat_contacts(accid, chatid) -> list[int]`` / ``rpc.get_contact(accid, cid)``
       * ``rpc.get_contacts(accid, listflags, query)`` — enumerate contacts
@@ -432,6 +449,12 @@ class DeltaChatBackend:
         self.accounts_dir = accounts_dir
         self._addr_to_accid: dict[str, int] = {}
         self._localpart_to_accid: dict[str, int] = {}
+        # Merged inbound event stream: one forwarder thread per account moves that account's
+        # events from the client's per-account queue (rpc.wait_for_event) onto this queue.
+        self._events: "queue.Queue[tuple[int, Any]]" = queue.Queue()
+        self._forwarded: set[int] = set()
+        self._forward_lock = threading.Lock()
+        self._pumping = False  # forwarders start with the first next_inbound (the event pump)
         if _rpc is not None:
             self.rpc = _rpc
         else:  # pragma: no cover - requires the deltachat-rpc-client + rpc-server binary
@@ -446,17 +469,44 @@ class DeltaChatBackend:
             # has removed, and every reply touching the changed type fails to parse.)
             rpc = Rpc(accounts_dir=accounts_dir)
             rpc.start()
-            for accid in rpc.get_all_account_ids():
-                rpc.start_io(accid)
             self.rpc = _AttrRpc(rpc)
         self._reindex_accounts()
+        if _rpc is None:  # pragma: no cover - live core
+            self._start_io_for_roster()
+
+    def _start_io_for_roster(self) -> list[int]:
+        """Start IO (IMAP/SMTP) only for accounts whose bot is in the roster.
+
+        An account whose bot has left the roster stays in the core — keys, contacts and chats
+        intact — but DORMANT: no connections, nothing received or sent. Put the bot back in the
+        roster and restart to revive it. An empty roster (bare wiring) starts every account.
+        Returns the account ids started."""
+        rostered = {b.localpart.lower() for b in self.config.roster}
+        started: list[int] = []
+        dormant: list[str] = []
+        for lp, accid in sorted(self._localpart_to_accid.items()):
+            if rostered and lp.lower() not in rostered:
+                dormant.append(lp)
+                continue
+            try:
+                self.rpc.start_io(accid)
+                started.append(accid)
+            except Exception:
+                log.error("start_io(acct=%s, %s) failed — account will NOT receive", accid, lp,
+                          exc_info=True)
+        if dormant:
+            log.info("accounts left DORMANT (not in roster; IO not started): %s", dormant)
+        return started
 
     # -- account index -----------------------------------------------------
     def _reindex_accounts(self) -> None:
         """Map configured account addresses → account ids, keyed by localpart."""
         self._addr_to_accid.clear()
         self._localpart_to_accid.clear()
-        for accid in self.rpc.get_all_account_ids():
+        accids = list(self.rpc.get_all_account_ids())
+        if self._pumping:  # a newly onboarded account joins the running event stream
+            self._ensure_event_forwarders(accids)
+        for accid in accids:
             try:
                 addr = self.rpc.get_config(accid, "addr") or self.rpc.get_config(accid, "configured_addr")
             except Exception:  # pragma: no cover - defensive
@@ -486,7 +536,7 @@ class DeltaChatBackend:
         MsgData — verified vs the installed package; send_msg(accid, chat_id, MessageData) -> int).
         """
         chat_id = self._resolve_chat_id(account_id, target)
-        return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        return self._send_msg(account_id, chat_id, text)
 
     def _resolve_chat_id(self, account_id: int, target: int) -> int:  # pragma: no cover
         """Resolve a send ``target`` to a sendable chat id (chat id OR contact id in → chat out).
@@ -544,7 +594,7 @@ class DeltaChatBackend:
         if getattr(info, "id", 0) != chat_id:
             raise KeyError(
                 f"no such chat {chat_id} for this account (chat-only send — not a contact id)")
-        return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        return self._send_msg(account_id, chat_id, text)
 
     def send_contact(self, account_id: int, contact_id: int, text: str) -> int:  # pragma: no cover
         """STRICT contact-only send — the mirror of ``send_chat``.
@@ -573,7 +623,7 @@ class DeltaChatBackend:
         chat_id = self.rpc.get_chat_id_by_contact_id(account_id, contact_id)
         if not chat_id:
             chat_id = self.rpc.create_chat_by_contact_id(account_id, contact_id)
-        return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        return self._send_msg(account_id, chat_id, text)
 
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
         """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
@@ -613,7 +663,7 @@ class DeltaChatBackend:
         if not cid:
             raise KeyError(f"no contact for address {addr}")
         chat_id = self.rpc.create_chat_by_contact_id(account_id, cid)
-        msg_id = self.rpc.send_msg(account_id, chat_id, {"text": text})
+        msg_id = self._send_msg(account_id, chat_id, text)
         return chat_id, msg_id
 
     # -- securejoin (accept a verified invite → inviter becomes a key-contact) ----
@@ -699,7 +749,9 @@ class DeltaChatBackend:
         (deltachat-core's "securejoin done" sentinel) on the LEAD's account. Selected on
         ``kind``, mirroring incoming_ids/reaction_ids. This is the event that drives
         EVENT-DRIVEN channel provisioning — no wait, no poll."""
-        if _kind(ev) == "SecurejoinInviterProgress":
+        # JoinerProgress too: for an EXTERNAL member the lead is the joiner (it joins the
+        # member's invite), so completion surfaces on the joiner side.
+        if _kind(ev) in ("SecurejoinInviterProgress", "SecurejoinJoinerProgress"):
             if int(_field(ev, "progress") or 0) >= 1000:
                 return _field(ev, "contact_id")
         return None
@@ -728,14 +780,82 @@ class DeltaChatBackend:
                             f"progress={_field(ev, 'progress')}")
         return None
 
-    def next_inbound(self):  # pragma: no cover - real rpc entry
-        raw = self.rpc.get_next_event()
-        if raw is None:
+    def _send_msg(self, account_id: int, chat_id: int, text: str) -> int:
+        """``send_msg`` with the core's permanent "cannot encrypt" failure surfaced as a typed,
+        explanatory error (``UnencryptableRecipient``) instead of a generic one that the relay
+        would park and retry ~40 times before dropping."""
+        try:
+            return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        except Exception as e:
+            if _is_unencryptable(e):
+                raise UnencryptableRecipient(
+                    f"cannot end-to-end encrypt to the recipient of chat {chat_id} (acct "
+                    f"{account_id}): it is an address-contact with no encryption key, and this "
+                    f"mail server requires encryption. Not retried. Send to the recipient's "
+                    f"verified key-contact instead (delta_list_contacts / delta_send_to_peer), "
+                    f"or securejoin with them first. Core said: {e}") from e
+            raise
+
+    # -- inbound event stream ---------------------------------------------
+    #
+    # 🔴 The core has ONE event channel per rpc-server, and ``Rpc.start()`` already runs a
+    # thread (``Rpc.events_loop``) that drains it via ``get_next_event_batch`` and files each
+    # event into a per-account queue read by ``Rpc.wait_for_event(accid)``. The core's own docs
+    # for ``get_next_event``: "if you are using ... the Rpc Python class, this function will be
+    # invoked by those classes internally and should not be used manually." Calling it here as
+    # well made two consumers race for every event: the ones the client's thread won (about
+    # two thirds) sat unread in its queues forever — lost wakes, lost reactions, and lost
+    # securejoin-verified events (so the peer-mesh queue for that pair never flushed).
+    #
+    # So the relay reads each account's events the documented way, ``wait_for_event(accid)``,
+    # one forwarder thread per account, merged onto one queue for the single event pump.
+
+    _EVENT_POLL_SECONDS = 5.0
+
+    def _ensure_event_forwarders(self, accids=None) -> None:
+        """Start a forwarder thread for every account that doesn't have one yet. Idempotent.
+        Events emitted before a forwarder starts are not lost: the client's events thread has
+        been queueing them per account since ``Rpc.start()``."""
+        if accids is None:
+            accids = self.rpc.get_all_account_ids()
+        with self._forward_lock:
+            for accid in accids:
+                if accid in self._forwarded:
+                    continue
+                self._forwarded.add(accid)
+                threading.Thread(target=self._forward_events, args=(accid,),
+                                 daemon=True, name=f"dcf-events-acct{accid}").start()
+
+    def _forward_events(self, accid: int) -> None:
+        """Forwarder thread body: move account ``accid``'s events onto the merged queue."""
+        while True:
+            try:
+                ev = self.rpc.wait_for_event(accid)
+            except Exception:
+                log.exception("event forwarder for acct %s died", accid)
+                with self._forward_lock:
+                    self._forwarded.discard(accid)  # let the next ensure pass restart it
+                return
+            if ev is not None:
+                self._events.put((accid, ev))
+
+    def _next_event(self):
+        """Next ``(accid, event)`` from any account, or None after an idle poll interval (the
+        idle wake-up re-checks for accounts onboarded since the last pass)."""
+        if not self._pumping:
+            self._pumping = True
+            self._ensure_event_forwarders()
+        try:
+            return self._events.get(timeout=self._EVENT_POLL_SECONDS)
+        except queue.Empty:
+            self._ensure_event_forwarders()
             return None
-        # The core's event envelope carries the account id as ``context_id``.
-        accid = (_field(raw, "context_id") or _field(raw, "account_id")
-                 or _field(raw, "accid") or 0)
-        ev = _field(raw, "event") or raw
+
+    def next_inbound(self):  # pragma: no cover - real rpc entry
+        item = self._next_event()
+        if item is None:
+            return None
+        accid, ev = item
         # Surface diagnostically-useful core events to the relay log (never invisible again).
         diag = self.core_diagnostic(ev)
         if diag is not None:
@@ -759,7 +879,8 @@ class DeltaChatBackend:
             contact = self.rpc.get_contact(accid, contact_id)
             addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
         except Exception:
-            pass
+            log.warning("verified event: get_contact(acct=%s, contact=%s) failed — no addr",
+                        accid, contact_id, exc_info=True)
         return InboundVerified(account_id=accid, contact_id=contact_id or 0, addr=addr)
 
     def _build_reaction(self, accid: int, chat_id, contact_id, msg_id, emoji: str) -> InboundReaction:  # pragma: no cover
@@ -768,7 +889,8 @@ class DeltaChatBackend:
             contact = self.rpc.get_contact(accid, contact_id)
             from_addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
         except Exception:
-            pass
+            log.warning("reaction: get_contact(acct=%s, contact=%s) failed — no from_addr",
+                        accid, contact_id, exc_info=True)
         # Only the AUTHOR of the reacted-to message should be woken; the reaction event is
         # delivered to every member account, so gate on "is this account the message author?"
         # (msg.from_id == self) + carry the reacted msg's GLOBAL id for cross-account dedup.
@@ -779,12 +901,14 @@ class DeltaChatBackend:
             m = self.rpc.get_message(accid, msg_id)
             own_message = int(getattr(m, "from_id", 0) or 0) == int(SpecialContactId.SELF)
         except Exception:
-            pass
+            log.warning("reaction: get_message(acct=%s, msg=%s) failed — author unknown",
+                        accid, msg_id, exc_info=True)
         try:
             info = self.rpc.get_message_info_object(accid, msg_id)
             rfc724_mid = getattr(info, "rfc724_mid", "") or ""
         except Exception:
-            pass
+            log.warning("reaction: get_message_info_object(acct=%s, msg=%s) failed — no "
+                        "cross-account dedup id", accid, msg_id, exc_info=True)
         return InboundReaction(
             account_id=accid, chat_id=chat_id or 0, msg_id=msg_id or 0,
             emoji=emoji, from_id=contact_id or 0, from_addr=from_addr,
@@ -811,6 +935,8 @@ class DeltaChatBackend:
                 if addr:
                     members.append(addr.split("@", 1)[0])
             except Exception:
+                log.warning("inbound: get_contact(acct=%s, contact=%s) failed — member omitted",
+                            accid, cid, exc_info=True)
                 continue
         from_id = getattr(msg, "from_id", 0) or 0
         # Sender localpart — used for sender-exclusion (a bot is never woken by its own post)
@@ -830,7 +956,8 @@ class DeltaChatBackend:
             try:
                 from_localpart = _localpart(self.rpc.get_contact(accid, from_id))
             except Exception:
-                pass
+                log.warning("inbound: get_contact(acct=%s, contact=%s) failed", accid, from_id,
+                            exc_info=True)
         if not from_localpart:
             log.warning("inbound sender UNRESOLVED (renders 'someone'): accid=%s msg=%s from_id=%s sender=%r",
                         accid, msg_id, from_id, getattr(msg, "sender", None))
@@ -840,7 +967,8 @@ class DeltaChatBackend:
             info = self.rpc.get_message_info_object(accid, msg_id)
             rfc724_mid = getattr(info, "rfc724_mid", "") or ""
         except Exception:
-            pass
+            log.warning("inbound: get_message_info_object(acct=%s, msg=%s) failed — no "
+                        "cross-account dedup id", accid, msg_id, exc_info=True)
         # Device/self-talk chats (account's own sync channels — login/update notices) and
         # system/info messages (core-generated, sender=SpecialContactId.DEVICE=5) are NEVER human
         # DMs. Classify here so handle_inbound suppresses the wake entirely — killing the poison
@@ -905,6 +1033,8 @@ class DeltaChatBackend:
                 try:
                     members.append(self._contact_dict(account_id, cid)["address"].split("@", 1)[0])
                 except Exception:
+                    log.warning("list_channels: contact %s of chat %s (acct=%s) unreadable — "
+                                "member omitted", cid, chat_id, account_id, exc_info=True)
                     continue
             out.append({
                 "id": chat_id,
@@ -996,6 +1126,7 @@ class DeltaChatBackend:
                      "is_from_self": bool(getattr(r, "is_from_self", False))}
                     for r in (getattr(reactions, "reactions", None) or [])]
         except Exception:
+            log.warning("reactions unreadable (acct=%s msg=%s)", account_id, msg_id, exc_info=True)
             return []
 
     def create_invite(self, account_id: int, target_addr: Optional[str] = None) -> str:  # pragma: no cover - real rpc
@@ -1046,12 +1177,13 @@ class DeltaChatBackend:
                     log.info("re-onboarding %s: address changed %s -> %s",
                              localpart, current, desired_addr)
             except Exception:
-                pass
+                log.warning("onboard %s: reading current config of acct %s failed — "
+                            "re-running transport setup", localpart, existing, exc_info=True)
         accid = existing if existing is not None else self.rpc.add_account()
         try:
             self.rpc.set_config(accid, "bot", "1")  # mark as a bot account (best-effort)
         except Exception:
-            pass
+            log.warning("onboard %s: set_config(bot=1) failed", localpart, exc_info=True)
         self._set_displayname(accid, display_name)  # name humans see (best-effort)
         # The core's EnteredLoginParam, as the camelCase dict the JSON-RPC API accepts.
         # The Socket enum is serde-rename_all camelCase, so the wire values are lowercase.
@@ -1070,7 +1202,8 @@ class DeltaChatBackend:
             try:
                 self.rpc.start_io(accid)  # begin receiving for the freshly-configured account
             except Exception:
-                pass
+                log.error("onboard %s: start_io(acct=%s) failed — account will NOT receive",
+                          localpart, accid, exc_info=True)
             self._reindex_accounts()
         return ok
 
@@ -1082,7 +1215,7 @@ class DeltaChatBackend:
         try:
             self.rpc.set_config(account_id, "displayname", display_name)
         except Exception:
-            pass
+            log.warning("set displayname failed (acct=%s)", account_id, exc_info=True)
 
 
 def extract_mentions(text: str, members: list[str]) -> list[str]:
@@ -1455,6 +1588,13 @@ class PeerMesh:
         # dedups re-invocation so we never re-handshake / dup contacts.
         self._inflight: set[tuple[str, str]] = set()
 
+    def _peer_id(self, token: str) -> str:
+        """Roster bot id for a bot id/localpart token (the token itself if not in the roster)."""
+        for b in self.config.roster:
+            if token in (b.id, b.localpart):
+                return b.id
+        return token
+
     def _peer_addr(self, target_bot: str) -> str:
         """Full Delta address for a roster bot id/localpart: ``{localpart}@{domain}``.
         Resolves via the roster (id or localpart) and falls back to using the given token as
@@ -1489,11 +1629,45 @@ class PeerMesh:
           {"status":"queued", "reason":"securejoin-pending", "queued": N, ...}
           {"status":"dropped", "reason":"pair-cap-exceeded", ...}   — cap hit, dropped LOUDLY
 
+        ``target_bot`` is a roster bot id/localpart, or that bot's full address on THIS relay's
+        mail domain (``<bot>@<domain>`` → ``<bot>``). An address on any other domain is not a
+        peer on this relay and is rejected loudly (``reason: "foreign-domain"``).
+
         Raises KeyError if the SENDER bot has no Delta account.
         """
         sender_accid = self.backend.account_id_for(sender_bot)
         if sender_accid is None:
             raise KeyError(f"no delta account for bot {sender_bot!r}")
+        ext = self.config.external_for(target_bot)
+        if ext is not None:
+            # An external member (own Delta account): no securejoin/queue can be driven from
+            # here — its realm lead verifies it via the roster invite. Send iff already a
+            # key-contact of the sender (e.g. learned through the realm group), else say so.
+            if self.backend.is_verified_key_contact(sender_accid, ext.address):
+                chat_id, msg_id = self.backend.send_to_addr(sender_accid, ext.address, text)
+                return {"status": "sent", "account_id": sender_accid, "chat_id": chat_id,
+                        "msg_id": msg_id, "target_addr": ext.address}
+            log.warning("peer-mesh: external member %s (%s) is not yet a key-contact of %s — "
+                        "not sent", ext.id, ext.address, sender_bot)
+            return {"status": "rejected", "reason": "external-not-verified",
+                    "target_addr": ext.address,
+                    "detail": f"{ext.id} has its own Delta account; it becomes reachable once "
+                              f"its realm lead has verified it and it is in the realm group"}
+        if "@" in target_bot:
+            local, _, domain = target_bot.strip().rpartition("@")
+            if domain.lower() != self.config.mail_domain.lower() or not local:
+                log.error("peer-mesh: target %r is not on this relay's domain (%s) — REJECTING "
+                          "send from %s (use the bot id, or delta_send_to for an outside address)",
+                          target_bot, self.config.mail_domain, sender_bot)
+                return {"status": "rejected", "reason": "foreign-domain", "target": target_bot}
+            target_bot = self._peer_id(local)
+        if self.config.roster and not any(target_bot in (b.id, b.localpart)
+                                          for b in self.config.roster):
+            # Not a fleet member (e.g. a retired bot whose Delta account still exists): never
+            # start a securejoin with it or queue for it.
+            log.error("peer-mesh: target %r is not in the roster — REJECTING send from %s",
+                      target_bot, sender_bot)
+            return {"status": "rejected", "reason": "target-not-in-roster", "target": target_bot}
         target_addr = self._peer_addr(target_bot)
         key = (sender_bot, target_addr)
         now = time.monotonic()
@@ -1514,7 +1688,7 @@ class PeerMesh:
         # GATE (fail-fast, per review): a target with no Delta account on this relay is NOT
         # onboarded (not in the roster / never logged in) — REJECT fast + loud rather than enqueue
         # for a securejoin verification that will never arrive (slow-fail via age-out).
-        target_accid = self.backend.account_id_for(target_bot)
+        target_accid = self.backend.account_id_for(target_addr.split("@", 1)[0])
         if target_accid is None:
             log.error("peer-mesh: target bot %r not onboarded (no Delta account on this relay) — "
                       "REJECTING send from %s (not enqueued; nothing to verify against)",
@@ -1895,7 +2069,7 @@ class Relay:
         try:
             chat_id, msg_id = self.backend.send_to_addr(accid, addr, text)
             return {"status": "sent", "account_id": accid, "chat_id": chat_id, "msg_id": msg_id}
-        except KeyError:
+        except (KeyError, TypeError):
             raise
         except Exception as e:
             return self._park(bot, "addr", addr, text, e, accid)
@@ -2090,6 +2264,9 @@ class Relay:
         the deterministic fleet signal — humans (Justin/Elene/external) are never in the roster."""
         if localpart and any(localpart.lower() == b.localpart.lower() for b in self.config.roster):
             return "bot"
+        if localpart and any(localpart.lower() == m.address.split("@", 1)[0]
+                             for m in self.config.external):
+            return "bot"
         return "human"
 
     async def handle_inbound(self, msg: InboundMessage) -> list[str]:
@@ -2214,17 +2391,41 @@ class Relay:
 
     async def _deliver(self, bot: str, payload: dict) -> bool:
         """Resolve ``bot``'s live url + POST the wake; hold it on any failure."""
+        if self.config.external_for(bot) is not None or self.config.external_for(
+                f"{bot}@{self.config.mail_domain}") is not None:
+            # An external member (own Delta account, e.g. a Hermes bot's plugin) already
+            # received this message natively — the relay never wakes or holds for it.
+            return False
         agent_url = await self.directory.resolve(bot)
         if agent_url and await self.directory.wake(agent_url, bot, payload):
             return True
+        if not self._in_roster(bot):
+            # A bot removed from the roster has left the fleet: holding its wake would only
+            # retry every few seconds until the TTL. Drop it LOUDLY instead.
+            log.warning("wake for %s NOT delivered and NOT held — %s is not in the roster "
+                        "(departed bot); msg=%s", bot, bot, payload.get("msg_id"))
+            return False
         self.hold.add(bot, payload)
         return False
+
+    def _in_roster(self, bot: str) -> bool:
+        """True if ``bot`` (id or localpart) is a current roster member. An empty roster
+        (bare/test wiring) counts everyone as a member, so nothing changes there."""
+        if not self.config.roster:
+            return True
+        b = (bot or "").lower()
+        return any(b in (s.id.lower(), s.localpart.lower()) for s in self.config.roster)
 
     async def drain_holds(self) -> int:
         """Retry every held wake; return how many were delivered this pass. Idempotent."""
         delivered = 0
         for item in self.hold.pending():
             bot = item["bot_id"]
+            if not self._in_roster(bot):
+                log.warning("drain: dropping held wake for %s — no longer in the roster "
+                            "(departed bot); msg=%s", bot, item.get("msg_id"))
+                self.hold.remove(item)
+                continue
             payload = {k: v for k, v in item.items() if k not in ("bot_id", "_hq_ts")}
             agent_url = await self.directory.resolve(bot)
             if agent_url and await self.directory.wake(agent_url, bot, payload):
@@ -2394,6 +2595,8 @@ def create_app(relay: Relay):
             return await asyncio.to_thread(relay.send, req.bot_id, req.target, req.text)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except UnencryptableRecipient as e:
+            raise HTTPException(status_code=422, detail=str(e))
         except Exception as e:  # pragma: no cover - backend send failure
             raise HTTPException(status_code=502, detail=f"send failed: {e}")
 
@@ -2439,6 +2642,8 @@ def create_app(relay: Relay):
             return await asyncio.to_thread(fn)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except UnencryptableRecipient as e:
+            raise HTTPException(status_code=422, detail=str(e))
         except HTTPException:
             raise
         except Exception as e:  # pragma: no cover - backend failure

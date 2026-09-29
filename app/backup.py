@@ -14,6 +14,7 @@ deltachat core is behind ``BackupBackend`` + ``# pragma: no cover``.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from .config import Config
+
+log = logging.getLogger("dcf")
 
 # A backup filename we own: "<localpart>-<YYYYmmddTHHMMSSZ>.tar" — lets us group + sort
 # per account for retention without trusting mtimes.
@@ -195,6 +198,12 @@ async def run_forever(config: Config, backend: BackupBackend, backup_dir: str,
                       _should_stop: Optional[Any] = None) -> None:  # pragma: no cover - loop
     """Nightly backup loop. Runs a backup, then sleeps ``interval`` until stopped.
 
+    🔴 ``run_backup`` is BLOCKING (one synchronous imex ``export_backup`` rpc per account —
+    tens of seconds for a full roster), so it runs in a worker thread. Called directly on the
+    loop it froze the whole process: the first pass fires at boot, so both uvicorns sat at
+    "Waiting for application startup." (unbound) until every account had exported, and the
+    nightly pass stalled every HTTP request, the drain loop and the reconciler the same way.
+
     ``_should_stop`` (callable) lets a test drive one pass; the real service passes None.
     """
     import asyncio
@@ -205,8 +214,14 @@ async def run_forever(config: Config, backend: BackupBackend, backup_dir: str,
         if delay > 0:
             await asyncio.sleep(delay)
         try:
-            run_backup(config, backend, backup_dir, retain)
+            summary = await asyncio.to_thread(run_backup, config, backend, backup_dir, retain)
+            if summary["errors"]:
+                log.warning("backup: %d exported, %d FAILED: %s", len(summary["exported"]),
+                            len(summary["errors"]), summary["errors"])
+            else:
+                log.info("backup: %d account(s) exported, %d old backup(s) pruned",
+                         len(summary["exported"]), len(summary["pruned"]))
         except Exception:
-            pass
+            log.exception("backup pass failed")
         last_run = time.time()
         await asyncio.sleep(interval)
