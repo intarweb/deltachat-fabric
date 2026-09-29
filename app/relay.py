@@ -1533,6 +1533,13 @@ class PeerMesh:
         # dedups re-invocation so we never re-handshake / dup contacts.
         self._inflight: set[tuple[str, str]] = set()
 
+    def _peer_id(self, token: str) -> str:
+        """Roster bot id for a bot id/localpart token (the token itself if not in the roster)."""
+        for b in self.config.roster:
+            if token in (b.id, b.localpart):
+                return b.id
+        return token
+
     def _peer_addr(self, target_bot: str) -> str:
         """Full Delta address for a roster bot id/localpart: ``{localpart}@{domain}``.
         Resolves via the roster (id or localpart) and falls back to using the given token as
@@ -1567,11 +1574,23 @@ class PeerMesh:
           {"status":"queued", "reason":"securejoin-pending", "queued": N, ...}
           {"status":"dropped", "reason":"pair-cap-exceeded", ...}   — cap hit, dropped LOUDLY
 
+        ``target_bot`` is a roster bot id/localpart, or that bot's full address on THIS relay's
+        mail domain (``<bot>@<domain>`` → ``<bot>``). An address on any other domain is not a
+        peer on this relay and is rejected loudly (``reason: "foreign-domain"``).
+
         Raises KeyError if the SENDER bot has no Delta account.
         """
         sender_accid = self.backend.account_id_for(sender_bot)
         if sender_accid is None:
             raise KeyError(f"no delta account for bot {sender_bot!r}")
+        if "@" in target_bot:
+            local, _, domain = target_bot.strip().rpartition("@")
+            if domain.lower() != self.config.mail_domain.lower() or not local:
+                log.error("peer-mesh: target %r is not on this relay's domain (%s) — REJECTING "
+                          "send from %s (use the bot id, or delta_send_to for an outside address)",
+                          target_bot, self.config.mail_domain, sender_bot)
+                return {"status": "rejected", "reason": "foreign-domain", "target": target_bot}
+            target_bot = self._peer_id(local)
         target_addr = self._peer_addr(target_bot)
         key = (sender_bot, target_addr)
         now = time.monotonic()
@@ -1592,7 +1611,7 @@ class PeerMesh:
         # GATE (fail-fast, per review): a target with no Delta account on this relay is NOT
         # onboarded (not in the roster / never logged in) — REJECT fast + loud rather than enqueue
         # for a securejoin verification that will never arrive (slow-fail via age-out).
-        target_accid = self.backend.account_id_for(target_bot)
+        target_accid = self.backend.account_id_for(target_addr.split("@", 1)[0])
         if target_accid is None:
             log.error("peer-mesh: target bot %r not onboarded (no Delta account on this relay) — "
                       "REJECTING send from %s (not enqueued; nothing to verify against)",
@@ -2295,14 +2314,33 @@ class Relay:
         agent_url = await self.directory.resolve(bot)
         if agent_url and await self.directory.wake(agent_url, bot, payload):
             return True
+        if not self._in_roster(bot):
+            # A bot removed from the roster has left the fleet: holding its wake would only
+            # retry every few seconds until the TTL. Drop it LOUDLY instead.
+            log.warning("wake for %s NOT delivered and NOT held — %s is not in the roster "
+                        "(departed bot); msg=%s", bot, bot, payload.get("msg_id"))
+            return False
         self.hold.add(bot, payload)
         return False
+
+    def _in_roster(self, bot: str) -> bool:
+        """True if ``bot`` (id or localpart) is a current roster member. An empty roster
+        (bare/test wiring) counts everyone as a member, so nothing changes there."""
+        if not self.config.roster:
+            return True
+        b = (bot or "").lower()
+        return any(b in (s.id.lower(), s.localpart.lower()) for s in self.config.roster)
 
     async def drain_holds(self) -> int:
         """Retry every held wake; return how many were delivered this pass. Idempotent."""
         delivered = 0
         for item in self.hold.pending():
             bot = item["bot_id"]
+            if not self._in_roster(bot):
+                log.warning("drain: dropping held wake for %s — no longer in the roster "
+                            "(departed bot); msg=%s", bot, item.get("msg_id"))
+                self.hold.remove(item)
+                continue
             payload = {k: v for k, v in item.items() if k not in ("bot_id", "_hq_ts")}
             agent_url = await self.directory.resolve(bot)
             if agent_url and await self.directory.wake(agent_url, bot, payload):

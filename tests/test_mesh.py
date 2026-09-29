@@ -321,3 +321,33 @@ def test_healthz_reports_peer_queued(tmp_path):
     client = TestClient(create_app(relay))
     body = client.get("/healthz").json()
     assert body["peer_queued"] == 1
+
+
+# --------------------------------------------------------------------------- target forms
+
+
+def test_send_to_peer_accepts_full_address_on_own_domain():
+    """``<bot>@<relay domain>`` is the same peer as ``<bot>`` (it used to be rejected as
+    "not onboarded" because the whole address was looked up as a localpart)."""
+    mesh, backend = make_mesh({"bot-a": 7, "bot-b": 9}, verified={(7, f"bot-b@{DOMAIN}")})
+    res = mesh.send_to_peer("bot-a", f"bot-b@{DOMAIN.upper()}", "hi by address")
+    assert res["status"] == "sent"
+    assert res["target_addr"] == f"bot-b@{DOMAIN}"
+    assert backend.sent_to == [(7, f"bot-b@{DOMAIN}", "hi by address")]
+
+
+def test_send_to_peer_full_address_unverified_queues_under_same_pair():
+    mesh, backend = make_mesh({"bot-a": 7, "bot-b": 9})
+    mesh.send_to_peer("bot-a", "bot-b", "one")
+    res = mesh.send_to_peer("bot-a", f"bot-b@{DOMAIN}", "two")
+    assert res["status"] == "queued" and res["queued"] == 2   # one pair, one queue
+
+
+def test_send_to_peer_rejects_foreign_domain_loudly(caplog):
+    mesh, backend = make_mesh({"bot-a": 7, "bot-b": 9})
+    with caplog.at_level(logging.ERROR):
+        res = mesh.send_to_peer("bot-a", "bot-b@elsewhere.example", "nope")
+    assert res == {"status": "rejected", "reason": "foreign-domain",
+                   "target": "bot-b@elsewhere.example"}
+    assert backend.sent_to == [] and backend.invites == [] and mesh.pending_count() == 0
+    assert any("not on this relay's domain" in r.getMessage() for r in caplog.records)

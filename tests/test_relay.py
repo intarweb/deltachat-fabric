@@ -6,6 +6,7 @@ The deltachat account-manager, the a2a-directory fetch, and the wake POST are al
 """
 from __future__ import annotations
 
+import logging
 import json
 from typing import Optional
 
@@ -1417,3 +1418,30 @@ def test_invite_endpoint(tmp_path):
     assert resp.json() == {"account_id": 7, "invite": "https://i.delta.chat/#FAKEINVITE-acc7"}
     miss = client.get("/invite", params={"bot_id": "bot-c"})
     assert miss.status_code == 404
+
+
+# --------------------------------------------------------------------------- departed bots
+
+
+async def test_wake_for_bot_not_in_roster_is_not_held(tmp_path, caplog):
+    """A bot removed from the roster has left the fleet: an undeliverable wake for it is
+    dropped loudly, not held for endless 5s retries (the dead-``eir`` case)."""
+    msg = InboundMessage(account_id=3, chat_id=5, msg_id=1, text="@gone", is_group=True,
+                         members=["bot-lead", "gone"], mentioned=["gone"])
+    relay = make_relay(FakeBackend(accounts={"bot-lead": 3}), [], [], tmp_path)
+    with caplog.at_level(logging.WARNING):
+        assert await relay.handle_inbound(msg) == []
+    assert len(relay.hold) == 0
+    assert any("not in the roster" in r.getMessage() for r in caplog.records)
+
+
+async def test_drain_drops_held_wakes_for_bots_no_longer_in_roster(tmp_path):
+    """A wake held while the bot was still rostered (persisted hold_queue.json) is dropped on
+    the next drain once the bot is removed from the roster; rostered bots' holds stay."""
+    q = HoldQueue(str(tmp_path))
+    q.add("gone", {"chat_id": 18, "msg_id": 588, "text": "hi"})
+    q.add("bot-a", {"chat_id": 5, "msg_id": 1, "text": "yo"})
+    relay = make_relay(FakeBackend(accounts={}), [], [], tmp_path)   # bot-a unresolvable
+    assert await relay.drain_holds() == 0
+    assert [i["bot_id"] for i in relay.hold.pending()] == ["bot-a"]
+    assert [i["bot_id"] for i in HoldQueue(str(tmp_path)).pending()] == ["bot-a"]  # persisted

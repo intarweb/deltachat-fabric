@@ -196,7 +196,8 @@ def build_mcp(relay_url: Optional[str] = None) -> MCPServer:
 
         Args:
             bot_id: The bot/account localpart to send AS (the sender).
-            target: The PEER bot's id/localpart (not a raw address — resolved via the roster).
+            target: The PEER bot's id/localpart, or its full address on this relay's own domain
+                (``<bot>@<domain>``); any other domain is rejected (status ``rejected``).
             text: The message body.
 
         Returns ``{"status":"sent"|"queued"|"dropped", ...}`` — ``queued`` means the securejoin
