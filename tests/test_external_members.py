@@ -5,7 +5,7 @@ import logging
 
 from app.config import BotSpec, Config, ExternalMember
 from app.main import desired_localparts, provision_channels, provision_verified_member, securejoin_star
-from app.relay import AgentDirectory, HoldQueue, InboundMessage, PeerMesh, Relay
+from app.relay import InboundMessage, PeerMesh
 from tests.test_relay import FakeBackend, make_relay
 
 DOMAIN = "deltachat.example.net"
