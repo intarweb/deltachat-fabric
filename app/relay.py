@@ -383,6 +383,19 @@ class DeltaBackend(Protocol):
         ...
 
 
+class UnencryptableRecipient(TypeError):
+    """The core refused a send because it cannot end-to-end encrypt to the recipient — the
+    target is an ADDRESS-contact (no key) on a server that requires encryption (chatmail).
+    PERMANENT for that target: retrying can never succeed, so it is never parked in the outbox
+    (it is a TypeError, the relay's existing "unsendable target, fail loud" class). The fix is
+    on the caller's side: use the recipient's key-contact (delta_list_contacts) or securejoin."""
+
+
+def _is_unencryptable(err: Exception) -> bool:
+    """True iff ``err`` is the core's "cannot encrypt to this recipient" send failure."""
+    return "e2e encryption unavailable" in str(err)
+
+
 def _core_missing_reason(err: Exception) -> str | None:
     """Classify a deltachat core error as a PERMANENT missing-chat/contact.
 
@@ -499,7 +512,7 @@ class DeltaChatBackend:
         MsgData — verified vs the installed package; send_msg(accid, chat_id, MessageData) -> int).
         """
         chat_id = self._resolve_chat_id(account_id, target)
-        return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        return self._send_msg(account_id, chat_id, text)
 
     def _resolve_chat_id(self, account_id: int, target: int) -> int:  # pragma: no cover
         """Resolve a send ``target`` to a sendable chat id (chat id OR contact id in → chat out).
@@ -557,7 +570,7 @@ class DeltaChatBackend:
         if getattr(info, "id", 0) != chat_id:
             raise KeyError(
                 f"no such chat {chat_id} for this account (chat-only send — not a contact id)")
-        return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        return self._send_msg(account_id, chat_id, text)
 
     def send_contact(self, account_id: int, contact_id: int, text: str) -> int:  # pragma: no cover
         """STRICT contact-only send — the mirror of ``send_chat``.
@@ -586,7 +599,7 @@ class DeltaChatBackend:
         chat_id = self.rpc.get_chat_id_by_contact_id(account_id, contact_id)
         if not chat_id:
             chat_id = self.rpc.create_chat_by_contact_id(account_id, contact_id)
-        return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        return self._send_msg(account_id, chat_id, text)
 
     def send_to_addr(self, account_id: int, addr: str, text: str) -> tuple[int, int]:  # pragma: no cover
         """Message a HUMAN by email address: resolve addr → contact → 1:1 chat, then send.
@@ -626,7 +639,7 @@ class DeltaChatBackend:
         if not cid:
             raise KeyError(f"no contact for address {addr}")
         chat_id = self.rpc.create_chat_by_contact_id(account_id, cid)
-        msg_id = self.rpc.send_msg(account_id, chat_id, {"text": text})
+        msg_id = self._send_msg(account_id, chat_id, text)
         return chat_id, msg_id
 
     # -- securejoin (accept a verified invite → inviter becomes a key-contact) ----
@@ -740,6 +753,22 @@ class DeltaChatBackend:
             return ("info", f"securejoin {who}: contact={_field(ev, 'contact_id')} "
                             f"progress={_field(ev, 'progress')}")
         return None
+
+    def _send_msg(self, account_id: int, chat_id: int, text: str) -> int:
+        """``send_msg`` with the core's permanent "cannot encrypt" failure surfaced as a typed,
+        explanatory error (``UnencryptableRecipient``) instead of a generic one that the relay
+        would park and retry ~40 times before dropping."""
+        try:
+            return self.rpc.send_msg(account_id, chat_id, {"text": text})
+        except Exception as e:
+            if _is_unencryptable(e):
+                raise UnencryptableRecipient(
+                    f"cannot end-to-end encrypt to the recipient of chat {chat_id} (acct "
+                    f"{account_id}): it is an address-contact with no encryption key, and this "
+                    f"mail server requires encryption. Not retried. Send to the recipient's "
+                    f"verified key-contact instead (delta_list_contacts / delta_send_to_peer), "
+                    f"or securejoin with them first. Core said: {e}") from e
+            raise
 
     # -- inbound event stream ---------------------------------------------
     #
@@ -1591,6 +1620,13 @@ class PeerMesh:
                           target_bot, self.config.mail_domain, sender_bot)
                 return {"status": "rejected", "reason": "foreign-domain", "target": target_bot}
             target_bot = self._peer_id(local)
+        if self.config.roster and not any(target_bot in (b.id, b.localpart)
+                                          for b in self.config.roster):
+            # Not a fleet member (e.g. a retired bot whose Delta account still exists): never
+            # start a securejoin with it or queue for it.
+            log.error("peer-mesh: target %r is not in the roster — REJECTING send from %s",
+                      target_bot, sender_bot)
+            return {"status": "rejected", "reason": "target-not-in-roster", "target": target_bot}
         target_addr = self._peer_addr(target_bot)
         key = (sender_bot, target_addr)
         now = time.monotonic()
@@ -1992,7 +2028,7 @@ class Relay:
         try:
             chat_id, msg_id = self.backend.send_to_addr(accid, addr, text)
             return {"status": "sent", "account_id": accid, "chat_id": chat_id, "msg_id": msg_id}
-        except KeyError:
+        except (KeyError, TypeError):
             raise
         except Exception as e:
             return self._park(bot, "addr", addr, text, e, accid)
@@ -2510,6 +2546,8 @@ def create_app(relay: Relay):
             return await asyncio.to_thread(relay.send, req.bot_id, req.target, req.text)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except UnencryptableRecipient as e:
+            raise HTTPException(status_code=422, detail=str(e))
         except Exception as e:  # pragma: no cover - backend send failure
             raise HTTPException(status_code=502, detail=f"send failed: {e}")
 
@@ -2555,6 +2593,8 @@ def create_app(relay: Relay):
             return await asyncio.to_thread(fn)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except UnencryptableRecipient as e:
+            raise HTTPException(status_code=422, detail=str(e))
         except HTTPException:
             raise
         except Exception as e:  # pragma: no cover - backend failure

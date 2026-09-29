@@ -351,3 +351,11 @@ def test_send_to_peer_rejects_foreign_domain_loudly(caplog):
                    "target": "bot-b@elsewhere.example"}
     assert backend.sent_to == [] and backend.invites == [] and mesh.pending_count() == 0
     assert any("not on this relay's domain" in r.getMessage() for r in caplog.records)
+
+
+def test_send_to_peer_rejects_target_not_in_roster():
+    """A retired bot keeps its Delta account, but must never get a securejoin or a queue."""
+    mesh, backend = make_mesh({"bot-a": 7, "retired": 11})
+    res = mesh.send_to_peer("bot-a", "retired", "hello?")
+    assert res == {"status": "rejected", "reason": "target-not-in-roster", "target": "retired"}
+    assert backend.invites == [] and backend.sent_to == [] and mesh.pending_count() == 0
