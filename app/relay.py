@@ -749,7 +749,9 @@ class DeltaChatBackend:
         (deltachat-core's "securejoin done" sentinel) on the LEAD's account. Selected on
         ``kind``, mirroring incoming_ids/reaction_ids. This is the event that drives
         EVENT-DRIVEN channel provisioning — no wait, no poll."""
-        if _kind(ev) == "SecurejoinInviterProgress":
+        # JoinerProgress too: for an EXTERNAL member the lead is the joiner (it joins the
+        # member's invite), so completion surfaces on the joiner side.
+        if _kind(ev) in ("SecurejoinInviterProgress", "SecurejoinJoinerProgress"):
             if int(_field(ev, "progress") or 0) >= 1000:
                 return _field(ev, "contact_id")
         return None
@@ -1636,6 +1638,21 @@ class PeerMesh:
         sender_accid = self.backend.account_id_for(sender_bot)
         if sender_accid is None:
             raise KeyError(f"no delta account for bot {sender_bot!r}")
+        ext = self.config.external_for(target_bot)
+        if ext is not None:
+            # An external member (own Delta account): no securejoin/queue can be driven from
+            # here — its realm lead verifies it via the roster invite. Send iff already a
+            # key-contact of the sender (e.g. learned through the realm group), else say so.
+            if self.backend.is_verified_key_contact(sender_accid, ext.address):
+                chat_id, msg_id = self.backend.send_to_addr(sender_accid, ext.address, text)
+                return {"status": "sent", "account_id": sender_accid, "chat_id": chat_id,
+                        "msg_id": msg_id, "target_addr": ext.address}
+            log.warning("peer-mesh: external member %s (%s) is not yet a key-contact of %s — "
+                        "not sent", ext.id, ext.address, sender_bot)
+            return {"status": "rejected", "reason": "external-not-verified",
+                    "target_addr": ext.address,
+                    "detail": f"{ext.id} has its own Delta account; it becomes reachable once "
+                              f"its realm lead has verified it and it is in the realm group"}
         if "@" in target_bot:
             local, _, domain = target_bot.strip().rpartition("@")
             if domain.lower() != self.config.mail_domain.lower() or not local:
@@ -2247,6 +2264,9 @@ class Relay:
         the deterministic fleet signal — humans (Justin/Elene/external) are never in the roster."""
         if localpart and any(localpart.lower() == b.localpart.lower() for b in self.config.roster):
             return "bot"
+        if localpart and any(localpart.lower() == m.address.split("@", 1)[0]
+                             for m in self.config.external):
+            return "bot"
         return "human"
 
     async def handle_inbound(self, msg: InboundMessage) -> list[str]:
@@ -2371,6 +2391,11 @@ class Relay:
 
     async def _deliver(self, bot: str, payload: dict) -> bool:
         """Resolve ``bot``'s live url + POST the wake; hold it on any failure."""
+        if self.config.external_for(bot) is not None or self.config.external_for(
+                f"{bot}@{self.config.mail_domain}") is not None:
+            # An external member (own Delta account, e.g. a Hermes bot's plugin) already
+            # received this message natively — the relay never wakes or holds for it.
+            return False
         agent_url = await self.directory.resolve(bot)
         if agent_url and await self.directory.wake(agent_url, bot, payload):
             return True

@@ -226,7 +226,8 @@ def desired_channels(config: Config) -> list[dict]:
             continue
         lead = id_to_localpart.get(lead_id, lead_id)  # bot-id → localpart (no-op if id==lp)
         out.append({"realm": realm, "name": realm, "lead": lead,
-                    "members": sorted(by_realm[realm])})
+                    "members": sorted(by_realm[realm]),
+                    "externals": [m for m in config.external if m.realm == realm]})
     return out
 
 
@@ -319,6 +320,14 @@ def provision_channels(config: Config, backend) -> list[dict]:
                     if m != lead and m not in have:
                         backend.add_member(lead_accid, match["id"], f"{m}@{domain}")
                         added += 1
+                # External members (own Delta account): only once VERIFIED — the core refuses
+                # to add a non-key-contact to an encrypted group. Catch-up for a verification
+                # that completed while no event reached us (restart, missed event).
+                for ext in ch.get("externals", []):
+                    if (ext.address.split("@", 1)[0] not in have
+                            and backend.is_verified_key_contact(lead_accid, ext.address)):
+                        backend.add_member(lead_accid, match["id"], ext.address)
+                        added += 1
                 results.append({"realm": ch["realm"], "channel_id": match["id"],
                                 "added": added})
         except Exception:
@@ -392,6 +401,25 @@ def securejoin_star(config: Config, backend) -> list[dict]:
             # The core's securejoin-verified event (handled by provision_verified_member) adds the
             # member to the channel — we do NOT wait/re-check here.
             initiated.append(m)
+        # External members own their account elsewhere, so the LEAD is the joiner: it
+        # securejoins the member's invite link. Fire-and-forget like the star above; the
+        # joiner-side completion event (or provision_channels' catch-up) adds them.
+        for ext in ch.get("externals", []):
+            if backend.is_verified_key_contact(lead_accid, ext.address):
+                skipped_verified.append(ext.id)
+                continue
+            if not ext.invite:
+                log.warning("reconcile: external member %s (%s) has no invite link in the "
+                            "roster — cannot securejoin it", ext.id, ext.address)
+                pending.append(ext.id)
+                continue
+            try:
+                backend.secure_join(lead_accid, ext.invite)
+            except Exception:
+                log.exception("securejoin %s → external %s failed", lead, ext.id)
+                pending.append(ext.id)
+                continue
+            initiated.append(ext.id)
         results.append({"realm": ch["realm"], "initiated": initiated,
                         "skipped_verified": skipped_verified, "pending": pending})
         if initiated:
@@ -420,7 +448,26 @@ def provision_verified_member(config: Config, backend, lead_accid: int,
         return None
     member_lp = addr.split("@", 1)[0]
     domain = config.mail_domain
+    ext = config.external_for(addr)
     for ch in desired_channels(config):
+        if ext is not None and ch["lead"] == lead_lp and ext in ch.get("externals", []):
+            try:
+                existing = backend.list_channels(lead_accid) or []
+                match = next((c for c in existing if c.get("name") == ch["name"]), None)
+                if match is None:
+                    chat_id = backend.create_channel(lead_accid, ch["name"], [ext.address])
+                    log.info("provision(event): realm %s — created channel %s with external %s",
+                             ch["realm"], chat_id, ext.id)
+                    return {"realm": ch["realm"], "created": chat_id, "added": ext.id}
+                if member_lp not in set(match.get("members", [])):
+                    backend.add_member(lead_accid, match["id"], ext.address)
+                    log.info("provision(event): realm %s — added external %s to channel %s",
+                             ch["realm"], ext.id, match["id"])
+                    return {"realm": ch["realm"], "channel_id": match["id"], "added": ext.id}
+                return {"realm": ch["realm"], "channel_id": match["id"], "already": ext.id}
+            except Exception:
+                log.exception("provision(event) failed: realm %s external %s", ch["realm"], ext.id)
+                return {"realm": ch["realm"], "error": True}
         if ch["lead"] != lead_lp or member_lp == lead_lp or member_lp not in ch["members"]:
             continue
         name = ch["name"]

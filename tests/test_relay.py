@@ -1198,9 +1198,11 @@ def test_securejoin_ids_selects_completed_inviter_progress():
     assert DeltaChatBackend.securejoin_ids(
         AttrDict({"kind": "SecurejoinInviterProgress", "chatId": 5, "chatType": 120,
                   "contactId": 42, "progress": 400})) is None
-    # the JOINER-side progress event is not what drives lead provisioning → None
+    # JOINER-side completion counts too: for an EXTERNAL member the lead is the joiner
     assert DeltaChatBackend.securejoin_ids(
-        AttrDict({"kind": "SecurejoinJoinerProgress", "contactId": 42, "progress": 1000})) is None
+        AttrDict({"kind": "SecurejoinJoinerProgress", "contactId": 42, "progress": 1000})) == 42
+    assert DeltaChatBackend.securejoin_ids(
+        AttrDict({"kind": "SecurejoinJoinerProgress", "contactId": 42, "progress": 400})) is None
     # a different event kind → None
     assert DeltaChatBackend.securejoin_ids(object()) is None
 
