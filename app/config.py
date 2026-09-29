@@ -39,6 +39,14 @@ class Config:
     username_max_length: int = 64
     roster: list[BotSpec] = field(default_factory=list)
     realm_leads: dict[str, str] = field(default_factory=dict)  # realm -> "main" bot id
+    # Per-bot wake transport for bots NOT reachable via the a2a directory, keyed by bot id —
+    # the roster's top-level ``wakes:`` map (a separate key, so a roster carrying it still loads
+    # in older images that only read ``bots``/``realm_leads``). Shape:
+    #   wakes:
+    #     <bot id>: {kind: hermes-runs, url: "http://host:port", key_env: SOME_ENV_VAR}
+    # ``kind: hermes-runs`` = Hermes Agent's documented programmatic input, ``POST /v1/runs``
+    # (Bearer = the API server key, read from env var ``key_env`` — never from the roster).
+    wakes: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def load(cls, roster_path: str | None = None) -> "Config":
@@ -46,13 +54,14 @@ class Config:
         roster_path = roster_path or os.environ.get("DELTA_ROSTER_PATH", "/config/roster.yaml")
         domain = os.environ.get("DELTA_MAIL_DOMAIN", "")
         imap_host = os.environ.get("DELTA_IMAP_HOST", domain)
-        roster, leads = [], {}
+        roster, leads, wakes = [], {}, {}
         p = Path(roster_path)
         if p.exists():
             data = yaml.safe_load(p.read_text()) or {}
             roster = [BotSpec(**b) if isinstance(b, dict) else BotSpec(id=b)
                       for b in data.get("bots", [])]
             leads = data.get("realm_leads", {}) or {}
+            wakes = {str(k): dict(v) for k, v in (data.get("wakes") or {}).items()}
         return cls(
             mail_domain=domain,
             imap_host=imap_host,
@@ -65,6 +74,7 @@ class Config:
             username_max_length=int(os.environ.get("DELTA_USERNAME_MAX_LENGTH", "64")),
             roster=roster,
             realm_leads=leads,
+            wakes=wakes,
         )
 
     @staticmethod
