@@ -27,7 +27,9 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -413,7 +415,9 @@ class DeltaChatBackend:
       * ``rpc.get_all_account_ids() -> list[int]``
       * ``rpc.get_config(accid, "addr") -> str``      — configured address of an account
       * ``rpc.send_msg(accid, chatid, {"text": ...}) -> int``       — returns sent msg id
-      * ``rpc.get_next_event() -> dict``              — event stream (blocks until one arrives)
+      * ``rpc.wait_for_event(accid) -> dict``         — per-account event stream (blocks). NOT
+        ``get_next_event``: the client's own events thread already consumes the core's
+        single event channel, so a second consumer steals events from it (see next_inbound)
       * ``rpc.get_message(accid, msgid)`` / ``rpc.get_basic_chat_info`` /
         ``rpc.get_chat_contacts(accid, chatid) -> list[int]`` / ``rpc.get_contact(accid, cid)``
       * ``rpc.get_contacts(accid, listflags, query)`` — enumerate contacts
@@ -432,6 +436,12 @@ class DeltaChatBackend:
         self.accounts_dir = accounts_dir
         self._addr_to_accid: dict[str, int] = {}
         self._localpart_to_accid: dict[str, int] = {}
+        # Merged inbound event stream: one forwarder thread per account moves that account's
+        # events from the client's per-account queue (rpc.wait_for_event) onto this queue.
+        self._events: "queue.Queue[tuple[int, Any]]" = queue.Queue()
+        self._forwarded: set[int] = set()
+        self._forward_lock = threading.Lock()
+        self._pumping = False  # forwarders start with the first next_inbound (the event pump)
         if _rpc is not None:
             self.rpc = _rpc
         else:  # pragma: no cover - requires the deltachat-rpc-client + rpc-server binary
@@ -456,7 +466,10 @@ class DeltaChatBackend:
         """Map configured account addresses → account ids, keyed by localpart."""
         self._addr_to_accid.clear()
         self._localpart_to_accid.clear()
-        for accid in self.rpc.get_all_account_ids():
+        accids = list(self.rpc.get_all_account_ids())
+        if self._pumping:  # a newly onboarded account joins the running event stream
+            self._ensure_event_forwarders(accids)
+        for accid in accids:
             try:
                 addr = self.rpc.get_config(accid, "addr") or self.rpc.get_config(accid, "configured_addr")
             except Exception:  # pragma: no cover - defensive
@@ -728,14 +741,66 @@ class DeltaChatBackend:
                             f"progress={_field(ev, 'progress')}")
         return None
 
-    def next_inbound(self):  # pragma: no cover - real rpc entry
-        raw = self.rpc.get_next_event()
-        if raw is None:
+    # -- inbound event stream ---------------------------------------------
+    #
+    # 🔴 The core has ONE event channel per rpc-server, and ``Rpc.start()`` already runs a
+    # thread (``Rpc.events_loop``) that drains it via ``get_next_event_batch`` and files each
+    # event into a per-account queue read by ``Rpc.wait_for_event(accid)``. The core's own docs
+    # for ``get_next_event``: "if you are using ... the Rpc Python class, this function will be
+    # invoked by those classes internally and should not be used manually." Calling it here as
+    # well made two consumers race for every event: the ones the client's thread won (about
+    # two thirds) sat unread in its queues forever — lost wakes, lost reactions, and lost
+    # securejoin-verified events (so the peer-mesh queue for that pair never flushed).
+    #
+    # So the relay reads each account's events the documented way, ``wait_for_event(accid)``,
+    # one forwarder thread per account, merged onto one queue for the single event pump.
+
+    _EVENT_POLL_SECONDS = 5.0
+
+    def _ensure_event_forwarders(self, accids=None) -> None:
+        """Start a forwarder thread for every account that doesn't have one yet. Idempotent.
+        Events emitted before a forwarder starts are not lost: the client's events thread has
+        been queueing them per account since ``Rpc.start()``."""
+        if accids is None:
+            accids = self.rpc.get_all_account_ids()
+        with self._forward_lock:
+            for accid in accids:
+                if accid in self._forwarded:
+                    continue
+                self._forwarded.add(accid)
+                threading.Thread(target=self._forward_events, args=(accid,),
+                                 daemon=True, name=f"dcf-events-acct{accid}").start()
+
+    def _forward_events(self, accid: int) -> None:
+        """Forwarder thread body: move account ``accid``'s events onto the merged queue."""
+        while True:
+            try:
+                ev = self.rpc.wait_for_event(accid)
+            except Exception:
+                log.exception("event forwarder for acct %s died", accid)
+                with self._forward_lock:
+                    self._forwarded.discard(accid)  # let the next ensure pass restart it
+                return
+            if ev is not None:
+                self._events.put((accid, ev))
+
+    def _next_event(self):
+        """Next ``(accid, event)`` from any account, or None after an idle poll interval (the
+        idle wake-up re-checks for accounts onboarded since the last pass)."""
+        if not self._pumping:
+            self._pumping = True
+            self._ensure_event_forwarders()
+        try:
+            return self._events.get(timeout=self._EVENT_POLL_SECONDS)
+        except queue.Empty:
+            self._ensure_event_forwarders()
             return None
-        # The core's event envelope carries the account id as ``context_id``.
-        accid = (_field(raw, "context_id") or _field(raw, "account_id")
-                 or _field(raw, "accid") or 0)
-        ev = _field(raw, "event") or raw
+
+    def next_inbound(self):  # pragma: no cover - real rpc entry
+        item = self._next_event()
+        if item is None:
+            return None
+        accid, ev = item
         # Surface diagnostically-useful core events to the relay log (never invisible again).
         diag = self.core_diagnostic(ev)
         if diag is not None:
@@ -759,7 +824,8 @@ class DeltaChatBackend:
             contact = self.rpc.get_contact(accid, contact_id)
             addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
         except Exception:
-            pass
+            log.warning("verified event: get_contact(acct=%s, contact=%s) failed — no addr",
+                        accid, contact_id, exc_info=True)
         return InboundVerified(account_id=accid, contact_id=contact_id or 0, addr=addr)
 
     def _build_reaction(self, accid: int, chat_id, contact_id, msg_id, emoji: str) -> InboundReaction:  # pragma: no cover
@@ -768,7 +834,8 @@ class DeltaChatBackend:
             contact = self.rpc.get_contact(accid, contact_id)
             from_addr = getattr(contact, "address", None) or getattr(contact, "addr", None) or ""
         except Exception:
-            pass
+            log.warning("reaction: get_contact(acct=%s, contact=%s) failed — no from_addr",
+                        accid, contact_id, exc_info=True)
         # Only the AUTHOR of the reacted-to message should be woken; the reaction event is
         # delivered to every member account, so gate on "is this account the message author?"
         # (msg.from_id == self) + carry the reacted msg's GLOBAL id for cross-account dedup.
@@ -779,12 +846,14 @@ class DeltaChatBackend:
             m = self.rpc.get_message(accid, msg_id)
             own_message = int(getattr(m, "from_id", 0) or 0) == int(SpecialContactId.SELF)
         except Exception:
-            pass
+            log.warning("reaction: get_message(acct=%s, msg=%s) failed — author unknown",
+                        accid, msg_id, exc_info=True)
         try:
             info = self.rpc.get_message_info_object(accid, msg_id)
             rfc724_mid = getattr(info, "rfc724_mid", "") or ""
         except Exception:
-            pass
+            log.warning("reaction: get_message_info_object(acct=%s, msg=%s) failed — no "
+                        "cross-account dedup id", accid, msg_id, exc_info=True)
         return InboundReaction(
             account_id=accid, chat_id=chat_id or 0, msg_id=msg_id or 0,
             emoji=emoji, from_id=contact_id or 0, from_addr=from_addr,
@@ -811,6 +880,8 @@ class DeltaChatBackend:
                 if addr:
                     members.append(addr.split("@", 1)[0])
             except Exception:
+                log.warning("inbound: get_contact(acct=%s, contact=%s) failed — member omitted",
+                            accid, cid, exc_info=True)
                 continue
         from_id = getattr(msg, "from_id", 0) or 0
         # Sender localpart — used for sender-exclusion (a bot is never woken by its own post)
@@ -830,7 +901,8 @@ class DeltaChatBackend:
             try:
                 from_localpart = _localpart(self.rpc.get_contact(accid, from_id))
             except Exception:
-                pass
+                log.warning("inbound: get_contact(acct=%s, contact=%s) failed", accid, from_id,
+                            exc_info=True)
         if not from_localpart:
             log.warning("inbound sender UNRESOLVED (renders 'someone'): accid=%s msg=%s from_id=%s sender=%r",
                         accid, msg_id, from_id, getattr(msg, "sender", None))
@@ -840,7 +912,8 @@ class DeltaChatBackend:
             info = self.rpc.get_message_info_object(accid, msg_id)
             rfc724_mid = getattr(info, "rfc724_mid", "") or ""
         except Exception:
-            pass
+            log.warning("inbound: get_message_info_object(acct=%s, msg=%s) failed — no "
+                        "cross-account dedup id", accid, msg_id, exc_info=True)
         # Device/self-talk chats (account's own sync channels — login/update notices) and
         # system/info messages (core-generated, sender=SpecialContactId.DEVICE=5) are NEVER human
         # DMs. Classify here so handle_inbound suppresses the wake entirely — killing the poison
@@ -905,6 +978,8 @@ class DeltaChatBackend:
                 try:
                     members.append(self._contact_dict(account_id, cid)["address"].split("@", 1)[0])
                 except Exception:
+                    log.warning("list_channels: contact %s of chat %s (acct=%s) unreadable — "
+                                "member omitted", cid, chat_id, account_id, exc_info=True)
                     continue
             out.append({
                 "id": chat_id,
@@ -996,6 +1071,7 @@ class DeltaChatBackend:
                      "is_from_self": bool(getattr(r, "is_from_self", False))}
                     for r in (getattr(reactions, "reactions", None) or [])]
         except Exception:
+            log.warning("reactions unreadable (acct=%s msg=%s)", account_id, msg_id, exc_info=True)
             return []
 
     def create_invite(self, account_id: int, target_addr: Optional[str] = None) -> str:  # pragma: no cover - real rpc
@@ -1046,12 +1122,13 @@ class DeltaChatBackend:
                     log.info("re-onboarding %s: address changed %s -> %s",
                              localpart, current, desired_addr)
             except Exception:
-                pass
+                log.warning("onboard %s: reading current config of acct %s failed — "
+                            "re-running transport setup", localpart, existing, exc_info=True)
         accid = existing if existing is not None else self.rpc.add_account()
         try:
             self.rpc.set_config(accid, "bot", "1")  # mark as a bot account (best-effort)
         except Exception:
-            pass
+            log.warning("onboard %s: set_config(bot=1) failed", localpart, exc_info=True)
         self._set_displayname(accid, display_name)  # name humans see (best-effort)
         # The core's EnteredLoginParam, as the camelCase dict the JSON-RPC API accepts.
         # The Socket enum is serde-rename_all camelCase, so the wire values are lowercase.
@@ -1070,7 +1147,8 @@ class DeltaChatBackend:
             try:
                 self.rpc.start_io(accid)  # begin receiving for the freshly-configured account
             except Exception:
-                pass
+                log.error("onboard %s: start_io(acct=%s) failed — account will NOT receive",
+                          localpart, accid, exc_info=True)
             self._reindex_accounts()
         return ok
 
@@ -1082,7 +1160,7 @@ class DeltaChatBackend:
         try:
             self.rpc.set_config(account_id, "displayname", display_name)
         except Exception:
-            pass
+            log.warning("set displayname failed (acct=%s)", account_id, exc_info=True)
 
 
 def extract_mentions(text: str, members: list[str]) -> list[str]:
