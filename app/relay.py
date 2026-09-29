@@ -1329,14 +1329,6 @@ class AgentDirectory:
             self._refreshing = False
             self._last_refresh_ok = ok
 
-    def _wake_spec(self, bot_id: str) -> Optional[dict]:
-        """The roster ``wakes:`` entry for ``bot_id`` (case-insensitive), or None = a2a bot."""
-        key = (bot_id or "").lower()
-        for name, spec in (getattr(self.config, "wakes", None) or {}).items():
-            if name.lower() == key:
-                return spec
-        return None
-
     async def resolve(self, bot_id: str) -> Optional[str]:
         """Return the live a2a URL for ``bot_id`` from the a2abridge directory, or None.
 
@@ -1351,13 +1343,6 @@ class AgentDirectory:
         lookup misses) would fire a refresh on EVERY resolve() = retry storm. _refresh advances
         _refreshed_at even on empty/failure, so the miss path is bounded to ~one refresh per
         MISS_MIN during an outage."""
-        spec = self._wake_spec(bot_id)
-        if spec is not None:
-            # Not an a2a bot: its wake endpoint is configured in the roster, not discovered.
-            target = spec.get("url") or None
-            if target is None:
-                log.error("resolve(%s) → None: roster wakes entry has no url", bot_id)
-            return target
         key = bot_id.lower()
         age = time.monotonic() - self._refreshed_at
         stale = age > self._ttl
@@ -1385,9 +1370,6 @@ class AgentDirectory:
         "[alice@example.com reacted 👍 on msg 27 via Delta Chat]"), delivered as the message's
         text part — matching the proven single-bot pattern. True iff the request was accepted (2xx).
         """
-        spec = self._wake_spec(bot_id)
-        if spec is not None:
-            return await self._wake_configured(spec, agent_url, bot_id, payload)
         text = payload.get("text") or f"[Delta Chat] wake for {bot_id}"
         # 🔴 STABLE, PRODUCER-OWNED taskId. Without it the bridge mints a fresh random UUID per
         # delivery (store.AcceptInbound: taskID==""→a2a.NewID()), so the dedup digest
@@ -1449,48 +1431,6 @@ class AgentDirectory:
             return True
         except Exception as e:
             log.warning("wake %s → %s FAILED: %s", bot_id, agent_url, e)
-            return False
-
-
-    async def _wake_configured(self, spec: dict, url: str, bot_id: str, payload: dict) -> bool:
-        """Wake a bot through its roster-configured transport (``wakes:`` entry).
-
-        ``kind: hermes-runs`` — Hermes Agent's documented programmatic input: ``POST /v1/runs``
-        on its API server with ``Authorization: Bearer <API server key>`` and a simple
-        ``input`` string. The run is keyed for safe retries with an ``Idempotency-Key`` (the
-        same stable task id the a2a path uses, so a held-then-retried wake — or the N member
-        copies of one group message — starts ONE run), and ``session_id`` /
-        ``X-Hermes-Session-Key`` carry the Delta chat so Hermes can correlate runs per chat. The
-        bot replies with the relay's own delta_* MCP tools (the reply hint is in the text).
-        True iff Hermes accepted the run (2xx; 202 = idempotent replay of an accepted run).
-        """
-        kind = spec.get("kind")
-        if kind != "hermes-runs":
-            log.error("wake %s: unsupported roster wake kind %r — not delivered", bot_id, kind)
-            return False
-        key_env = spec.get("key_env") or ""
-        api_key = os.environ.get(key_env, "") if key_env else ""
-        if not api_key:
-            log.error("wake %s: env var %r (roster wakes.key_env) is unset — not delivered",
-                      bot_id, key_env)
-            return False
-        text = payload.get("text") or f"[Delta Chat] wake for {bot_id}"
-        task_id = _stable_task_id(bot_id, payload) or "%s:content:%s" % (
-            bot_id, hashlib.sha256(("\x1f".join([bot_id, str(text)])).encode()).hexdigest()[:16])
-        rt = payload.get("reply_target") or {}
-        chat = rt.get("chat_id") or rt.get("channel_id") or payload.get("chat_id") or ""
-        session = f"deltachat:{bot_id}:{chat}"
-        headers = {"Authorization": f"Bearer {api_key}", "Idempotency-Key": task_id[:255],
-                   "X-Hermes-Session-Key": session}
-        body = {"input": text, "session_id": session}
-        try:
-            resp = await self.client.post(url.rstrip("/") + "/v1/runs", json=body,
-                                          headers=headers)
-            resp.raise_for_status()
-            log.info("wake %s → %s/v1/runs (%s)", bot_id, url, resp.status_code)
-            return True
-        except Exception as e:
-            log.warning("wake %s → %s/v1/runs FAILED: %s", bot_id, url, e)
             return False
 
 
