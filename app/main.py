@@ -10,11 +10,10 @@ Runs these concurrently in one process (all gated so a unit test never fires rea
                                BLOCKS, so it must NOT run on the asyncio loop or it freezes
                                uvicorn; the thread bridges each incoming msg onto the loop)
   5. the hold-queue drain loop (retry undeliverable wakes)
-  6. the nightly backup loop   (app.backup — deltachat imex export per account)
 
 Generic-engine rule (hard): ZERO fleet identity is baked here. Domain, imap host, roster,
 directory URL, ports, dirs, intervals — ALL from ``app.config.Config`` + env. This file
-only imports+wires config/reconciler/routing/relay/backup; it adds no fleet-specific logic.
+only imports+wires config/reconciler/routing/relay; it adds no fleet-specific logic.
 
 Env contract (all optional-with-defaults except the domain):
   DELTA_MAIL_DOMAIN         (config)  mail domain accounts live under          — REQUIRED
@@ -25,9 +24,6 @@ Env contract (all optional-with-defaults except the domain):
   DATA_DIR                            LOCAL account-DB + hold-queue dir        default /data
   ACCOUNTS_DIR                        deltachat accounts dir       default $DATA_DIR/accounts
   DELTA_SECRETS_PATH                  local per-bot password store default $DATA_DIR/secrets.json
-  DELTA_BACKUP_DIR                    imex backup dir              default /backup
-  DELTA_BACKUP_RETAIN                 backups kept per account     default 7
-  DELTA_BACKUP_INTERVAL               backup loop seconds          default 86400
   DELTA_RECONCILE_INTERVAL            reconciler loop seconds      default 3600
   RELAY_HOST / RELAY_PORT             relay uvicorn bind       default 0.0.0.0 / 8080
   DELTA_RECONCILE_ON_START            "1" to reconcile once at boot    default 1
@@ -49,7 +45,6 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from . import backup as backup_mod
 from . import reconciler
 from .config import Config
 from .relay import InboundReaction, InboundVerified, Relay, build_default, create_app
@@ -617,12 +612,10 @@ class Service:
     beyond what the injected backend does."""
 
     def __init__(self, config: Config, relay: Relay, secrets: SecretsStore,
-                 *, backup_backend: Optional[backup_mod.BackupBackend] = None,
-                 registry: "Optional[OnboardRegistry]" = None):
+                 *, registry: "Optional[OnboardRegistry]" = None):
         self.config = config
         self.relay = relay
         self.secrets = secrets
-        self.backup_backend = backup_backend
         self.registry = registry
         self.app = create_app(relay)
 
@@ -666,9 +659,8 @@ def build_service(config: Optional[Config] = None,
     else:
         secrets = SecretsStore(secrets_path, config.password_min_length)
         log.info("secret store: local mint-to-disk (chatmaild-era)")
-    backup_backend = backup_mod.DeltaChat2BackupBackend(relay.backend)
     registry = OnboardRegistry(OnboardRegistry.default_path(config))
-    return Service(config, relay, secrets, backup_backend=backup_backend, registry=registry)
+    return Service(config, relay, secrets, registry=registry)
 
 
 def _make_onboard(service: Service) -> Onboard:  # pragma: no cover - real core onboarding
@@ -689,7 +681,7 @@ def _make_onboard(service: Service) -> Onboard:  # pragma: no cover - real core 
 
 
 async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn + loops
-    """Start both uvicorns + the reconciler + the drain loop + the backup loop on the asyncio
+    """Start both uvicorns + the reconciler + the drain loop on the asyncio
     loop, and the BLOCKING deltachat event stream in a dedicated thread. One process."""
     import uvicorn
 
@@ -698,9 +690,6 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
     port = int(os.environ.get("RELAY_PORT", os.environ.get("PORT", "8080")))
     reconcile_interval = float(os.environ.get("DELTA_RECONCILE_INTERVAL", "3600"))
     run_on_start = os.environ.get("DELTA_RECONCILE_ON_START", "1") == "1"
-    backup_dir = os.environ.get("DELTA_BACKUP_DIR", "/backup")
-    backup_retain = int(os.environ.get("DELTA_BACKUP_RETAIN", "7"))
-    backup_interval = float(os.environ.get("DELTA_BACKUP_INTERVAL", "86400"))
 
     server = uvicorn.Server(uvicorn.Config(service.app, host=host, port=port, log_level="info"))
 
@@ -767,8 +756,6 @@ async def _serve(service: Service) -> None:  # pragma: no cover - real uvicorn +
         reconciler_loop(cfg, service.secrets, reconcile_interval, run_on_start, existing_fn,
                         onboard=_make_onboard(service),
                         after_reconcile=after_reconcile, registry=service.registry),
-        backup_mod.run_forever(cfg, service.backup_backend, backup_dir,
-                               retain=backup_retain, interval=backup_interval),
     )
 
 
