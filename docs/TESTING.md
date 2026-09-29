@@ -20,7 +20,7 @@ core / chatmail server**, so we know the deploy-time live-verify is load-bearing
 ## Covered by the offline suite (`pytest -q`, no network / no rpc-server)
 
 - **Pure logic:** routing (anti-thundering-herd), reconcile diff, password minting, config
-  parsing, hold-queue idempotency, backup scheduling/rotation, mention extraction.
+  parsing, hold-queue idempotency, mention extraction.
 - **HTTP contract:** every relay endpoint (`/send`, `/contacts`, `/channels`, `/send_channel`,
   `/channel`, `/channel/member`, `/react`, `/healthz`) via `TestClient` with a fake backend.
 - **MCP tools:** all 7 tools register with clean schemas and delegate to the right relay
@@ -59,7 +59,6 @@ They're isolated behind the `DeltaBackend` seam with `# pragma: no cover` + defe
 | **Inbound event parsing** (`_build_inbound`: `get_message`/`get_basic_chat_info`/`get_chat_contacts`/`get_contact`) | real event/message/chat snapshot field names are version-fragile across cores | type-based selection (`incoming_ids`) unit-tested; body build behind the seam | a real inbound group msg wakes the right bot(s) |
 | **Message delivery** (`send` → `rpc.send_msg`) | needs a configured account + live SMTP | `/send` HTTP contract + routing unit-tested with a fake backend | a real `delta_send` / `delta_list_channels` returns live data |
 | **contacts/channels/react** enumeration (`get_contacts`/`get_chatlist_entries`/`send_reaction`) | JSON-RPC names could not be signature-verified from reachable autodocs | isolated behind the seam with defensive fallbacks | exercise each MCP tool against the live account |
-| **Nightly imex backup** (`export_backup`) | needs a live account DB | scheduling/rotation unit-tested; the one imex call is `# pragma: no cover` | a backup tar appears in `/backup` after the interval |
 | **MCP end-to-end** (gateway → `/mcp` → relay HTTP → backend send) | full chain needs a live core + a real MCP client handshake | each hop unit-tested (tools, delegation, relay HTTP); `/mcp` bind covered by the boot test | gateway `tools/list` + a real tool call succeed |
 
 **Deploy live-verify is therefore required** for every "live-only" row above — a green unit

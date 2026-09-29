@@ -382,8 +382,6 @@ def test_serve_boots_and_both_uvicorns_bind_with_blocking_backend(tmp_path, monk
     monkeypatch.setenv("DELTA_MCP_PORT", str(mcp_port))
     monkeypatch.setenv("DELTA_RECONCILE_ON_START", "0")   # this test is about binding, not onboarding
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("DELTA_BACKUP_DIR", str(tmp_path / "backup"))
-    monkeypatch.setenv("DELTA_BACKUP_INTERVAL", "99999")   # backup loop sleeps; never fires in-test
 
     release = threading.Event()
 
@@ -403,7 +401,7 @@ def test_serve_boots_and_both_uvicorns_bind_with_blocking_backend(tmp_path, monk
     cfg = _cfg("bot-a", leads={"default": "bot-a"})
     relay = Relay(cfg, BlockingBackend(), AgentDirectory(cfg, httpx.AsyncClient()),
                   HoldQueue(str(tmp_path)))
-    svc = main.Service(cfg, relay, main.SecretsStore(str(tmp_path / "s.json")), backup_backend=None)
+    svc = main.Service(cfg, relay, main.SecretsStore(str(tmp_path / "s.json")))
 
     async def _await_ok(client, url, timeout=12.0):
         import time

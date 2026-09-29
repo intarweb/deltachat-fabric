@@ -22,19 +22,15 @@ services:
       DATA_DIR: "/data"
       ACCOUNTS_DIR: "/data/accounts"
       DELTA_SECRETS_PATH: "/data/secrets.json"
-      DELTA_BACKUP_DIR: "/backup"
       # --- schedules / tuning ---
       DELTA_RECONCILE_INTERVAL: "3600"
       DELTA_RECONCILE_ON_START: "1"
-      DELTA_BACKUP_INTERVAL: "86400"
-      DELTA_BACKUP_RETAIN: "7"
       RELAY_HOST: "0.0.0.0"
       RELAY_PORT: "8080"
     volumes:
       # 🔴 /data MUST be a LOCAL volume (SQLCipher over NFS corrupts). Use a named
       # docker volume or a local bind — NEVER an NFS mount.
       - dcf-data:/data
-      - dcf-backup:/backup
       # roster injected read-only at deploy; the repo/image never contains it.
       - ./config:/config:ro
     healthcheck:
@@ -46,4 +42,3 @@ services:
 
 volumes:
   dcf-data:
-  dcf-backup:

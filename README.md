@@ -23,12 +23,8 @@ reusable by anyone; your specifics never live in the repo.
 - **Routing** (`app/routing.py`) — the anti-thundering-herd rule: @mentions wake only the
   mentioned members; an unaddressed message wakes only the channel's "main" (realm lead);
   **never** wakes all members.
-- **Backup** (`app/backup.py`) — nightly deltachat **imex** export of each account
-  (portable backup, *not* a raw SQLCipher copy) into a backup dir, with per-account
-  retention.
 - **Service entrypoint** (`app/main.py`) — wires it all and runs the reconciler loop, the
-  relay inbound loop, uvicorn (`/send`), and the backup loop concurrently in one asyncio
-  process.
+  relay inbound loop and uvicorn (`/send`) concurrently in one asyncio process.
 - **MCP tools** (`app/mcp_tools.py`) — thin clients over the relay's HTTP contract, so an
   agent can send/manage Delta chats as tool calls.
 
@@ -95,14 +91,6 @@ channel by name and only adds missing members; a realm whose lead isn't onboarde
 retried next pass. The lead is the channel's "main" (routing wakes it on an unaddressed
 message). A realm with no lead is skipped (nothing to route unaddressed messages to).
 
-## Backup
-
-A nightly loop calls the deltachat **imex** backup export
-(`rpc.export_backup(accid, folder, None)` — a portable backup tar, *not* a raw SQLCipher
-copy) for each live account into `DELTA_BACKUP_DIR`, naming each `<localpart>-<UTC>.tar`,
-then prunes to the newest `DELTA_BACKUP_RETAIN` per account. The scheduling and rotation
-logic is pure + unit-tested; only the one imex RPC call touches the live core.
-
 ## Environment variables
 
 | Var | Default | Purpose |
@@ -117,9 +105,6 @@ logic is pure + unit-tested; only the one imex RPC call touches the live core.
 | `DATA_DIR` | `/data` | LOCAL account-DB + hold-queue dir (**never NFS** — SQLCipher) |
 | `ACCOUNTS_DIR` | `$DATA_DIR/accounts` | deltachat accounts dir |
 | `DELTA_SECRETS_PATH` | `$DATA_DIR/secrets.json` | Local per-bot password store (mode 600) |
-| `DELTA_BACKUP_DIR` | `/backup` | imex backup output dir |
-| `DELTA_BACKUP_RETAIN` | `7` | Backups kept per account |
-| `DELTA_BACKUP_INTERVAL` | `86400` | Backup loop period (s) |
 | `DELTA_RECONCILE_INTERVAL` | `3600` | Reconciler loop period (s) |
 | `DELTA_RECONCILE_ON_START` | `1` | Reconcile once at boot (`1`/`0`) |
 | `RELAY_HOST` / `RELAY_PORT` | `0.0.0.0` / `8080` | uvicorn bind (also honors `PORT`) |
@@ -156,7 +141,7 @@ cp roster.example.yaml config/roster.yaml   # inject your roster (gitignored)
 docker compose up --build
 ```
 
-`/data` and `/backup` are **local** volumes (SQLCipher over NFS corrupts — never NFS).
+`/data` is a **local** volume (SQLCipher over NFS corrupts — never NFS).
 
 ### Direct
 
@@ -164,7 +149,7 @@ docker compose up --build
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 DELTA_MAIL_DOMAIN=deltachat.example.net \
 DELTA_ROSTER_PATH=./config/roster.yaml \
-DATA_DIR=./data DELTA_BACKUP_DIR=./backup \
+DATA_DIR=./data \
   .venv/bin/python -m app.main
 ```
 
@@ -181,8 +166,6 @@ behind an injectable seam and faked in tests.
 
 Several deltachat JSON-RPC method names used by the default backend (contact/channel
 enumeration, reactions) could not be signature-verified against reachable autodocs and are
-isolated behind the `DeltaBackend` / `BackupBackend` seams with `# pragma: no cover` +
+isolated behind the `DeltaBackend` seam with `# pragma: no cover` +
 defensive `getattr` so an API drift is a one-place fix. **Verify against the deployed core
-before production.** The imex backup call
-(`export_backup(accid, folder, passphrase)`) **is** verified
-([deltachat-bot/deltabot-cli-py autodocs](https://github.com/deltachat-bot/deltabot-cli-py)).
+before production.**
